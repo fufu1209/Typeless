@@ -1536,25 +1536,17 @@ writeActiveSession(inputJson);
         if accessibilityTrusted {
             log.append("权限预检通过：辅助功能 Accessibility 已允许")
         } else {
-            log.append("权限预检未通过：辅助功能 Accessibility 未允许；已在创建 MoeMail 邮箱前打开系统设置，避免中途卡在弹窗")
-            openMacPermissionSettings("Privacy_Accessibility")
+            log.append("权限预警：辅助功能 Accessibility 未允许，将尝试以无辅助功能模式继续运行（如自动点击失败可手动辅助）")
         }
 
         if automationOK {
             log.append("权限预检通过：自动化 Apple Events 已可控制 Google Chrome 和 System Events")
         } else {
-            log.append("权限预检未通过：自动化 Apple Events 未完全允许；Chrome：\(chromeProbe.message)；System Events：\(systemEventsProbe.message)")
-            openMacPermissionSettings("Privacy_Automation")
+            log.append("权限预警：自动化 Apple Events 未完全允许；Chrome：\(chromeProbe.message)；System Events：\(systemEventsProbe.message)")
         }
 
-        if accessibilityTrusted && automationOK {
-            log.append("权限预检完成：可以继续创建邮箱、清理环境和注册新账号")
-            return true
-        }
-
-        copyToClipboard(MacPermissionChecklist.markdown)
-        statusMessage = "一键换号已在注册前暂停：请先给 TypelessSwitchboard 打开辅助功能/自动化权限；权限清单已复制，设置好后再点一次。"
-        return false
+        log.append("权限预检完成：继续执行创建邮箱、清理环境和自动换号逻辑")
+        return true
     }
 
     func copyMacPermissionChecklist() {

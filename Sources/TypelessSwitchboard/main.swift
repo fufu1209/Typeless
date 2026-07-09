@@ -306,10 +306,6 @@ final class SwitchboardStore: ObservableObject {
         if state.settings.isAutoRotateEnabled {
             startRotateMonitor()
         }
-        
-        Task {
-            await runSetupDiagnostics(apiKey: KeychainStore.readAPIKey())
-        }
     }
 
     private func migrateDefaultsIfNeeded() {

@@ -222,25 +222,122 @@ swift run OperationalFeatureChecks
 
 ## 📧 域名邮箱（MoeMail）搭建与对接配置指南
 
-本工具（`Typeless Switchboard`）支持调用域名邮箱系统（默认对接开源临时邮箱服务 `MoeMail`）来全自动接收并轮询注册验证码。以下是自建该域名邮箱体系的极简步骤：
+本工具（`Typeless Switchboard`）采用开源的临时/自建域名邮箱体系（以 `MoeMail` 为标准 API 协议）来接收并轮询注册验证码。
+只要在工具右侧的「连接设置」中填写您**自建邮箱服务的 API 域名**与**自定义卡密 (API Key)**，即可实现全自动验证码收码。
 
-### 1. 准备工作
-* **域名**：一个已将 DNS 解析权托管在 **Cloudflare** 的闲置域名（如 `mymail.xyz`）。
-* **服务器**：一台轻量级云服务器（用于部署 MoeMail 后端服务），或者使用 Serverless（如部署在 Cloudflare Workers / Vercel 上）。
+### 1. 软件客户端配置项说明
 
-### 2. 部署 MoeMail 后端服务
-MoeMail 是一款极简的开源域名临时邮件接收系统。
-1. **获取源码**：将 MoeMail 后端部署在您的服务器或 Cloudflare Workers 上。
-2. **配置环境变量**：
-   * 设置 `API_KEY`（在 Switchboard 中的“连接设置”中填写的 MoeMail API Key）。
-   * 设置允许接收的域名白名单。
-3. **配置 Cloudflare Email Routing (邮件路由)**：
-   * 登录 Cloudflare 后端，进入该域名的 **Email -> Email Routing** 开启服务。
-   * 添加规则：将所有未匹配的邮件（**Catch-All**）配置为“转发到 Worker (Send to Worker)”，并选择您部署的 MoeMail 邮件接收 Worker 脚本。
-4. **配置 DNS 记录**：
-   * Cloudflare 会引导您自动添加 3 条 MX 记录和 1 条 TXT (SPF) 记录，用以让全球邮件能成功投递到 Cloudflare。
-5. **连通测试**：
-   * 打开命令行，运行 `curl -H "x-api-key: 你的APIKEY" https://您的邮件接收域名/api/config` 确认能成功返回域名白名单列表。
+当您或您的朋友使用本工具时，在右侧「连接设置」中需要填写以下三个信息：
+* **官方注册入口**：默认填 `https://www.typeless.com/login`。
+* **邮箱服务 URL**：填您自建域名邮箱系统的 API 根路径，例如 `https://mail.yourdomain.com`（必须支持 HTTPS）。
+* **API Key / 卡密**：您在自建后端服务时，自行在环境变量中设置的访问令牌（用来保障您的域名邮箱不被他人盗刷）。
+
+### 2. ⚡️ 1分钟极速自建方案 (基于 Cloudflare Workers 免费部署)
+
+如果您不想购买并配置云服务器，可以直接使用 **Cloudflare Workers** 跑一个无服务器 (Serverless) 的轻量邮箱 API。步骤如下：
+
+#### 第一步：在 Cloudflare 中创建 Worker
+1. 登录 Cloudflare 控制台，进入 **Workers & Pages** -> 点击 **Create Application** -> **Create Worker**。
+2. 命名为 `typeless-moemail-backend` 并部署。
+3. 点击 **Quick Edit**（快速编辑），将以下完整的极简 API 代码粘贴进去并保存部署：
+
+```javascript
+// Cloudflare Worker 极简 MoeMail 协议仿真后端
+const API_KEY = "您自定义的卡密内容"; // 建议在 Worker 设置的 Environment Variables 中配置为 API_KEY 变量
+const DOMAIN = "yourdomain.com"; // 您的自定义邮箱域名
+
+// 内存数据库：用于临时缓存收到的邮件 (实际生产中可绑定 KV 存储)
+const mailStore = new Map(); 
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const clientKey = request.headers.get("x-api-key");
+    const actualKey = env.API_KEY || API_KEY;
+    const actualDomain = env.DOMAIN || DOMAIN;
+
+    // 1. 校验卡密 / API Key
+    if (clientKey !== actualKey) {
+      return new Response(JSON.stringify({ error: "Unauthorized API Key" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 2. 接口 A：自检配置，返回可用域名列表
+    if (url.pathname === "/api/config") {
+      return new Response(JSON.stringify({ domains: [actualDomain] }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 3. 接口 B：获取指定邮箱的最新邮件 (用于 Switchboard 自动轮询提取 6 位验证码)
+    if (url.pathname === "/api/messages") {
+      const email = url.searchParams.get("email");
+      if (!email) {
+        return new Response(JSON.stringify({ error: "Missing email param" }), { status: 400 });
+      }
+      const messages = mailStore.get(email) || [];
+      return new Response(JSON.stringify(messages), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    return new Response("MoeMail Mock Server Running", { status: 200 });
+  },
+
+  // 4. Cloudflare Email Routing 接收邮件触发器
+  async email(message, env, ctx) {
+    const emailTo = message.to; // 例如 sharp.orbit.123456@yourdomain.com
+    const emailFrom = message.from;
+    
+    // 读取邮件全文
+    let rawBody = "";
+    const reader = message.raw.getReader();
+    const decoder = new TextDecoder("utf-8");
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      rawBody += decoder.decode(value, { stream: true });
+    }
+
+    // 解析出 6 位数字验证码 (例如 Typeless 验证码为 123456)
+    const codeMatch = rawBody.match(/\b\d{6}\b/);
+    const code = codeMatch ? codeMatch[0] : "";
+    
+    const mailItem = {
+      id: Math.random().toString(36).substring(2),
+      from: emailFrom,
+      to: emailTo,
+      subject: `Your Typeless Verification Code: ${code}`,
+      body: rawBody,
+      text: `Your code is ${code}`,
+      createdAt: new Date().toISOString()
+    };
+
+    // 存入当前邮箱的收件箱列表
+    const emailKey = emailTo.toLowerCase();
+    if (!mailStore.has(emailKey)) {
+      mailStore.set(emailKey, []);
+    }
+    const list = mailStore.get(emailKey);
+    list.unshift(mailItem);
+    // 只保留最近 10 条，避免内存膨胀
+    if (list.length > 10) list.pop(); 
+  }
+};
+```
+
+#### 第二步：在 Cloudflare 中配置域名接收路由
+1. 进入您的域名控制台，点击 **Email -> Email Routing**。
+2. 开启 Email Routing，并在 **Routing Rules (路由规则)** 页面：
+   * 点击 **Add Rule (添加规则)**。
+   * 选择 **Catch-All (捕获所有未定义前缀的邮件)**。
+   * Action 选择 **Send to Worker**，并指定为您刚刚创建的 `typeless-moemail-backend` Worker。
+3. 按照 Cloudflare 引导自动一键添加 MX 记录以开始接收全球投递的邮件。
+
+#### 第三步：绑定自定义域名到 Worker (选填)
+在 Worker 的 **Settings -> Triggers -> Custom Domains** 里，添加一个您自定义的 API 子域名（例如 `mail.yourdomain.com`）指向该 Worker，大功告成！
 
 ---
 

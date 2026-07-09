@@ -716,9 +716,9 @@ writeActiveSession(inputJson);
         guard let currentIndex = accountIndex(id: currentID) else { return }
         let currentAccount = state.accounts[currentIndex]
         
-        if currentAccount.usedCharacters >= currentAccount.monthlyLimit {
+        if currentAccount.remainingCharacters < 200 {
             if let nextAccount = findNextRotateCandidate(excluding: currentID) {
-                statusMessage = "检测到当前官方账号额度已满，正在为您静默轮换到备用账号「\(nextAccount.email)」..."
+                statusMessage = "检测到当前官方账号额度即将耗尽 (剩余不足200字)，正在为您静默轮换到备用账号「\(nextAccount.email)」..."
                 let success = await switchActiveAccountSilently(to: nextAccount.id)
                 if success {
                     statusMessage = "额度接力成功！已自动无感切换至新账号「\(nextAccount.email)」，请继续使用！"
@@ -726,7 +726,7 @@ writeActiveSession(inputJson);
                     statusMessage = "自动静默换号失败，请尝试手动同步或重试。"
                 }
             } else {
-                statusMessage = "当前官方账号额度已满，但未在账号池中找到其它带有有效凭证的备用账号。"
+                statusMessage = "当前官方账号额度即将耗尽，但未在账号池中找到其它带有有效凭证的备用账号。"
             }
         }
     }

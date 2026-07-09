@@ -217,3 +217,42 @@ swift run OperationalFeatureChecks
 ```
 
 需要重置工具数据时，退出应用后删除这个文件即可。
+
+---
+
+## 📧 域名邮箱（MoeMail）搭建与对接配置指南
+
+本工具（`Typeless Switchboard`）支持调用域名邮箱系统（默认对接开源临时邮箱服务 `MoeMail`）来全自动接收并轮询注册验证码。以下是自建该域名邮箱体系的极简步骤：
+
+### 1. 准备工作
+* **域名**：一个已将 DNS 解析权托管在 **Cloudflare** 的闲置域名（如 `mymail.xyz`）。
+* **服务器**：一台轻量级云服务器（用于部署 MoeMail 后端服务），或者使用 Serverless（如部署在 Cloudflare Workers / Vercel 上）。
+
+### 2. 部署 MoeMail 后端服务
+MoeMail 是一款极简的开源域名临时邮件接收系统。
+1. **获取源码**：将 MoeMail 后端部署在您的服务器或 Cloudflare Workers 上。
+2. **配置环境变量**：
+   * 设置 `API_KEY`（在 Switchboard 中的“连接设置”中填写的 MoeMail API Key）。
+   * 设置允许接收的域名白名单。
+3. **配置 Cloudflare Email Routing (邮件路由)**：
+   * 登录 Cloudflare 后端，进入该域名的 **Email -> Email Routing** 开启服务。
+   * 添加规则：将所有未匹配的邮件（**Catch-All**）配置为“转发到 Worker (Send to Worker)”，并选择您部署的 MoeMail 邮件接收 Worker 脚本。
+4. **配置 DNS 记录**：
+   * Cloudflare 会引导您自动添加 3 条 MX 记录和 1 条 TXT (SPF) 记录，用以让全球邮件能成功投递到 Cloudflare。
+5. **连通测试**：
+   * 打开命令行，运行 `curl -H "x-api-key: 你的APIKEY" https://您的邮件接收域名/api/config` 确认能成功返回域名白名单列表。
+
+---
+
+## 🔍 SEO 检索与推广关键词优化（GitHub Search Optimization）
+
+为了方便更多开发者、自动化效率工具爱好者在 GitHub 上检索、收藏和复用本项目，我们在此列出关键的检索索引主题：
+
+* **GitHub Keywords**:
+  * `typeless-switchboard`, `typeless-automation`, `typeless-helper`, `playwright-autoclicker`, `macos-tcc-helper`, `voice-typing-switcher`, `temp-mail-auto-register`, `moemail-self-host`, `quota-auto-monitor`, `keychain-credential-injector`.
+* **搜索引擎检索方向**:
+  * **Typeless 自动换号/智能切换**：利用 macOS Keychain 凭证注入，快速进行客户端与 Chrome 网页版登录态重置。
+  * **MoeMail 自建域名邮箱对接**：全自动通过 Cloudflare Workers Catch-All 邮件转发并轮询提取 6 位数字验证码。
+  * **Mac 辅助安全性与自动化权限修复**：一键清除由于代码重签导致的 TCC.db 权限拉黑缓存，恢复 Apple Events 及控制权限。
+  * **免浏览器额度秒级自检**：使用 AES-CBC 动态指纹密钥直接解密 Electron 本地缓存文件，实现轻量级 API 额度同步。
+

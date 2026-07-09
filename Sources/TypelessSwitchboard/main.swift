@@ -274,6 +274,8 @@ final class SwitchboardStore: ObservableObject {
     @Published var moeMailMessages: [MoeMailMessage] = []
     @Published var diagnostics: [DiagnosticItem] = []
     @Published var isRunningAutomaticReplacement = false
+    @Published var isSyncingSession = false
+    @Published var syncStatusMessage = ""
 
     private let fileURL: URL
 
@@ -293,6 +295,7 @@ final class SwitchboardStore: ObservableObject {
             state = .empty
         }
         migrateDefaultsIfNeeded()
+        ensureExtractScript()
     }
 
     private func migrateDefaultsIfNeeded() {
@@ -306,6 +309,276 @@ final class SwitchboardStore: ObservableObject {
             }
         }
     }
+
+    private func ensureExtractScript() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
+        let scriptURL = folder.appendingPathComponent("extract-active-session.js")
+        
+        let scriptContent = #"""
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const https = require('https');
+
+function getActiveSession() {
+  return new Promise((resolve, reject) => {
+    try {
+      const platform = os.platform();
+      const arch = os.arch();
+      const appName = 'Typeless';
+      
+      const hashInput = platform + '-' + arch;
+      const sha256Hex = crypto.createHash('sha256').update(hashInput).digest('hex');
+      const pbkdf2Key = crypto.pbkdf2Sync(sha256Hex + appName, 'typeless-user-service', 10000, 32, 'sha256');
+
+      const userdataPath = path.join(process.env.HOME, 'Library/Application Support/Typeless/user-data.json');
+      if (!fs.existsSync(userdataPath)) {
+        return resolve({ success: false, error: "未检测到 Typeless 客户端的登录缓存文件" });
+      }
+
+      const data = fs.readFileSync(userdataPath);
+      if (data.length < 17 || data[16] !== 0x3a) {
+        return resolve({ success: false, error: "登录缓存文件格式不正确或已损坏" });
+      }
+
+      const iv = data.slice(0, 16);
+      const ciphertext = data.slice(17);
+      const derivedPassword = crypto.pbkdf2Sync(pbkdf2Key, iv.toString(), 10000, 32, 'sha512');
+
+      let credentials;
+      try {
+        const decipher = crypto.createDecipheriv('aes-256-cbc', derivedPassword, iv);
+        let dec = decipher.update(ciphertext);
+        dec = Buffer.concat([dec, decipher.final()]);
+        const parsed = JSON.parse(dec.toString('utf8'));
+        credentials = JSON.parse(parsed.userData);
+      } catch (e) {
+        return resolve({ success: false, error: "本地缓存解密失败，可能是指纹不匹配或客户端已退出" });
+      }
+
+      const { access_token, user_id, email } = credentials;
+      if (!access_token || !user_id) {
+        return resolve({ success: false, error: "登录缓存中未包含有效的授权 Token" });
+      }
+
+      // 获取额度使用状况
+      const Qs = "7d4a8f2e6b9c3a1f5e8d2c7b4a9f6e3d1b5a2f9e6d3c0b7a4f1e8d5c2b9f6a3d";
+      const yc = "9b1c67af3f7ecd1501d7da7196f281f5e0c7c292ebc2227d49ff9d20";
+      
+      const timestamp = Math.floor(Date.now() / 1000);
+      const appVersion = "mac_2.0.0";
+      const pathname = "/user/usage_stats";
+
+      const signStr = `${timestamp}:${appVersion}:${pathname}:${user_id}`;
+      const hmacKeyString = `${timestamp}:${yc}`;
+
+      const hmac = crypto.createHmac('sha1', hmacKeyString).update(signStr).digest('hex');
+
+      const aesKey = Buffer.from(Qs, 'hex');
+      const ivAes = Buffer.alloc(16, 0);
+      const cipher = crypto.createCipheriv('aes-256-cbc', aesKey, ivAes);
+      let encrypted = cipher.update(hmac, 'utf8', 'base64');
+      encrypted += cipher.final('base64');
+
+      const options = {
+        hostname: 'api.typeless.com',
+        port: 443,
+        path: pathname,
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${access_token}`,
+          'X-Authorization': encrypted,
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Typeless/2.0.0 Chrome/120.0.6099.291 Electron/28.2.1 Safari/537.36',
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        },
+        timeout: 6000
+      };
+
+      const req = https.request(options, (res) => {
+        let body = '';
+        res.on('data', (chunk) => body += chunk);
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            return resolve({
+              success: true,
+              email: email,
+              userId: user_id,
+              error: `API 额度拉取失败 (HTTP ${res.statusCode})`
+            });
+          }
+          try {
+            const respObj = JSON.parse(body);
+            if (respObj.status === 'OK' && respObj.data && respObj.data.voice_transcription) {
+              const vt = respObj.data.voice_transcription;
+              return resolve({
+                success: true,
+                email: email,
+                userId: user_id,
+                usedCharacters: vt.week_word_usage_value,
+                monthlyLimit: vt.week_word_usage_limit,
+                info: `总字数: ${vt.total_words}, 已用秒数: ${Math.round(vt.total_audio_seconds)}秒`
+              });
+            } else {
+              return resolve({
+                success: true,
+                email: email,
+                userId: user_id,
+                error: "API 返回格式不匹配"
+              });
+            }
+          } catch (e) {
+            return resolve({
+              success: true,
+              email: email,
+              userId: user_id,
+              error: "解析 API 报文失败"
+            });
+          }
+        });
+      });
+
+      req.on('error', (e) => {
+        resolve({
+          success: true,
+          email: email,
+          userId: user_id,
+          error: `API 请求网络连接失败: ${e.message}`
+        });
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({
+          success: true,
+          email: email,
+          userId: user_id,
+          error: "API 请求连接超时"
+        });
+      });
+
+      req.write(JSON.stringify({}));
+      req.end();
+
+    } catch (err) {
+      resolve({ success: false, error: `提取过程异常: ${err.message}` });
+    }
+  });
+}
+
+getActiveSession().then(res => {
+  console.log(JSON.stringify(res, null, 2));
+});
+"""#
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? scriptContent.write(to: scriptURL, atomically: true, encoding: .utf8)
+    }
+
+    func syncActiveAppSessionAndQuota() async -> UUID? {
+        isSyncingSession = true
+        syncStatusMessage = "正在读取本地 Typeless 登录状态并向云端同步额度..."
+        statusMessage = syncStatusMessage
+        
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
+        let scriptURL = folder.appendingPathComponent("extract-active-session.js")
+        
+        let result = await Task.detached(priority: .userInitiated) {
+            return SwitchboardStore.runProcess(
+                arguments: ["node", scriptURL.path],
+                environment: SwitchboardStore.automationEnvironment(),
+                currentDirectory: folder,
+                timeoutSeconds: 15
+            )
+        }.value
+        
+        isSyncingSession = false
+        
+        guard result.status == 0 else {
+            syncStatusMessage = "同步进程失败：\(result.output)"
+            statusMessage = syncStatusMessage
+            return nil
+        }
+        
+        guard let data = result.output.data(using: .utf8) else {
+            syncStatusMessage = "读取进程输出失败"
+            statusMessage = syncStatusMessage
+            return nil
+        }
+        
+        struct ActiveSessionResult: Codable {
+            let success: Bool
+            let email: String?
+            let userId: String?
+            let usedCharacters: Int?
+            let monthlyLimit: Int?
+            let info: String?
+            let error: String?
+        }
+        
+        do {
+            let res = try JSONDecoder().decode(ActiveSessionResult.self, from: data)
+            if !res.success {
+                syncStatusMessage = "同步失败：\(res.error ?? "未知错误")"
+                statusMessage = syncStatusMessage
+                return nil
+            }
+            
+            guard let email = res.email else {
+                syncStatusMessage = "解密成功但未找到邮箱"
+                statusMessage = syncStatusMessage
+                return nil
+            }
+            
+            var matchedID: UUID? = nil
+            for i in 0..<state.accounts.count {
+                if state.accounts[i].email.lowercased() == email.lowercased() {
+                    matchedID = state.accounts[i].id
+                    if let used = res.usedCharacters {
+                        state.accounts[i].usedCharacters = used
+                    }
+                    if let limit = res.monthlyLimit {
+                        state.accounts[i].monthlyLimit = limit
+                    }
+                    if let info = res.info {
+                        state.accounts[i].notes = "已同步：\(info)"
+                    }
+                    break
+                }
+            }
+            
+            if let matchedID = matchedID {
+                if let errorMsg = res.error {
+                    syncStatusMessage = "已同步账号「\(email)」，但 API 拉取有错：\(errorMsg)"
+                } else {
+                    syncStatusMessage = "已成功更新当前官方账号「\(email)」的字数额度！"
+                }
+                save()
+                statusMessage = syncStatusMessage
+                return matchedID
+            } else {
+                // 新建账号
+                var newAcc = Account.blank(settings: state.settings)
+                newAcc.email = email
+                newAcc.usedCharacters = res.usedCharacters ?? 0
+                newAcc.monthlyLimit = res.monthlyLimit ?? 8000
+                newAcc.notes = "从官方 App 自动导入（\(res.info ?? "")）"
+                state.accounts.append(newAcc)
+                save()
+                syncStatusMessage = "发现新账号「\(email)」，已自动导入并切换！"
+                statusMessage = syncStatusMessage
+                return newAcc.id
+            }
+            
+        } catch {
+            syncStatusMessage = "解析同步结果失败：\(error.localizedDescription)"
+            statusMessage = syncStatusMessage
+            return nil
+        }
+    }
+
 
     func save() {
         do {
@@ -3722,6 +3995,31 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .padding(.horizontal, 18)
 
+            if store.isSyncingSession {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("同步官方 App 登录与额度中...")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 18)
+            } else {
+                Button {
+                    Task {
+                        if let newID = await store.syncActiveAppSessionAndQuota() {
+                            selectedID = newID
+                        }
+                    }
+                } label: {
+                    Label("同步官方 App 登录与额度", systemImage: "arrow.triangle.2.circlepath")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .padding(.horizontal, 18)
+            }
+
             Button {
                 selectedID = store.prepareSwitch(from: selectedID)
             } label: {
@@ -3731,6 +4029,7 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .disabled(store.nextAvailableAccountID() == nil)
             .padding(.horizontal, 18)
+
 
             Button {
                 Task {

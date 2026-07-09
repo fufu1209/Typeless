@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+DerivedData/
+*.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+TypelessSwitchboard.app/
+*.log
+.env
+secrets.json

@@ -585,11 +585,11 @@ getActiveSession().then(res => {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try JSONEncoder.appEncoder.encode(state)
             try data.write(to: fileURL, options: [.atomic])
-            statusMessage = "已保存到本机"
         } catch {
             statusMessage = "保存失败：\(error.localizedDescription)"
         }
     }
+
 
     func addAccount() -> UUID {
         let account = Account.blank(settings: state.settings)

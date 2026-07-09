@@ -306,6 +306,10 @@ final class SwitchboardStore: ObservableObject {
         if state.settings.isAutoRotateEnabled {
             startRotateMonitor()
         }
+        
+        Task {
+            await runSetupDiagnostics(apiKey: KeychainStore.readAPIKey())
+        }
     }
 
     private func migrateDefaultsIfNeeded() {
@@ -4138,6 +4142,27 @@ struct ContentView: View {
             }
             .padding(.top, 18)
             .padding(.horizontal, 18)
+
+            if store.diagnostics.contains(where: { $0.level == .error }) {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("环境依赖或权限缺失")
+                            .font(.caption.weight(.bold))
+                            .foregroundColor(.orange)
+                        Text("部分功能受限，请在右侧运行“一键自检”")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.12))
+                .cornerRadius(6)
+                .padding(.horizontal, 14)
+            }
+
 
             QuotaSummaryView()
                 .padding(.horizontal, 14)

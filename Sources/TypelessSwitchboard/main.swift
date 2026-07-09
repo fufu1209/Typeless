@@ -119,6 +119,7 @@ struct Account: Identifiable, Codable, Equatable, Sendable {
     var notes: String
     var createdAt: Date
     var lastResetAt: Date
+    var rawUserDataPayload: String?
 
     var remainingCharacters: Int {
         max(monthlyLimit - usedCharacters, 0)
@@ -156,7 +157,8 @@ struct Account: Identifiable, Codable, Equatable, Sendable {
             inboxURL: settings.moeMailBaseURL,
             notes: "",
             createdAt: Date(),
-            lastResetAt: Date()
+            lastResetAt: Date(),
+            rawUserDataPayload: nil
         )
     }
 }
@@ -217,6 +219,8 @@ struct AppSettings: Codable, Equatable, Sendable {
     var moeMailBaseURL: String
     var domains: [String]
     var checklist: [SwitchTask]
+    var isAutoRotateEnabled: Bool
+    var autoRotateCheckIntervalMinutes: Int
 
     static let defaults = AppSettings(
         typelessLoginURL: typelessDefaultLoginURL,
@@ -228,7 +232,9 @@ struct AppSettings: Codable, Equatable, Sendable {
             SwitchTask(title: "选择下一个仍有额度的账号", isRequired: true),
             SwitchTask(title: "自动轮询对应邮箱验证码，必要时手动兜底", isRequired: true),
             SwitchTask(title: "登录完成后更新本工具里的已用字数", isRequired: false)
-        ]
+        ],
+        isAutoRotateEnabled: false,
+        autoRotateCheckIntervalMinutes: 5
     )
 }
 
@@ -296,6 +302,10 @@ final class SwitchboardStore: ObservableObject {
         }
         migrateDefaultsIfNeeded()
         ensureExtractScript()
+        
+        if state.settings.isAutoRotateEnabled {
+            startRotateMonitor()
+        }
     }
 
     private func migrateDefaultsIfNeeded() {
@@ -314,6 +324,7 @@ final class SwitchboardStore: ObservableObject {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
         let scriptURL = folder.appendingPathComponent("extract-active-session.js")
+        let writeURL = folder.appendingPathComponent("write-active-session.js")
         
         let scriptContent = #"""
 const crypto = require('crypto');
@@ -348,11 +359,13 @@ function getActiveSession() {
       const derivedPassword = crypto.pbkdf2Sync(pbkdf2Key, iv.toString(), 10000, 32, 'sha512');
 
       let credentials;
+      let rawJsonString = "";
       try {
         const decipher = crypto.createDecipheriv('aes-256-cbc', derivedPassword, iv);
         let dec = decipher.update(ciphertext);
         dec = Buffer.concat([dec, decipher.final()]);
-        const parsed = JSON.parse(dec.toString('utf8'));
+        rawJsonString = dec.toString('utf8');
+        const parsed = JSON.parse(rawJsonString);
         credentials = JSON.parse(parsed.userData);
       } catch (e) {
         return resolve({ success: false, error: "本地缓存解密失败，可能是指纹不匹配或客户端已退出" });
@@ -406,6 +419,7 @@ function getActiveSession() {
               success: true,
               email: email,
               userId: user_id,
+              rawJson: rawJsonString,
               error: `API 额度拉取失败 (HTTP ${res.statusCode})`
             });
           }
@@ -417,6 +431,7 @@ function getActiveSession() {
                 success: true,
                 email: email,
                 userId: user_id,
+                rawJson: rawJsonString,
                 usedCharacters: vt.week_word_usage_value,
                 monthlyLimit: vt.week_word_usage_limit,
                 info: `总字数: ${vt.total_words}, 已用秒数: ${Math.round(vt.total_audio_seconds)}秒`
@@ -426,6 +441,7 @@ function getActiveSession() {
                 success: true,
                 email: email,
                 userId: user_id,
+                rawJson: rawJsonString,
                 error: "API 返回格式不匹配"
               });
             }
@@ -434,6 +450,7 @@ function getActiveSession() {
               success: true,
               email: email,
               userId: user_id,
+              rawJson: rawJsonString,
               error: "解析 API 报文失败"
             });
           }
@@ -445,6 +462,7 @@ function getActiveSession() {
           success: true,
           email: email,
           userId: user_id,
+          rawJson: rawJsonString,
           error: `API 请求网络连接失败: ${e.message}`
         });
       });
@@ -455,6 +473,7 @@ function getActiveSession() {
           success: true,
           email: email,
           userId: user_id,
+          rawJson: rawJsonString,
           error: "API 请求连接超时"
         });
       });
@@ -472,9 +491,61 @@ getActiveSession().then(res => {
   console.log(JSON.stringify(res, null, 2));
 });
 """#
+
+        let writeScriptContent = #"""
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+function writeActiveSession(rawJsonString) {
+  try {
+    const platform = os.platform();
+    const arch = os.arch();
+    const appName = 'Typeless';
+    
+    const hashInput = platform + '-' + arch;
+    const sha256Hex = crypto.createHash('sha256').update(hashInput).digest('hex');
+    const pbkdf2Key = crypto.pbkdf2Sync(sha256Hex + appName, 'typeless-user-service', 10000, 32, 'sha256');
+
+    const plaintext = Buffer.from(rawJsonString, 'utf8');
+    const iv = crypto.randomBytes(16);
+    const derivedPassword = crypto.pbkdf2Sync(pbkdf2Key, iv.toString(), 10000, 32, 'sha512');
+
+    const cipher = crypto.createCipheriv('aes-256-cbc', derivedPassword, iv);
+    let ciphertext = cipher.update(plaintext);
+    ciphertext = Buffer.concat([ciphertext, cipher.final()]);
+
+    const colon = Buffer.from(':');
+    const totalLength = iv.length + colon.length + ciphertext.length;
+    const finalBuffer = Buffer.concat([iv, colon, ciphertext], totalLength);
+
+    const userdataPath = path.join(process.env.HOME, 'Library/Application Support/Typeless/user-data.json');
+    const dir = path.dirname(userdataPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    fs.writeFileSync(userdataPath, finalBuffer);
+    console.log(JSON.stringify({ success: true }));
+  } catch (err) {
+    console.log(JSON.stringify({ success: false, error: err.message }));
+  }
+}
+
+const inputJson = process.argv[2];
+if (!inputJson) {
+  console.log(JSON.stringify({ success: false, error: "未提供 session payload 参数" }));
+  process.exit(1);
+}
+writeActiveSession(inputJson);
+"""#
+
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try? scriptContent.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try? writeScriptContent.write(to: writeURL, atomically: true, encoding: .utf8)
     }
+
 
     func syncActiveAppSessionAndQuota() async -> UUID? {
         isSyncingSession = true
@@ -516,6 +587,7 @@ getActiveSession().then(res => {
             let monthlyLimit: Int?
             let info: String?
             let error: String?
+            let rawJson: String?
         }
         
         do {
@@ -545,6 +617,9 @@ getActiveSession().then(res => {
                     if let info = res.info {
                         state.accounts[i].notes = "已同步：\(info)"
                     }
+                    if let rawJson = res.rawJson {
+                        state.accounts[i].rawUserDataPayload = rawJson
+                    }
                     break
                 }
             }
@@ -565,6 +640,7 @@ getActiveSession().then(res => {
                 newAcc.usedCharacters = res.usedCharacters ?? 0
                 newAcc.monthlyLimit = res.monthlyLimit ?? 8000
                 newAcc.notes = "从官方 App 自动导入（\(res.info ?? "")）"
+                newAcc.rawUserDataPayload = res.rawJson
                 state.accounts.append(newAcc)
                 save()
                 syncStatusMessage = "发现新账号「\(email)」，已自动导入并切换！"
@@ -585,9 +661,113 @@ getActiveSession().then(res => {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try JSONEncoder.appEncoder.encode(state)
             try data.write(to: fileURL, options: [.atomic])
+            
+            if state.settings.isAutoRotateEnabled {
+                startRotateMonitor()
+            } else {
+                stopRotateMonitor()
+            }
         } catch {
             statusMessage = "保存失败：\(error.localizedDescription)"
         }
+    }
+
+    // MARK: - 账号池自动轮切与额度监控
+
+    private var rotateMonitorTask: Task<Void, Never>?
+
+    func startRotateMonitor() {
+        guard rotateMonitorTask == nil else { return }
+        rotateMonitorTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 15 * 1_000_000_000)
+            } catch {
+                return
+            }
+            
+            while !Task.isCancelled {
+                guard let self = self else { break }
+                if self.state.settings.isAutoRotateEnabled {
+                    await self.performAutoRotateCheck()
+                }
+                
+                let minutes = max(self.state.settings.autoRotateCheckIntervalMinutes, 1)
+                let interval = Double(minutes) * 60.0
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                } catch {
+                    break
+                }
+            }
+        }
+    }
+
+    func stopRotateMonitor() {
+        rotateMonitorTask?.cancel()
+        rotateMonitorTask = nil
+    }
+
+    func performAutoRotateCheck() async {
+        guard let currentID = await syncActiveAppSessionAndQuota() else { return }
+        guard let currentIndex = accountIndex(id: currentID) else { return }
+        let currentAccount = state.accounts[currentIndex]
+        
+        if currentAccount.usedCharacters >= currentAccount.monthlyLimit {
+            if let nextAccount = findNextRotateCandidate(excluding: currentID) {
+                statusMessage = "检测到当前官方账号额度已满，正在为您静默轮换到备用账号「\(nextAccount.email)」..."
+                let success = await switchActiveAccountSilently(to: nextAccount.id)
+                if success {
+                    statusMessage = "额度接力成功！已自动无感切换至新账号「\(nextAccount.email)」，请继续使用！"
+                } else {
+                    statusMessage = "自动静默换号失败，请尝试手动同步或重试。"
+                }
+            } else {
+                statusMessage = "当前官方账号额度已满，但未在账号池中找到其它带有有效凭证的备用账号。"
+            }
+        }
+    }
+
+    private func findNextRotateCandidate(excluding currentID: UUID) -> Account? {
+        return state.accounts.first { account in
+            account.id != currentID &&
+            account.isUsable &&
+            account.remainingCharacters > 0 &&
+            account.rawUserDataPayload != nil
+        }
+    }
+
+    func switchActiveAccountSilently(to accountID: UUID) async -> Bool {
+        guard let index = accountIndex(id: accountID) else { return false }
+        let targetAccount = state.accounts[index]
+        guard let payload = targetAccount.rawUserDataPayload, !payload.isEmpty else { return false }
+        
+        _ = terminateInstalledTypelessApp()
+        
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
+        let scriptURL = folder.appendingPathComponent("write-active-session.js")
+        
+        let result = await Task.detached(priority: .userInitiated) {
+            return SwitchboardStore.runProcess(
+                arguments: ["node", scriptURL.path, payload],
+                environment: SwitchboardStore.automationEnvironment(),
+                currentDirectory: folder,
+                timeoutSeconds: 10
+            )
+        }.value
+        
+        guard result.status == 0 else {
+            return false
+        }
+        
+        openInstalledTypelessApp()
+        
+        for idx in state.settings.checklist.indices {
+            state.settings.checklist[idx].isDone = false
+        }
+        
+        save()
+        return true
     }
 
 
@@ -1970,6 +2150,11 @@ getActiveSession().then(res => {
             log: log
         )
         save()
+        if automationComplete {
+            Task {
+                _ = await syncActiveAppSessionAndQuota()
+            }
+        }
         statusMessage = automationComplete
             ? "全自动换号已完成，已同步 Google Chrome / Typeless 桌面端并复制新邮箱：\(account.email)"
             : "自动换号已推进到兜底确认阶段；旧账号未标记用完：\(account.email)"
@@ -4019,6 +4204,25 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .padding(.horizontal, 18)
             }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("启用额度自动轮切", isOn: Binding(
+                    get: { store.state.settings.isAutoRotateEnabled },
+                    set: { newValue in
+                        store.state.settings.isAutoRotateEnabled = newValue
+                        store.save()
+                    }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.subheadline.weight(.medium))
+                
+                Text("后台每 5 分钟巡检。若额度耗满，自动静默切换到池中下一个可用账号。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 4)
 
             Button {
                 selectedID = store.prepareSwitch(from: selectedID)

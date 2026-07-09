@@ -1528,8 +1528,7 @@ writeActiveSession(inputJson);
     private func preflightMacPermissionsBeforeAutomaticReplacement(log: inout [String]) -> Bool {
         log.append("开始注册前权限预检：先触发/检查辅助功能、自动化、Chrome 外部协议和 Typeless 常用权限")
 
-        let promptOptions = ["AXTrustedCheckOptionPrompt" as CFString: true] as CFDictionary
-        let accessibilityTrusted = AXIsProcessTrustedWithOptions(promptOptions)
+        let accessibilityTrusted = AXIsProcessTrusted()
         let chromeProbe = Self.runAppleEventsProbe(#"tell application "Google Chrome" to get version"#)
         let systemEventsProbe = Self.runAppleEventsProbe(#"tell application "System Events" to count processes"#)
         let automationOK = chromeProbe.success && systemEventsProbe.success

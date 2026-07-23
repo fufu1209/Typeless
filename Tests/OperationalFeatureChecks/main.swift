@@ -283,6 +283,16 @@ struct OperationalFeatureChecks {
         check(switchboardSource.contains("HeadlessCLIRunner") || switchboardSource.contains("runHeadlessCLI"), "CLI/daemon path does not require the main window")
         check(switchboardSource.contains("installQuotaGuardLaunchAgent"), "UI can install the boot quota-guard agent")
         check(FileManager.default.fileExists(atPath: "scripts/install-quota-guard.sh"), "install-quota-guard.sh script is present")
+        // 本周额度可靠性：只信 week_word_usage 新鲜值；API 失败不误判充足；近阈值加速。
+        check(switchboardSource.contains("lastQuotaSyncFresh"), "quota sync tracks whether weekly numbers are fresh")
+        check(switchboardSource.contains("lastQuotaSyncAt"), "quota sync records last successful weekly sync time")
+        check(switchboardSource.contains("lastQuotaUsedCharacters"), "quota sync keeps weekly used characters")
+        check(switchboardSource.contains("lastQuotaMonthlyLimit"), "quota sync keeps weekly limit (field name monthlyLimit is legacy)")
+        check(switchboardSource.contains("weeklyQuotaSummaryLine"), "UI/logs expose weekly used/limit/remaining/freshness summary")
+        check(switchboardSource.contains("本周额度 API 未刷新成功，跳过换号决策"), "auto-rotate skips switch when weekly quota is not fresh")
+        check(switchboardSource.contains("reconcileIntervalSecondsIfNeeded"), "daemon can tighten LaunchAgent StartInterval near threshold")
+        check(switchboardSource.contains("week_word_usage"), "copy/docs mention Typeless weekly word usage as the quota source")
+        check(switchboardSource.contains("?\\(remaining)"), "menu bar marks stale weekly remaining with ?")
 
         // SmartSwitchPolicy pure-logic checks
         let silentCandidate = SmartSwitchCandidate(

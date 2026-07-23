@@ -381,6 +381,13 @@ final class SwitchboardStore: ObservableObject {
     @Published var lastSilentSwitchFailureReason = ""
     /// 最近一次同步官方会话时是否命中「设备登录用户数超限」。
     @Published var lastSyncHitDeviceUserLimit = false
+    /// 最近一次「本周额度」官方 API 是否拿到新鲜数值（失败时不得当成额度充足）。
+    @Published var lastQuotaSyncFresh = false
+    /// 最近一次成功拉到本周额度的时间。
+    @Published var lastQuotaSyncAt: Date?
+    /// 最近一次官方本周已用 / 上限（与 remaining 同源：week_word_usage_*）。
+    @Published var lastQuotaUsedCharacters: Int?
+    @Published var lastQuotaMonthlyLimit: Int?
     /// 当前官方账号剩余字数（菜单栏展示用）。
     @Published var liveRemainingCharacters: Int?
     @Published var liveAccountEmail = ""
@@ -768,7 +775,8 @@ writeActiveSession(inputJson);
     func syncActiveAppSessionAndQuota() async -> UUID? {
         isSyncingSession = true
         lastSyncHitDeviceUserLimit = false
-        syncStatusMessage = "正在读取本地 Typeless 登录状态并向云端同步额度..."
+        lastQuotaSyncFresh = false
+        syncStatusMessage = "正在读取本地 Typeless 登录状态并向云端同步本周额度..."
         statusMessage = syncStatusMessage
         
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -830,21 +838,32 @@ writeActiveSession(inputJson);
             if res.errorCode == "DEVICE_USER_LIMIT" || SmartSwitchPolicy.isDeviceUserLimitError(res.error) {
                 lastSyncHitDeviceUserLimit = true
             }
+
+            // 只有官方 usage_stats 给出本周 used/limit 才算「新鲜额度」；否则不得据此判定充足。
+            let quotaFresh = res.error == nil
+                && res.usedCharacters != nil
+                && res.monthlyLimit != nil
+                && !lastSyncHitDeviceUserLimit
             
             var matchedID: UUID? = nil
             for i in 0..<state.accounts.count {
                 if state.accounts[i].email.lowercased() == email.lowercased() {
                     matchedID = state.accounts[i].id
-                    if let used = res.usedCharacters {
+                    if quotaFresh, let used = res.usedCharacters, let limit = res.monthlyLimit {
                         state.accounts[i].usedCharacters = used
-                    }
-                    if let limit = res.monthlyLimit {
-                        state.accounts[i].monthlyLimit = limit
-                    }
-                    if let info = res.info {
+                        state.accounts[i].monthlyLimit = max(limit, 1)
+                        lastQuotaUsedCharacters = used
+                        lastQuotaMonthlyLimit = max(limit, 1)
+                        lastQuotaSyncAt = Date()
+                        lastQuotaSyncFresh = true
+                        liveRemainingCharacters = state.accounts[i].remainingCharacters
+                        liveAccountEmail = state.accounts[i].email
+                        let remaining = state.accounts[i].remainingCharacters
+                        state.accounts[i].notes = "本周额度：已用 \(used)/\(limit)，剩余 \(remaining) · 官方同步 \(Self.shortClock(Date()))"
+                    } else if let info = res.info, res.error == nil {
                         state.accounts[i].notes = "已同步：\(info)"
                     }
-                    // 额度 API 正常时才刷新静默会话缓存；设备超限/API 错误时保留旧 payload，避免把半残会话写回账号池。
+                    // 额度 API 正常时才刷新静默会话缓存；设备超限/API 错误时保留旧 payload。
                     if res.error == nil, let rawJson = res.rawJson, !rawJson.isEmpty {
                         state.accounts[i].rawUserDataPayload = rawJson
                     }
@@ -857,10 +876,18 @@ writeActiveSession(inputJson);
                     if lastSyncHitDeviceUserLimit {
                         syncStatusMessage = "已读到账号「\(email)」，但设备登录用户数已超限：\(errorMsg)"
                     } else {
-                        syncStatusMessage = "已同步账号「\(email)」，但 API 拉取有错：\(errorMsg)"
+                        // 登录态在，但本周额度 API 失败：保留旧 used/limit，明确标陈旧。
+                        lastQuotaSyncFresh = false
+                        syncStatusMessage = "已读到账号「\(email)」，但本周额度 API 失败（数字可能陈旧）：\(errorMsg)"
                     }
+                } else if quotaFresh {
+                    let used = lastQuotaUsedCharacters ?? 0
+                    let limit = lastQuotaMonthlyLimit ?? 8000
+                    let remaining = liveRemainingCharacters ?? max(limit - used, 0)
+                    syncStatusMessage = "本周额度已更新「\(email)」：已用 \(used)/\(limit)，剩余 \(remaining)"
                 } else {
-                    syncStatusMessage = "已成功更新当前官方账号「\(email)」的字数额度！"
+                    lastQuotaSyncFresh = false
+                    syncStatusMessage = "已读到账号「\(email)」，但未拿到完整本周额度字段"
                 }
                 save()
                 statusMessage = syncStatusMessage
@@ -868,14 +895,28 @@ writeActiveSession(inputJson);
                 if lastSyncHitDeviceUserLimit {
                     return nil
                 }
+                // API 失败时仍返回账号 ID，供 UI 显示邮箱；换号决策见 performAutoRotateCheck（非新鲜则不换）。
                 return matchedID
             } else {
                 // 新建账号
                 var newAcc = Account.blank(settings: state.settings)
                 newAcc.email = email
-                newAcc.usedCharacters = res.usedCharacters ?? 0
-                newAcc.monthlyLimit = res.monthlyLimit ?? 8000
-                newAcc.notes = "从官方 App 自动导入（\(res.info ?? "")）"
+                if quotaFresh {
+                    newAcc.usedCharacters = res.usedCharacters ?? 0
+                    newAcc.monthlyLimit = res.monthlyLimit ?? 8000
+                    lastQuotaUsedCharacters = newAcc.usedCharacters
+                    lastQuotaMonthlyLimit = newAcc.monthlyLimit
+                    lastQuotaSyncAt = Date()
+                    lastQuotaSyncFresh = true
+                    liveRemainingCharacters = newAcc.remainingCharacters
+                    liveAccountEmail = email
+                    newAcc.notes = "本周额度：已用 \(newAcc.usedCharacters)/\(newAcc.monthlyLimit)，剩余 \(newAcc.remainingCharacters) · 官方同步 \(Self.shortClock(Date()))"
+                } else {
+                    newAcc.usedCharacters = res.usedCharacters ?? 0
+                    newAcc.monthlyLimit = res.monthlyLimit ?? 8000
+                    newAcc.notes = "从官方 App 自动导入（本周额度待刷新）"
+                    lastQuotaSyncFresh = false
+                }
                 if res.error == nil {
                     newAcc.rawUserDataPayload = res.rawJson
                 }
@@ -886,7 +927,11 @@ writeActiveSession(inputJson);
                     statusMessage = syncStatusMessage
                     return nil
                 }
-                syncStatusMessage = "发现新账号「\(email)」，已自动导入并切换！"
+                if !quotaFresh, res.error != nil {
+                    syncStatusMessage = "发现账号「\(email)」，但本周额度 API 失败，暂不据此换号"
+                } else {
+                    syncStatusMessage = "发现新账号「\(email)」，已自动导入"
+                }
                 statusMessage = syncStatusMessage
                 return newAcc.id
             }
@@ -903,6 +948,29 @@ writeActiveSession(inputJson);
         if SmartSwitchPolicy.isDeviceUserLimitError(message) {
             lastSyncHitDeviceUserLimit = true
         }
+    }
+
+    private nonisolated static func shortClock(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
+    /// 侧栏/日志用的本周额度摘要。
+    var weeklyQuotaSummaryLine: String {
+        let used = lastQuotaUsedCharacters
+        let limit = lastQuotaMonthlyLimit
+        let remaining = liveRemainingCharacters
+        let clock = lastQuotaSyncAt.map(Self.shortClock) ?? "—"
+        if let used, let limit, let remaining {
+            let freshness = lastQuotaSyncFresh ? "新鲜" : "可能陈旧"
+            return "本周：已用 \(used)/\(limit)，剩余 \(remaining) · \(freshness) · \(clock)"
+        }
+        if let remaining {
+            return "本周剩余约 \(remaining)（待官方刷新）· \(clock)"
+        }
+        return lastQuotaSyncFresh ? "本周额度已同步 · \(clock)" : "本周额度尚未成功同步"
     }
 
 
@@ -1164,10 +1232,17 @@ writeActiveSession(inputJson);
             return nil
         }
 
+        liveAccountEmail = state.accounts[currentIndex].email
+        // 本周额度 API 未成功时：只展示缓存，绝不据此自动换号（避免陈旧数字误触发）。
+        if !lastQuotaSyncFresh {
+            lastAutoRotateDecisionReason = "本周额度 API 未刷新成功，跳过换号决策（避免陈旧数字）"
+            autoRotateMonitorStatus = "巡检完成：\(weeklyQuotaSummaryLine)；本轮不换号"
+            return currentID
+        }
+
         let remaining = state.accounts[currentIndex].remainingCharacters
         lastKnownRemainingForInterval = remaining
         liveRemainingCharacters = remaining
-        liveAccountEmail = state.accounts[currentIndex].email
 
         let threshold = SmartSwitchPolicy.normalizeThreshold(state.settings.autoRotateRemainingThreshold)
         let candidates = smartSwitchCandidates(excluding: currentID)
@@ -1186,6 +1261,7 @@ writeActiveSession(inputJson);
         case .none:
             // 额度 ≥ 阈值：只监控、不换号；同时后台补热备，保证真到阈值时能秒切。
             autoRotateMonitorStatus = SmartSwitchPolicy.monitorIdleStatus(remaining: remaining, threshold: threshold)
+                + " · \(weeklyQuotaSummaryLine)"
             if allowCreate {
                 await ensureHotSpareIfNeeded(apiKey: key, domain: domain)
             }
@@ -3001,9 +3077,25 @@ writeActiveSession(inputJson);
         }
 
         let resultID = await performAutoRotateCheck(apiKey: apiKey.isEmpty ? nil : apiKey)
-        // 额度充足时也尝试补热备（与 GUI 巡检一致）。
-        if !apiKey.isEmpty, state.settings.autoCreateWhenPoolEmpty {
+        // 额度充足且本周数字新鲜时才补热备。
+        if lastQuotaSyncFresh, !apiKey.isEmpty, state.settings.autoCreateWhenPoolEmpty {
             await ensureHotSpareIfNeeded(apiKey: apiKey, domain: state.settings.domains.first ?? "")
+        }
+
+        // 近阈值时把 LaunchAgent 间隔压到约 20 秒，额度回升后再拉回用户设定分钟数。
+        if QuotaGuardLaunchAgent.isInstalled {
+            let threshold = SmartSwitchPolicy.normalizeThreshold(state.settings.autoRotateRemainingThreshold)
+            let desiredSeconds: Int
+            if lastQuotaSyncFresh,
+               let remaining = liveRemainingCharacters,
+               SmartSwitchPolicy.isApproachingQuotaLimit(remaining: remaining, threshold: threshold) {
+                desiredSeconds = Int(SmartSwitchPolicy.urgentCheckIntervalSeconds)
+            } else {
+                desiredSeconds = SmartSwitchPolicy.normalizeCheckIntervalMinutes(
+                    state.settings.autoRotateCheckIntervalMinutes
+                ) * 60
+            }
+            QuotaGuardLaunchAgent.reconcileIntervalSecondsIfNeeded(desiredSeconds)
         }
 
         state.settings.isAutoRotateEnabled = previousAutoRotate
@@ -3012,15 +3104,18 @@ writeActiveSession(inputJson);
 
         let elapsed = Date().timeIntervalSince(startedAt)
         let remainingText = liveRemainingCharacters.map(String.init) ?? "unknown"
+        let usedText = lastQuotaUsedCharacters.map(String.init) ?? "-"
+        let limitText = lastQuotaMonthlyLimit.map(String.init) ?? "-"
         print(
-            "TypelessSwitchboard daemon: done remaining=\(remainingText) email=\(liveAccountEmail.ifEmpty("-")) " +
+            "TypelessSwitchboard daemon: done weekly used=\(usedText)/\(limitText) remaining=\(remainingText) " +
+            "fresh=\(lastQuotaSyncFresh) email=\(liveAccountEmail.ifEmpty("-")) " +
             "resultID=\(resultID?.uuidString ?? "nil") reason=\(lastAutoRotateDecisionReason.ifEmpty(autoRotateMonitorStatus)) " +
             "elapsed=\(String(format: "%.1f", elapsed))s"
         )
         appendDaemonLog(
             remaining: liveRemainingCharacters,
             email: liveAccountEmail,
-            reason: lastAutoRotateDecisionReason.ifEmpty(autoRotateMonitorStatus),
+            reason: "\(weeklyQuotaSummaryLine) | \(lastAutoRotateDecisionReason.ifEmpty(autoRotateMonitorStatus))",
             resultID: resultID
         )
         return true
@@ -5120,9 +5215,43 @@ enum QuotaGuardLaunchAgent {
     static func statusSummary(intervalMinutes: Int) -> String {
         if isInstalled {
             let minutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(intervalMinutes)
-            return "开机轻量插件：已安装 · 约每 \(minutes) 分钟巡检（不常驻窗口）"
+            let live = currentStartIntervalSeconds()
+            if let live, live < minutes * 60 {
+                return "开机轻量插件：已安装 · 近阈值加速约每 \(live) 秒巡检（常规 \(minutes) 分钟）"
+            }
+            return "开机轻量插件：已安装 · 约每 \(minutes) 分钟巡检本周额度（不常驻窗口）"
         }
         return "开机轻量插件：未安装（推荐安装，不必一直开着本 App）"
+    }
+
+    /// 读取当前 plist 里的 StartInterval（秒）。
+    static func currentStartIntervalSeconds() -> Int? {
+        guard let data = try? Data(contentsOf: plistURL),
+              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let seconds = object["StartInterval"] as? Int else {
+            return nil
+        }
+        return seconds
+    }
+
+    /// daemon 根据本周剩余额度动态调整巡检间隔：接近阈值 → 约 20 秒；否则恢复用户设定分钟数。
+    static func reconcileIntervalSecondsIfNeeded(_ desiredSeconds: Int) {
+        let clamped = max(20, min(desiredSeconds, 120 * 60))
+        guard isInstalled else { return }
+        if currentStartIntervalSeconds() == clamped { return }
+        guard let data = try? Data(contentsOf: plistURL),
+              var text = String(data: data, encoding: .utf8) else {
+            return
+        }
+        // 替换 <key>StartInterval</key> 后的 integer。
+        if let range = text.range(of: #"<key>StartInterval</key>\s*<integer>\d+</integer>"#, options: .regularExpression) {
+            text.replaceSubrange(range, with: "<key>StartInterval</key>\n  <integer>\(clamped)</integer>")
+        } else {
+            return
+        }
+        try? text.write(to: plistURL, atomically: true, encoding: .utf8)
+        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
+        _ = runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
     }
 
     /// 优先用已打包的 .app 可执行文件；否则用当前进程路径（swift run / 开发构建）。
@@ -5340,24 +5469,33 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
             return
         }
         if let remaining = store.liveRemainingCharacters {
-            // 菜单栏：剩余字数；低于阈值时加「↓」提示即将/正在低额度。
-            button.title = remaining < threshold ? "↓\(remaining)" : "\(remaining)"
+            // 菜单栏：本周剩余字数；数字不新鲜加「?」；低于阈值加「↓」。
+            let low = remaining < threshold
+            if store.lastQuotaSyncFresh {
+                button.title = low ? "↓\(remaining)" : "\(remaining)"
+            } else {
+                button.title = low ? "?↓\(remaining)" : "?\(remaining)"
+            }
             button.toolTip = [
                 store.liveAccountEmail.isEmpty ? nil : "当前：\(store.liveAccountEmail)",
-                "剩余 \(remaining) 字 · 换号阈值 \(threshold)（仅低于阈值才自动换）",
+                store.weeklyQuotaSummaryLine,
+                store.lastQuotaSyncFresh
+                    ? "换号阈值 \(threshold)（仅本周剩余 < 阈值才自动换）"
+                    : "本周额度可能陈旧：本轮不自动换号",
                 store.autoRotateMonitorStatus,
                 store.lastAutoRotateDecisionReason.isEmpty ? nil : store.lastAutoRotateDecisionReason
             ].compactMap { $0 }.joined(separator: "\n")
-        } else if store.state.settings.isAutoRotateEnabled {
-            button.title = "监控"
+        } else if store.state.settings.isAutoRotateEnabled || QuotaGuardLaunchAgent.isInstalled {
+            button.title = store.lastQuotaSyncFresh ? "监控" : "?"
             button.toolTip = [
-                "无感额度守护已开，等待读到官方剩余字数",
-                "换号阈值：剩余 < \(threshold) 才自动换号",
+                "本周额度守护已开，等待读到官方本周剩余字数",
+                store.weeklyQuotaSummaryLine,
+                "换号阈值：本周剩余 < \(threshold) 且数字新鲜才自动换号",
                 store.autoRotateMonitorStatus
             ].joined(separator: "\n")
         } else {
             button.title = "关闭"
-            button.toolTip = "无感额度守护已关闭"
+            button.toolTip = "本周额度守护未开启（可安装开机轻量插件）"
         }
     }
 
@@ -5636,15 +5774,25 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                if let remaining = store.liveRemainingCharacters {
+                Text(store.weeklyQuotaSummaryLine)
+                    .font(.caption)
+                    .foregroundStyle(store.lastQuotaSyncFresh ? Color.secondary : Color.orange)
+                    .lineLimit(2)
+
+                if let remaining = store.liveRemainingCharacters, store.lastQuotaSyncFresh {
                     let threshold = SmartSwitchPolicy.normalizeThreshold(store.state.settings.autoRotateRemainingThreshold)
                     let emailSuffix = store.liveAccountEmail.isEmpty ? "" : " · \(store.liveAccountEmail)"
                     let line = remaining >= threshold
-                        ? "当前剩余 \(remaining) 字 ≥ 阈值 \(threshold)：只监控，不换号\(emailSuffix)"
-                        : "当前剩余 \(remaining) 字 < 阈值 \(threshold)：将自动换号\(emailSuffix)"
+                        ? "本周剩余 \(remaining) ≥ 阈值 \(threshold)：只监控，不换号\(emailSuffix)"
+                        : "本周剩余 \(remaining) < 阈值 \(threshold)：将自动换号\(emailSuffix)"
                     Text(line)
                         .font(.caption)
                         .foregroundStyle(remaining >= threshold ? Color.secondary : Color.orange)
+                        .lineLimit(2)
+                } else if !store.lastQuotaSyncFresh {
+                    Text("本周额度未刷新成功时不会自动换号（避免陈旧数字误触发）")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                         .lineLimit(2)
                 }
 
@@ -5660,7 +5808,7 @@ struct ContentView: View {
                         .lineLimit(3)
                 }
 
-                Text("推荐：安装开机插件后关掉本 App。插件定时醒来读额度；仅剩余 < 阈值（默认 200）才自动换号。静默换号会轮换设备身份。日志在 Application Support/TypelessSwitchboard/Logs/。")
+                Text("口径：Typeless 本周周额度（week_word_usage）。插件定时读官方接口；仅本周剩余 < 阈值（默认 200）且数字新鲜才自动换号。近阈值会加速到约 20 秒一轮。日志在 Application Support/TypelessSwitchboard/Logs/。")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(5)

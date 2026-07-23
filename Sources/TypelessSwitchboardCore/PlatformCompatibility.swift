@@ -129,7 +129,9 @@ public enum TypelessToolkitCompatibilityMatrix {
         "删除 user-data.json",
         "清理 app-storage.json 中的 userData / quotaUsage / session / currentRoute",
         "清理 Electron 登录残留目录：Local Storage / Network / Cookies / Session Storage",
-        "重新启动 Typeless 并等待新设备身份生成"
+        "重新启动 Typeless 并等待新设备身份生成",
+        "静默换号（池内注入）同样执行设备身份轮换，避免同一 deviceId 挂过多账号触发服务端设备用户数上限",
+        "若检测到「The number of users logged into this device has exceeded the limit」类错误，跳过静默切换并降级为全自动 resetDevice + 注册"
     ]
 
     public static let macOS = TypelessToolkitPlatformProfile(

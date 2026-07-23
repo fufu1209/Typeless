@@ -1521,6 +1521,263 @@ public enum RegistrationAutomationCompletionPolicy {
     }
 }
 
+// MARK: - Smart switch / auto-rotate policy
+
+/// 智能换号走哪条路径：池内静默注入，或全自动注册新号。
+public enum SmartSwitchPath: String, Codable, Equatable, Sendable {
+    case none
+    case silentPoolSwitch
+    case fullAutomaticReplacement
+}
+
+public struct SmartSwitchCandidate: Equatable, Sendable {
+    public var id: UUID
+    public var email: String
+    public var remainingCharacters: Int
+    public var hasSilentSessionPayload: Bool
+
+    public init(id: UUID, email: String, remainingCharacters: Int, hasSilentSessionPayload: Bool) {
+        self.id = id
+        self.email = email
+        self.remainingCharacters = remainingCharacters
+        self.hasSilentSessionPayload = hasSilentSessionPayload
+    }
+}
+
+public struct SmartSwitchDecision: Equatable, Sendable {
+    public var path: SmartSwitchPath
+    public var targetAccountID: UUID?
+    public var targetEmail: String?
+    public var reason: String
+
+    public init(path: SmartSwitchPath, targetAccountID: UUID?, targetEmail: String?, reason: String) {
+        self.path = path
+        self.targetAccountID = targetAccountID
+        self.targetEmail = targetEmail
+        self.reason = reason
+    }
+}
+
+/// 统一「点一下换号」与后台额度监测的决策逻辑，避免 UI / monitor 各写一套。
+public enum SmartSwitchPolicy {
+    /// 剩余字数低于该值时立刻静默换号。
+    public static let defaultRemainingThreshold = 200
+    /// 常规巡检间隔（分钟）；额度接近阈值时会自动加速。
+    public static let defaultCheckIntervalMinutes = 1
+    /// App 启动后首次巡检等待：尽量短，让菜单栏尽快显示真实剩余字数。
+    public static let defaultStartupDelaySeconds: UInt64 = 2
+    /// 额度接近阈值时的加速巡检间隔（秒）。
+    public static let urgentCheckIntervalSeconds: UInt64 = 20
+    /// remaining < threshold * urgentMultiplier 时进入加速巡检。
+    public static let urgentRemainingMultiplier = 2
+    /// 热备池目标：始终尽量保有这么多「可静默注入」的备用号。
+    public static let defaultHotSpareTarget = 1
+    public static let sessionCaptureRetryAttempts = 8
+    public static let sessionCaptureRetryDelaySeconds: UInt64 = 2
+    /// 静默注入后等待桌面端读入新会话 / 生成新 device.cache 的秒数。
+    public static let silentInjectSettleSeconds: UInt64 = 2
+    /// 静默切换后校验目标邮箱的最大轮数（每轮会再同步官方额度）。
+    public static let silentSwitchVerifyAttempts = 8
+    public static let silentSwitchVerifyDelaySeconds: UInt64 = 2
+
+    public static func isQuotaLow(remaining: Int, threshold: Int) -> Bool {
+        remaining < max(threshold, 0)
+    }
+
+    /// 监控文案：额度充足时只巡检不换号；低于阈值才触发静默/全自动换号。
+    public static func monitorIdleStatus(remaining: Int, threshold: Int) -> String {
+        let normalized = max(threshold, 0)
+        if remaining >= normalized {
+            return "监控中：剩余 \(remaining) ≥ 阈值 \(normalized)，只巡检不换号"
+        }
+        return "额度偏低：剩余 \(remaining) < 阈值 \(normalized)，准备换号"
+    }
+
+    public static func monitorIdleDecisionReason(remaining: Int, threshold: Int) -> String {
+        let normalized = max(threshold, 0)
+        if remaining >= normalized {
+            return "当前额度充足（剩余 \(remaining)，阈值 \(normalized)）：持续监控，暂不换号"
+        }
+        return "当前额度低于阈值 \(normalized)（剩余 \(remaining)）"
+    }
+
+    /// Typeless 服务端「同一设备登录用户数超限」类错误。命中后应重置设备身份并优先走全自动换号。
+    public static func isDeviceUserLimitError(_ message: String?) -> Bool {
+        guard let message else { return false }
+        // 官方文案偶发缺空格（如 hasexceeded）；同时做「折叠空白」和「去空白」两套匹配。
+        let lower = message.lowercased()
+        let spaced = lower.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        let compact = lower.replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
+        let spacedNeedles = [
+            "number of users logged into this device has exceeded the limit",
+            "users logged into this device has exceeded",
+            "device has exceeded the limit",
+            "device user limit",
+            "too many users on this device",
+            "登录该设备的用户数已超过限制",
+            "设备登录用户数已超",
+            "设备用户数超限",
+            "此设备登录的用户数已超过限制"
+        ]
+        if spacedNeedles.contains(where: { spaced.contains($0) }) {
+            return true
+        }
+        let compactNeedles = [
+            "numberofusersloggedintothisdevicehasexceededthelimit",
+            "usersloggedintothisdevicehasexceeded",
+            "devicehasexceededthelimit",
+            "deviceuserlimit",
+            "toomanyusersonthisdevice",
+            "登录该设备的用户数已超过限制",
+            "设备登录用户数已超",
+            "设备用户数超限",
+            "此设备登录的用户数已超过限制"
+        ]
+        return compactNeedles.contains { compact.contains($0) }
+    }
+
+    public static func isApproachingQuotaLimit(remaining: Int, threshold: Int) -> Bool {
+        let normalized = max(threshold, 0)
+        return remaining < normalized * urgentRemainingMultiplier
+    }
+
+    /// 根据当前剩余额度选择本轮 sleep 秒数：接近阈值时 20 秒一轮，否则按分钟配置。
+    public static func nextCheckDelaySeconds(remaining: Int?, threshold: Int, intervalMinutes: Int) -> UInt64 {
+        if let remaining, isApproachingQuotaLimit(remaining: remaining, threshold: threshold) {
+            return urgentCheckIntervalSeconds
+        }
+        return UInt64(normalizeCheckIntervalMinutes(intervalMinutes)) * 60
+    }
+
+    public static func silentReadyCount(in candidates: [SmartSwitchCandidate]) -> Int {
+        candidates.filter { $0.hasSilentSessionPayload && $0.remainingCharacters > 0 }.count
+    }
+
+    public static func needsHotSpare(candidates: [SmartSwitchCandidate], target: Int) -> Bool {
+        silentReadyCount(in: candidates) < max(target, 0)
+    }
+
+    /// - Parameters:
+    ///   - forceSwitch: 用户主动点换号时为 true，忽略“额度仍充足”。
+    ///   - allowFullAutomaticReplacement: 监测场景在无 API Key / 关闭自动创建时可关掉全自动注册。
+    public static func decide(
+        currentRemaining: Int?,
+        threshold: Int,
+        forceSwitch: Bool,
+        candidates: [SmartSwitchCandidate],
+        allowFullAutomaticReplacement: Bool
+    ) -> SmartSwitchDecision {
+        let normalizedThreshold = max(threshold, 0)
+        if !forceSwitch, let remaining = currentRemaining, !isQuotaLow(remaining: remaining, threshold: normalizedThreshold) {
+            return SmartSwitchDecision(
+                path: .none,
+                targetAccountID: nil,
+                targetEmail: nil,
+                reason: monitorIdleDecisionReason(remaining: remaining, threshold: normalizedThreshold)
+            )
+        }
+
+        let silentReady = candidates
+            .filter { $0.hasSilentSessionPayload && $0.remainingCharacters > 0 }
+            .sorted {
+                if $0.remainingCharacters == $1.remainingCharacters {
+                    return $0.email.localizedCaseInsensitiveCompare($1.email) == .orderedAscending
+                }
+                return $0.remainingCharacters > $1.remainingCharacters
+            }
+
+        if let best = silentReady.first {
+            return SmartSwitchDecision(
+                path: .silentPoolSwitch,
+                targetAccountID: best.id,
+                targetEmail: best.email,
+                reason: forceSwitch
+                    ? "池内静默切换到「\(best.email)」（剩余 \(best.remainingCharacters)）"
+                    : "额度低于 \(normalizedThreshold)，静默切换到「\(best.email)」（剩余 \(best.remainingCharacters)）"
+            )
+        }
+
+        if allowFullAutomaticReplacement {
+            return SmartSwitchDecision(
+                path: .fullAutomaticReplacement,
+                targetAccountID: nil,
+                targetEmail: nil,
+                reason: forceSwitch
+                    ? "账号池没有可静默注入的会话，执行全自动注册换号"
+                    : "额度偏低且没有可静默注入的备用号，自动创建并切换新账号"
+            )
+        }
+
+        let usableWithoutPayload = candidates.filter { $0.remainingCharacters > 0 && !$0.hasSilentSessionPayload }
+        if !usableWithoutPayload.isEmpty {
+            return SmartSwitchDecision(
+                path: .none,
+                targetAccountID: nil,
+                targetEmail: nil,
+                reason: "池中有 \(usableWithoutPayload.count) 个可用账号但缺少桌面会话缓存；请先「同步官方 App 登录与额度」，或开启自动创建新号"
+            )
+        }
+
+        return SmartSwitchDecision(
+            path: .none,
+            targetAccountID: nil,
+            targetEmail: nil,
+            reason: "没有可用备用账号，且未允许自动创建新号"
+        )
+    }
+
+    /// 把浏览器 profile 里的 token JSON 转成桌面端 `user-data.json` 明文结构，供静默注入复用。
+    public static func desktopUserDataPayload(fromBrowserTokenInfo tokenInfoJSON: String) -> String? {
+        guard let data = tokenInfoJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        let accessToken = (object["accessToken"] as? String)
+            ?? (object["access_token"] as? String)
+            ?? ""
+        let refreshToken = (object["refreshToken"] as? String)
+            ?? (object["refresh_token"] as? String)
+            ?? ""
+        let userID = (object["userId"] as? String)
+            ?? (object["user_id"] as? String)
+            ?? ""
+        let email = (object["email"] as? String) ?? ""
+
+        guard !accessToken.isEmpty, !userID.isEmpty else { return nil }
+
+        let credentials: [String: Any] = [
+            "access_token": accessToken,
+            "refresh_token": refreshToken,
+            "user_id": userID,
+            "email": email
+        ]
+        guard let credentialsData = try? JSONSerialization.data(withJSONObject: credentials, options: []),
+              let credentialsString = String(data: credentialsData, encoding: .utf8) else {
+            return nil
+        }
+
+        let wrapper: [String: Any] = ["userData": credentialsString]
+        guard let wrapperData = try? JSONSerialization.data(withJSONObject: wrapper, options: []),
+              let wrapperString = String(data: wrapperData, encoding: .utf8) else {
+            return nil
+        }
+        return wrapperString
+    }
+
+    public static func normalizeCheckIntervalMinutes(_ minutes: Int) -> Int {
+        min(max(minutes, 1), 120)
+    }
+
+    public static func normalizeThreshold(_ threshold: Int) -> Int {
+        min(max(threshold, 0), 50_000)
+    }
+
+    public static func normalizeHotSpareTarget(_ target: Int) -> Int {
+        min(max(target, 0), 5)
+    }
+}
+
 private extension String {
     func ifEmpty(_ fallback: String) -> String { isEmpty ? fallback : self }
 

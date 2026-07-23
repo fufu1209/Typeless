@@ -48,6 +48,24 @@
 8. 完成网页注册后同步 Chrome 会话并执行桌面端 handoff。
 9. 写入/延迟重写新手引导完成状态。
 
+## 静默换号与设备用户数上限
+
+Typeless 服务端会对**同一 deviceId 上登录过的用户数**设限。历史实现里：
+
+- 全自动一键换号会 `resetDevice`
+- 无感/智能静默换号只注入 `user-data.json`，**不换设备身份**
+
+这会在长期无感轮切后触发：
+
+`The number of users logged into this device has exceeded the limit.`
+
+当前 macOS 主流程已补齐：
+
+1. **静默换号前也执行设备身份重置**（Keychain + `device.cache` + 登录残留），再写入目标会话。
+2. **同步官方额度时识别设备用户数超限**（`DEVICE_USER_LIMIT` / 英文与中文文案）。
+3. **命中超限时跳过静默池切换**，直接降级为全自动 `resetDevice` + 注册/handoff。
+4. 静默切换成功与否以**目标邮箱校验通过**为准；未验证成功不标记旧号用完。
+
 ## 保护当前稳定状态的护栏
 
 - macOS 主程序仍是当前 SwiftUI/AppKit/Security/Apple Events 路线，不被 Windows 逻辑覆盖。

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import ApplicationServices
+import Combine
 import Security
 import Darwin
 import TypelessSwitchboardCore
@@ -219,8 +220,18 @@ struct AppSettings: Codable, Equatable, Sendable {
     var moeMailBaseURL: String
     var domains: [String]
     var checklist: [SwitchTask]
+    /// 后台无感额度守护：打开后定时同步官方额度，低额度时自动静默换号。
     var isAutoRotateEnabled: Bool
+    /// 常规巡检间隔（分钟），1–120；额度接近阈值时会自动加速到约 20 秒。
     var autoRotateCheckIntervalMinutes: Int
+    /// 剩余字数低于该阈值时触发自动换号（默认 200）。
+    var autoRotateRemainingThreshold: Int
+    /// 监测到低额度且池内没有可静默切换账号时，是否自动走全自动注册换号。
+    var autoCreateWhenPoolEmpty: Bool
+    /// 热备池目标数量：始终尽量保有这么多可静默注入的备用号。
+    var hotSpareTargetCount: Int
+    /// 关主窗口时是否继续后台守护（菜单栏常驻）。
+    var keepRunningInBackground: Bool
 
     static let defaults = AppSettings(
         typelessLoginURL: typelessDefaultLoginURL,
@@ -233,9 +244,77 @@ struct AppSettings: Codable, Equatable, Sendable {
             SwitchTask(title: "自动轮询对应邮箱验证码，必要时手动兜底", isRequired: true),
             SwitchTask(title: "登录完成后更新本工具里的已用字数", isRequired: false)
         ],
-        isAutoRotateEnabled: false,
-        autoRotateCheckIntervalMinutes: 5
+        isAutoRotateEnabled: true,
+        autoRotateCheckIntervalMinutes: SmartSwitchPolicy.defaultCheckIntervalMinutes,
+        autoRotateRemainingThreshold: SmartSwitchPolicy.defaultRemainingThreshold,
+        autoCreateWhenPoolEmpty: true,
+        hotSpareTargetCount: SmartSwitchPolicy.defaultHotSpareTarget,
+        keepRunningInBackground: true
     )
+
+    enum CodingKeys: String, CodingKey {
+        case typelessLoginURL
+        case moeMailBaseURL
+        case domains
+        case checklist
+        case isAutoRotateEnabled
+        case autoRotateCheckIntervalMinutes
+        case autoRotateRemainingThreshold
+        case autoCreateWhenPoolEmpty
+        case hotSpareTargetCount
+        case keepRunningInBackground
+    }
+
+    init(
+        typelessLoginURL: String,
+        moeMailBaseURL: String,
+        domains: [String],
+        checklist: [SwitchTask],
+        isAutoRotateEnabled: Bool,
+        autoRotateCheckIntervalMinutes: Int,
+        autoRotateRemainingThreshold: Int,
+        autoCreateWhenPoolEmpty: Bool,
+        hotSpareTargetCount: Int,
+        keepRunningInBackground: Bool
+    ) {
+        self.typelessLoginURL = typelessLoginURL
+        self.moeMailBaseURL = moeMailBaseURL
+        self.domains = domains
+        self.checklist = checklist
+        self.isAutoRotateEnabled = isAutoRotateEnabled
+        self.autoRotateCheckIntervalMinutes = autoRotateCheckIntervalMinutes
+        self.autoRotateRemainingThreshold = autoRotateRemainingThreshold
+        self.autoCreateWhenPoolEmpty = autoCreateWhenPoolEmpty
+        self.hotSpareTargetCount = hotSpareTargetCount
+        self.keepRunningInBackground = keepRunningInBackground
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = AppSettings.defaults
+        typelessLoginURL = try container.decodeIfPresent(String.self, forKey: .typelessLoginURL) ?? fallback.typelessLoginURL
+        moeMailBaseURL = try container.decodeIfPresent(String.self, forKey: .moeMailBaseURL) ?? fallback.moeMailBaseURL
+        domains = try container.decodeIfPresent([String].self, forKey: .domains) ?? fallback.domains
+        checklist = try container.decodeIfPresent([SwitchTask].self, forKey: .checklist) ?? fallback.checklist
+        // 旧版默认是关；新版无感守护默认开。若 JSON 里明确写了 false 仍尊重用户选择。
+        isAutoRotateEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAutoRotateEnabled) ?? true
+        autoRotateCheckIntervalMinutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(
+            try container.decodeIfPresent(Int.self, forKey: .autoRotateCheckIntervalMinutes)
+                ?? fallback.autoRotateCheckIntervalMinutes
+        )
+        autoRotateRemainingThreshold = SmartSwitchPolicy.normalizeThreshold(
+            try container.decodeIfPresent(Int.self, forKey: .autoRotateRemainingThreshold)
+                ?? fallback.autoRotateRemainingThreshold
+        )
+        autoCreateWhenPoolEmpty = try container.decodeIfPresent(Bool.self, forKey: .autoCreateWhenPoolEmpty)
+            ?? fallback.autoCreateWhenPoolEmpty
+        hotSpareTargetCount = SmartSwitchPolicy.normalizeHotSpareTarget(
+            try container.decodeIfPresent(Int.self, forKey: .hotSpareTargetCount)
+                ?? fallback.hotSpareTargetCount
+        )
+        keepRunningInBackground = try container.decodeIfPresent(Bool.self, forKey: .keepRunningInBackground)
+            ?? fallback.keepRunningInBackground
+    }
 }
 
 struct SwitchTask: Identifiable, Codable, Equatable, Sendable {
@@ -280,13 +359,34 @@ final class SwitchboardStore: ObservableObject {
     @Published var moeMailMessages: [MoeMailMessage] = []
     @Published var diagnostics: [DiagnosticItem] = []
     @Published var isRunningAutomaticReplacement = false
+    /// 智能换号 / 静默池内切换进行中（与全自动注册共用互斥，避免双开）。
+    @Published var isRunningSmartSwitch = false
     @Published var isSyncingSession = false
     @Published var syncStatusMessage = ""
+    @Published var lastAutoRotateCheckAt: Date?
+    @Published var lastAutoRotateDecisionReason = ""
+    @Published var autoRotateMonitorStatus = "守护未开启"
+    /// 最近一次静默换号失败原因（含设备用户数超限等），供 UI / 降级决策使用。
+    @Published var lastSilentSwitchFailureReason = ""
+    /// 最近一次同步官方会话时是否命中「设备登录用户数超限」。
+    @Published var lastSyncHitDeviceUserLimit = false
+    /// 当前官方账号剩余字数（菜单栏展示用）。
+    @Published var liveRemainingCharacters: Int?
+    @Published var liveAccountEmail = ""
 
     private let fileURL: URL
+    private var rotateMonitorTask: Task<Void, Never>?
+    private var isAutoRotateCheckInFlight = false
+    /// 上一轮巡检得到的剩余额度，用于自适应巡检间隔。
+    private var lastKnownRemainingForInterval: Int?
 
     var dataFileURL: URL {
         fileURL
+    }
+
+    /// 任一换号路径进行中时禁用主按钮。
+    var isSwitchBusy: Bool {
+        isRunningAutomaticReplacement || isRunningSmartSwitch || isSyncingSession
     }
 
     init() {
@@ -303,8 +403,12 @@ final class SwitchboardStore: ObservableObject {
         migrateDefaultsIfNeeded()
         ensureExtractScript()
         
+        // 无感守护：默认开启；旧用户若未写字段也默认开。
         if state.settings.isAutoRotateEnabled {
             startRotateMonitor()
+            autoRotateMonitorStatus = "无感守护已开启，等待首次巡检"
+        } else {
+            autoRotateMonitorStatus = "无感守护已关闭"
         }
     }
 
@@ -313,6 +417,37 @@ final class SwitchboardStore: ObservableObject {
             state.settings.typelessLoginURL == typelessOfficialURL {
             state.settings.typelessLoginURL = typelessDefaultLoginURL
         }
+
+        // 一次性迁移到「无感守护」默认：开启监测、池空自动注册、关窗后台、阈值 200、热备 1、常规 1 分钟巡检。
+        let seamlessMigrationKey = "didApplySeamlessGuardianDefaults_v1"
+        if !UserDefaults.standard.bool(forKey: seamlessMigrationKey) {
+            state.settings.isAutoRotateEnabled = true
+            state.settings.autoCreateWhenPoolEmpty = true
+            state.settings.keepRunningInBackground = true
+            state.settings.autoRotateRemainingThreshold = SmartSwitchPolicy.defaultRemainingThreshold
+            state.settings.autoRotateCheckIntervalMinutes = SmartSwitchPolicy.defaultCheckIntervalMinutes
+            state.settings.hotSpareTargetCount = max(
+                state.settings.hotSpareTargetCount,
+                SmartSwitchPolicy.defaultHotSpareTarget
+            )
+            UserDefaults.standard.set(true, forKey: seamlessMigrationKey)
+        }
+
+        if state.settings.autoRotateCheckIntervalMinutes <= 0 {
+            state.settings.autoRotateCheckIntervalMinutes = SmartSwitchPolicy.defaultCheckIntervalMinutes
+        }
+        if state.settings.autoRotateRemainingThreshold <= 0 {
+            state.settings.autoRotateRemainingThreshold = SmartSwitchPolicy.defaultRemainingThreshold
+        }
+        state.settings.autoRotateCheckIntervalMinutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(
+            state.settings.autoRotateCheckIntervalMinutes
+        )
+        state.settings.autoRotateRemainingThreshold = SmartSwitchPolicy.normalizeThreshold(
+            state.settings.autoRotateRemainingThreshold
+        )
+        state.settings.hotSpareTargetCount = SmartSwitchPolicy.normalizeHotSpareTarget(
+            state.settings.hotSpareTargetCount
+        )
         for index in state.settings.checklist.indices {
             if state.settings.checklist[index].title == "打开对应邮箱，手动处理必要验证码" {
                 state.settings.checklist[index].title = "自动轮询对应邮箱验证码，必要时手动兜底"
@@ -376,6 +511,54 @@ function getActiveSession() {
         return resolve({ success: false, error: "登录缓存中未包含有效的授权 Token" });
       }
 
+      function looksLikeDeviceUserLimit(text) {
+        if (!text) return false;
+        const lower = String(text).toLowerCase();
+        const spaced = lower.replace(/\s+/g, ' ');
+        const compact = lower.replace(/\s+/g, '');
+        return (
+          spaced.includes('number of users logged into this device has exceeded the limit') ||
+          spaced.includes('users logged into this device has exceeded') ||
+          spaced.includes('device has exceeded the limit') ||
+          spaced.includes('device user limit') ||
+          spaced.includes('too many users on this device') ||
+          compact.includes('numberofusersloggedintothisdevicehasexceededthelimit') ||
+          compact.includes('usersloggedintothisdevicehasexceeded') ||
+          compact.includes('devicehasexceededthelimit') ||
+          compact.includes('deviceuserlimit') ||
+          compact.includes('toomanyusersonthisdevice') ||
+          spaced.includes('登录该设备的用户数已超过限制') ||
+          spaced.includes('设备登录用户数已超') ||
+          spaced.includes('设备用户数超限') ||
+          spaced.includes('此设备登录的用户数已超过限制')
+        );
+      }
+
+      function summarizeApiError(statusCode, bodyText) {
+        const compact = String(bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+        let message = '';
+        try {
+          const parsed = JSON.parse(bodyText || '{}');
+          message = parsed.message || parsed.error || parsed.detail || parsed.msg || '';
+          if (!message && parsed.data && typeof parsed.data === 'object') {
+            message = parsed.data.message || parsed.data.error || '';
+          }
+        } catch (_) {}
+        const combined = [message, compact].filter(Boolean).join(' | ');
+        if (looksLikeDeviceUserLimit(combined) || looksLikeDeviceUserLimit(bodyText)) {
+          return {
+            code: 'DEVICE_USER_LIMIT',
+            error: `设备登录用户数已超限 (HTTP ${statusCode}): ${combined || 'The number of users logged into this device has exceeded the limit.'}`
+          };
+        }
+        return {
+          code: statusCode === 200 ? 'API_PAYLOAD_MISMATCH' : 'API_HTTP_ERROR',
+          error: statusCode === 200
+            ? (combined ? `API 返回格式不匹配：${combined}` : 'API 返回格式不匹配')
+            : `API 额度拉取失败 (HTTP ${statusCode})${combined ? ': ' + combined : ''}`
+        };
+      }
+
       // 获取额度使用状况
       const Qs = "7d4a8f2e6b9c3a1f5e8d2c7b4a9f6e3d1b5a2f9e6d3c0b7a4f1e8d5c2b9f6a3d";
       const yc = "9b1c67af3f7ecd1501d7da7196f281f5e0c7c292ebc2227d49ff9d20";
@@ -415,12 +598,14 @@ function getActiveSession() {
         res.on('data', (chunk) => body += chunk);
         res.on('end', () => {
           if (res.statusCode !== 200) {
+            const summarized = summarizeApiError(res.statusCode, body);
             return resolve({
               success: true,
               email: email,
               userId: user_id,
               rawJson: rawJsonString,
-              error: `API 额度拉取失败 (HTTP ${res.statusCode})`
+              errorCode: summarized.code,
+              error: summarized.error
             });
           }
           try {
@@ -436,22 +621,25 @@ function getActiveSession() {
                 monthlyLimit: vt.week_word_usage_limit,
                 info: `总字数: ${vt.total_words}, 已用秒数: ${Math.round(vt.total_audio_seconds)}秒`
               });
-            } else {
-              return resolve({
-                success: true,
-                email: email,
-                userId: user_id,
-                rawJson: rawJsonString,
-                error: "API 返回格式不匹配"
-              });
             }
-          } catch (e) {
+            const summarized = summarizeApiError(200, body);
             return resolve({
               success: true,
               email: email,
               userId: user_id,
               rawJson: rawJsonString,
-              error: "解析 API 报文失败"
+              errorCode: summarized.code,
+              error: summarized.error
+            });
+          } catch (e) {
+            const summarized = summarizeApiError(200, body);
+            return resolve({
+              success: true,
+              email: email,
+              userId: user_id,
+              rawJson: rawJsonString,
+              errorCode: summarized.code,
+              error: summarized.error || "解析 API 报文失败"
             });
           }
         });
@@ -549,6 +737,7 @@ writeActiveSession(inputJson);
 
     func syncActiveAppSessionAndQuota() async -> UUID? {
         isSyncingSession = true
+        lastSyncHitDeviceUserLimit = false
         syncStatusMessage = "正在读取本地 Typeless 登录状态并向云端同步额度..."
         statusMessage = syncStatusMessage
         
@@ -570,6 +759,7 @@ writeActiveSession(inputJson);
         guard result.status == 0 else {
             syncStatusMessage = "同步进程失败：\(result.output)"
             statusMessage = syncStatusMessage
+            noteDeviceUserLimitIfPresent(in: result.output)
             return nil
         }
         
@@ -587,6 +777,7 @@ writeActiveSession(inputJson);
             let monthlyLimit: Int?
             let info: String?
             let error: String?
+            let errorCode: String?
             let rawJson: String?
         }
         
@@ -595,6 +786,8 @@ writeActiveSession(inputJson);
             if !res.success {
                 syncStatusMessage = "同步失败：\(res.error ?? "未知错误")"
                 statusMessage = syncStatusMessage
+                noteDeviceUserLimitIfPresent(in: res.error)
+                noteDeviceUserLimitIfPresent(in: res.errorCode)
                 return nil
             }
             
@@ -602,6 +795,10 @@ writeActiveSession(inputJson);
                 syncStatusMessage = "解密成功但未找到邮箱"
                 statusMessage = syncStatusMessage
                 return nil
+            }
+
+            if res.errorCode == "DEVICE_USER_LIMIT" || SmartSwitchPolicy.isDeviceUserLimitError(res.error) {
+                lastSyncHitDeviceUserLimit = true
             }
             
             var matchedID: UUID? = nil
@@ -617,7 +814,8 @@ writeActiveSession(inputJson);
                     if let info = res.info {
                         state.accounts[i].notes = "已同步：\(info)"
                     }
-                    if let rawJson = res.rawJson {
+                    // 额度 API 正常时才刷新静默会话缓存；设备超限/API 错误时保留旧 payload，避免把半残会话写回账号池。
+                    if res.error == nil, let rawJson = res.rawJson, !rawJson.isEmpty {
                         state.accounts[i].rawUserDataPayload = rawJson
                     }
                     break
@@ -626,12 +824,20 @@ writeActiveSession(inputJson);
             
             if let matchedID = matchedID {
                 if let errorMsg = res.error {
-                    syncStatusMessage = "已同步账号「\(email)」，但 API 拉取有错：\(errorMsg)"
+                    if lastSyncHitDeviceUserLimit {
+                        syncStatusMessage = "已读到账号「\(email)」，但设备登录用户数已超限：\(errorMsg)"
+                    } else {
+                        syncStatusMessage = "已同步账号「\(email)」，但 API 拉取有错：\(errorMsg)"
+                    }
                 } else {
                     syncStatusMessage = "已成功更新当前官方账号「\(email)」的字数额度！"
                 }
                 save()
                 statusMessage = syncStatusMessage
+                // 设备超限时桌面会话不可信：返回 nil，让上层优先走 resetDevice + 全自动换号。
+                if lastSyncHitDeviceUserLimit {
+                    return nil
+                }
                 return matchedID
             } else {
                 // 新建账号
@@ -640,9 +846,16 @@ writeActiveSession(inputJson);
                 newAcc.usedCharacters = res.usedCharacters ?? 0
                 newAcc.monthlyLimit = res.monthlyLimit ?? 8000
                 newAcc.notes = "从官方 App 自动导入（\(res.info ?? "")）"
-                newAcc.rawUserDataPayload = res.rawJson
+                if res.error == nil {
+                    newAcc.rawUserDataPayload = res.rawJson
+                }
                 state.accounts.append(newAcc)
                 save()
+                if lastSyncHitDeviceUserLimit {
+                    syncStatusMessage = "发现账号「\(email)」，但设备登录用户数已超限，未采用当前桌面会话"
+                    statusMessage = syncStatusMessage
+                    return nil
+                }
                 syncStatusMessage = "发现新账号「\(email)」，已自动导入并切换！"
                 statusMessage = syncStatusMessage
                 return newAcc.id
@@ -651,7 +864,14 @@ writeActiveSession(inputJson);
         } catch {
             syncStatusMessage = "解析同步结果失败：\(error.localizedDescription)"
             statusMessage = syncStatusMessage
+            noteDeviceUserLimitIfPresent(in: result.output)
             return nil
+        }
+    }
+
+    private func noteDeviceUserLimitIfPresent(in message: String?) {
+        if SmartSwitchPolicy.isDeviceUserLimitError(message) {
+            lastSyncHitDeviceUserLimit = true
         }
     }
 
@@ -672,32 +892,55 @@ writeActiveSession(inputJson);
         }
     }
 
-    // MARK: - 账号池自动轮切与额度监控
+    // MARK: - 智能换号 / 账号池自动轮切与额度监控
 
-    private var rotateMonitorTask: Task<Void, Never>?
-
-    func startRotateMonitor() {
-        guard rotateMonitorTask == nil else { return }
-        rotateMonitorTask = Task { [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: 15 * 1_000_000_000)
-            } catch {
-                return
+    /// 启动或重启无感守护循环。`kickImmediately` 用于休眠唤醒 / 菜单「立即巡检」后的续跑。
+    func startRotateMonitor(kickImmediately: Bool = false) {
+        if rotateMonitorTask != nil {
+            if kickImmediately {
+                // 已在跑：额外触发一轮，不拆掉现有循环。
+                Task { [weak self] in
+                    _ = await self?.performAutoRotateCheck()
+                }
             }
-            
+            return
+        }
+        let threshold = SmartSwitchPolicy.normalizeThreshold(state.settings.autoRotateRemainingThreshold)
+        autoRotateMonitorStatus = kickImmediately
+            ? "无感守护运行中：立即巡检…"
+            : "无感守护运行中：约 \(SmartSwitchPolicy.defaultStartupDelaySeconds) 秒后首次读额度（阈值 \(threshold)）"
+        rotateMonitorTask = Task { [weak self] in
+            if !kickImmediately {
+                do {
+                    try await Task.sleep(nanoseconds: SmartSwitchPolicy.defaultStartupDelaySeconds * 1_000_000_000)
+                } catch {
+                    return
+                }
+            }
+
             while !Task.isCancelled {
                 guard let self = self else { break }
                 if self.state.settings.isAutoRotateEnabled {
-                    await self.performAutoRotateCheck()
+                    _ = await self.performAutoRotateCheck()
+                } else {
+                    break
                 }
-                
-                let minutes = max(self.state.settings.autoRotateCheckIntervalMinutes, 1)
-                let interval = Double(minutes) * 60.0
+
+                let delay = SmartSwitchPolicy.nextCheckDelaySeconds(
+                    remaining: self.lastKnownRemainingForInterval,
+                    threshold: self.state.settings.autoRotateRemainingThreshold,
+                    intervalMinutes: self.state.settings.autoRotateCheckIntervalMinutes
+                )
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: delay * 1_000_000_000)
                 } catch {
                     break
                 }
+            }
+            await MainActor.run {
+                self?.autoRotateMonitorStatus = self?.state.settings.isAutoRotateEnabled == true
+                    ? "无感守护已暂停（可点菜单「立即巡检额度」恢复）"
+                    : "无感守护已关闭"
             }
         }
     }
@@ -705,48 +948,437 @@ writeActiveSession(inputJson);
     func stopRotateMonitor() {
         rotateMonitorTask?.cancel()
         rotateMonitorTask = nil
+        if !state.settings.isAutoRotateEnabled {
+            autoRotateMonitorStatus = "无感守护已关闭"
+        }
     }
 
-    func performAutoRotateCheck() async {
-        guard let currentID = await syncActiveAppSessionAndQuota() else { return }
-        guard let currentIndex = accountIndex(id: currentID) else { return }
-        let currentAccount = state.accounts[currentIndex]
-        
-        if currentAccount.remainingCharacters < 200 {
-            if let nextAccount = findNextRotateCandidate(excluding: currentID) {
-                statusMessage = "检测到当前官方账号额度即将耗尽 (剩余不足200字)，正在为您静默轮换到备用账号「\(nextAccount.email)」..."
-                let success = await switchActiveAccountSilently(to: nextAccount.id)
-                if success {
-                    statusMessage = "额度接力成功！已自动无感切换至新账号「\(nextAccount.email)」，请继续使用！"
-                } else {
-                    statusMessage = "自动静默换号失败，请尝试手动同步或重试。"
-                }
-            } else {
-                statusMessage = "当前官方账号额度即将耗尽，但未在账号池中找到其它带有有效凭证的备用账号。"
+    /// 休眠唤醒 / 用户点菜单时调用：确保守护循环在跑，并立刻同步一轮额度。
+    func resumeRotateMonitorAfterWakeOrManualKick() {
+        guard state.settings.isAutoRotateEnabled else {
+            autoRotateMonitorStatus = "无感守护已关闭"
+            return
+        }
+        if rotateMonitorTask == nil {
+            startRotateMonitor(kickImmediately: true)
+        } else {
+            Task { [weak self] in
+                _ = await self?.performAutoRotateCheck()
             }
         }
     }
 
-    private func findNextRotateCandidate(excluding currentID: UUID) -> Account? {
-        return state.accounts.first { account in
-            account.id != currentID &&
-            account.isUsable &&
-            account.remainingCharacters > 0 &&
-            account.rawUserDataPayload != nil
+    /// 用户主入口：点一下即可。优先池内静默切换，没有可注入会话时再全自动注册。
+    func runSmartSwitch(
+        apiKey: String,
+        domain: String,
+        expiryTime: Int,
+        from currentID: UUID?,
+        forceSwitch: Bool = true
+    ) async -> UUID? {
+        guard !isRunningSmartSwitch, !isRunningAutomaticReplacement else {
+            statusMessage = "换号正在进行中，请稍候"
+            return currentID
+        }
+
+        isRunningSmartSwitch = true
+        defer { isRunningSmartSwitch = false }
+
+        statusMessage = forceSwitch ? "正在智能换号…" : "正在根据额度自动换号…"
+        let syncedID = await syncActiveAppSessionAndQuota()
+        // 设备用户数超限：静默池切换只会复用旧 deviceId，直接走全自动 resetDevice。
+        if lastSyncHitDeviceUserLimit {
+            lastAutoRotateDecisionReason = "检测到设备登录用户数超限，跳过静默切换并全自动重置设备身份"
+            if apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                statusMessage = "设备登录用户数已超限，且未配置 MoeMail API Key，无法自动注册新号。请配置后重试，或手动全自动换号。"
+                return currentID
+            }
+            statusMessage = "设备登录用户数已超限，正在重置设备身份并全自动注册换号…"
+            return await runOneClickAutomaticReplacement(
+                apiKey: apiKey,
+                domain: domain,
+                expiryTime: expiryTime,
+                from: syncedID ?? currentID,
+                interactive: forceSwitch
+            )
+        }
+
+        let resolvedCurrentID = syncedID ?? currentID
+        let currentRemaining: Int? = {
+            guard let id = resolvedCurrentID, let index = accountIndex(id: id) else { return nil }
+            return state.accounts[index].remainingCharacters
+        }()
+        if let currentRemaining {
+            lastKnownRemainingForInterval = currentRemaining
+            liveRemainingCharacters = currentRemaining
+        }
+
+        let candidates = smartSwitchCandidates(excluding: resolvedCurrentID)
+        let decision = SmartSwitchPolicy.decide(
+            currentRemaining: currentRemaining,
+            threshold: state.settings.autoRotateRemainingThreshold,
+            forceSwitch: forceSwitch,
+            candidates: candidates,
+            allowFullAutomaticReplacement: !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+        lastAutoRotateDecisionReason = decision.reason
+
+        switch decision.path {
+        case .none:
+            statusMessage = decision.reason
+            return resolvedCurrentID
+
+        case .silentPoolSwitch:
+            guard let targetID = decision.targetAccountID else {
+                statusMessage = "智能换号决策异常：缺少目标账号"
+                return resolvedCurrentID
+            }
+            if isRunningAutomaticReplacement {
+                statusMessage = "全自动换号进行中，智能换号已跳过"
+                return resolvedCurrentID
+            }
+            statusMessage = decision.reason
+            let success = await switchActiveAccountSilently(
+                to: targetID,
+                markPreviousExhausted: resolvedCurrentID,
+                activateTypeless: forceSwitch
+            )
+            if success {
+                statusMessage = "已静默切换到「\(decision.targetEmail ?? "")」（已轮换设备身份）"
+                // 换走当前号后补热备，用户无感。
+                Task { await self.ensureHotSpareIfNeeded(apiKey: apiKey, domain: domain) }
+                return targetID
+            }
+            if apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                statusMessage = "静默切换失败：\(lastSilentSwitchFailureReason.ifEmpty("未知原因"))；且未配置 MoeMail API Key，无法自动注册新号"
+                return resolvedCurrentID
+            }
+            let limitHint = SmartSwitchPolicy.isDeviceUserLimitError(lastSilentSwitchFailureReason)
+                || lastSyncHitDeviceUserLimit
+            statusMessage = limitHint
+                ? "静默切换命中设备用户数限制，正在降级为全自动重置设备并注册换号…"
+                : "静默切换失败，正在降级为全自动注册换号…"
+            return await runOneClickAutomaticReplacement(
+                apiKey: apiKey,
+                domain: domain,
+                expiryTime: expiryTime,
+                from: resolvedCurrentID,
+                interactive: forceSwitch
+            )
+
+        case .fullAutomaticReplacement:
+            statusMessage = decision.reason
+            return await runOneClickAutomaticReplacement(
+                apiKey: apiKey,
+                domain: domain,
+                expiryTime: expiryTime,
+                from: resolvedCurrentID,
+                interactive: forceSwitch
+            )
         }
     }
 
-    func switchActiveAccountSilently(to accountID: UUID) async -> Bool {
-        guard let index = accountIndex(id: accountID) else { return false }
+    @discardableResult
+    func performAutoRotateCheck(apiKey: String? = nil) async -> UUID? {
+        guard !isAutoRotateCheckInFlight else {
+            autoRotateMonitorStatus = "巡检进行中（跳过重叠触发）"
+            return nil
+        }
+        guard !isRunningAutomaticReplacement, !isRunningSmartSwitch else {
+            autoRotateMonitorStatus = "换号进行中，本轮巡检跳过"
+            return nil
+        }
+
+        isAutoRotateCheckInFlight = true
+        defer { isAutoRotateCheckInFlight = false }
+
+        lastAutoRotateCheckAt = Date()
+        autoRotateMonitorStatus = "正在同步额度…"
+
+        let key = (apiKey ?? KeychainStore.readAPIKey()).trimmingCharacters(in: .whitespacesAndNewlines)
+        let domain = state.settings.domains.first ?? ""
+        let allowCreate = state.settings.autoCreateWhenPoolEmpty && !key.isEmpty
+
+        let syncedID = await syncActiveAppSessionAndQuota()
+        if lastSyncHitDeviceUserLimit {
+            lastAutoRotateDecisionReason = "检测到设备登录用户数超限，跳过静默切换并全自动重置设备身份"
+            guard allowCreate else {
+                autoRotateMonitorStatus = "巡检完成：设备用户数超限，但未允许自动创建新号"
+                statusMessage = "设备登录用户数已超限；请配置 MoeMail API Key 并开启「池空时自动注册新号」"
+                return nil
+            }
+            if isRunningAutomaticReplacement || isRunningSmartSwitch {
+                autoRotateMonitorStatus = "巡检完成：设备超限但其它换号进行中"
+                return nil
+            }
+            autoRotateMonitorStatus = "设备用户数超限，自动重置设备并注册中…"
+            isRunningSmartSwitch = true
+            defer { isRunningSmartSwitch = false }
+            let newID = await runOneClickAutomaticReplacement(
+                apiKey: key,
+                domain: domain,
+                expiryTime: 0,
+                from: syncedID
+            )
+            autoRotateMonitorStatus = newID != nil ? "守护中：已因设备超限完成重置换号" : "巡检完成：设备超限后的自动注册失败"
+            return newID
+        }
+
+        guard let currentID = syncedID else {
+            lastAutoRotateDecisionReason = "无法读取官方 App 登录态，本轮巡检跳过"
+            autoRotateMonitorStatus = "巡检完成：未读到登录态（请保持 Typeless 已登录）"
+            return nil
+        }
+        guard let currentIndex = accountIndex(id: currentID) else {
+            autoRotateMonitorStatus = "巡检完成：账号未入库"
+            return nil
+        }
+
+        let remaining = state.accounts[currentIndex].remainingCharacters
+        lastKnownRemainingForInterval = remaining
+        liveRemainingCharacters = remaining
+        liveAccountEmail = state.accounts[currentIndex].email
+
+        let threshold = SmartSwitchPolicy.normalizeThreshold(state.settings.autoRotateRemainingThreshold)
+        let candidates = smartSwitchCandidates(excluding: currentID)
+        let decision = SmartSwitchPolicy.decide(
+            currentRemaining: remaining,
+            threshold: threshold,
+            forceSwitch: false,
+            candidates: candidates,
+            allowFullAutomaticReplacement: allowCreate
+        )
+        lastAutoRotateDecisionReason = decision.reason
+
+        var resultID: UUID? = currentID
+
+        switch decision.path {
+        case .none:
+            // 额度 ≥ 阈值：只监控、不换号；同时后台补热备，保证真到阈值时能秒切。
+            autoRotateMonitorStatus = SmartSwitchPolicy.monitorIdleStatus(remaining: remaining, threshold: threshold)
+            if allowCreate {
+                await ensureHotSpareIfNeeded(apiKey: key, domain: domain)
+            }
+
+        case .silentPoolSwitch:
+            guard let targetID = decision.targetAccountID else {
+                autoRotateMonitorStatus = "巡检完成：决策缺少目标账号"
+                break
+            }
+            if isRunningAutomaticReplacement || isRunningSmartSwitch {
+                autoRotateMonitorStatus = "巡检完成：其它换号进行中，跳过静默切换"
+                break
+            }
+            autoRotateMonitorStatus = "剩余 \(remaining) < \(threshold)，正在静默换号（含设备身份轮换）…"
+            let success = await switchActiveAccountSilently(
+                to: targetID,
+                markPreviousExhausted: currentID,
+                activateTypeless: false
+            )
+            if success {
+                statusMessage = "无感换号完成 → \(decision.targetEmail ?? "")"
+                autoRotateMonitorStatus = "守护中：已静默切换并轮换设备身份，继续监测"
+                resultID = targetID
+                if allowCreate {
+                    await ensureHotSpareIfNeeded(apiKey: key, domain: domain)
+                }
+            } else if allowCreate {
+                autoRotateMonitorStatus = SmartSwitchPolicy.isDeviceUserLimitError(lastSilentSwitchFailureReason)
+                    ? "静默命中设备限制，自动注册中…"
+                    : "静默失败，自动注册中…"
+                isRunningSmartSwitch = true
+                defer { isRunningSmartSwitch = false }
+                let newID = await runOneClickAutomaticReplacement(
+                    apiKey: key,
+                    domain: domain,
+                    expiryTime: 0,
+                    from: currentID
+                )
+                autoRotateMonitorStatus = newID != nil ? "守护中：已注册并切换" : "巡检完成：自动注册失败"
+                resultID = newID ?? currentID
+            } else {
+                statusMessage = "自动静默换号失败：\(lastSilentSwitchFailureReason.ifEmpty("未知原因"))；请配置 MoeMail API Key 或手动补号"
+                autoRotateMonitorStatus = "巡检完成：静默切换失败"
+            }
+
+        case .fullAutomaticReplacement:
+            autoRotateMonitorStatus = "剩余 \(remaining) < \(threshold) 且无备用会话，自动注册中…"
+            isRunningSmartSwitch = true
+            defer { isRunningSmartSwitch = false }
+            let newID = await runOneClickAutomaticReplacement(
+                apiKey: key,
+                domain: domain,
+                expiryTime: 0,
+                from: currentID
+            )
+            autoRotateMonitorStatus = (newID != nil && newID != currentID)
+                ? "守护中：已注册并切换"
+                : "巡检完成：自动注册未完成"
+            resultID = newID ?? currentID
+            if allowCreate, newID != nil {
+                await ensureHotSpareIfNeeded(apiKey: key, domain: domain)
+            }
+        }
+
+        return resultID
+    }
+
+    /// 后台补齐热备：额度充足时静默注册 1 个可注入会话的备用号，不切换当前使用号。
+    private func ensureHotSpareIfNeeded(apiKey: String, domain: String) async {
+        guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !isRunningAutomaticReplacement else { return }
+
+        let target = SmartSwitchPolicy.normalizeHotSpareTarget(state.settings.hotSpareTargetCount)
+        guard target > 0 else { return }
+
+        let activeID = liveAccountEmail.isEmpty
+            ? nil
+            : state.accounts.first { $0.email.lowercased() == liveAccountEmail.lowercased() }?.id
+        let candidates = smartSwitchCandidates(excluding: activeID)
+        guard SmartSwitchPolicy.needsHotSpare(candidates: candidates, target: target) else { return }
+
+        autoRotateMonitorStatus = "守护中：补齐热备账号…"
+        // 热备只走 Playwright 独立 profile，不碰桌面登录态。
+        let spareID = await runOneClickAutomaticReplacement(
+            apiKey: apiKey,
+            domain: domain,
+            expiryTime: 0,
+            from: nil,
+            preserveCurrentAccount: true
+        )
+        if let spareID, let index = accountIndex(id: spareID) {
+            let hasPayload = !(state.accounts[index].rawUserDataPayload?.isEmpty ?? true)
+            autoRotateMonitorStatus = hasPayload
+                ? "守护中：热备已就绪（\(state.accounts[index].email)）"
+                : "守护中：热备已注册但会话缓存未固化（下次可再同步）"
+        } else {
+            autoRotateMonitorStatus = "守护中：热备补齐未完成（下次巡检再试）"
+        }
+    }
+
+    private func smartSwitchCandidates(excluding currentID: UUID?) -> [SmartSwitchCandidate] {
+        state.accounts.compactMap { account in
+            guard account.id != currentID else { return nil }
+            guard account.isUsable, account.remainingCharacters > 0 else { return nil }
+            let payload = account.rawUserDataPayload?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return SmartSwitchCandidate(
+                id: account.id,
+                email: account.email.ifEmpty(account.name),
+                remainingCharacters: account.remainingCharacters,
+                hasSilentSessionPayload: !payload.isEmpty
+            )
+        }
+    }
+
+    func switchActiveAccountSilently(
+        to accountID: UUID,
+        markPreviousExhausted previousID: UUID? = nil,
+        activateTypeless: Bool = false
+    ) async -> Bool {
+        lastSilentSwitchFailureReason = ""
+        lastSyncHitDeviceUserLimit = false
+
+        guard let index = accountIndex(id: accountID) else {
+            lastSilentSwitchFailureReason = "目标账号不存在"
+            return false
+        }
         let targetAccount = state.accounts[index]
-        guard let payload = targetAccount.rawUserDataPayload, !payload.isEmpty else { return false }
-        
+        guard let payload = targetAccount.rawUserDataPayload, !payload.isEmpty else {
+            lastSilentSwitchFailureReason = "目标账号缺少可注入的桌面会话缓存"
+            return false
+        }
+
+        // 静默换号也必须轮换设备身份，否则同一 deviceId 会不断挂新 user，最终触发服务端设备用户数上限。
+        let injectOK = await reinjectSessionPayload(
+            payload,
+            activateTypeless: activateTypeless,
+            resetDeviceIdentity: true
+        )
+        guard injectOK else {
+            if lastSilentSwitchFailureReason.isEmpty {
+                lastSilentSwitchFailureReason = "写入桌面会话或重置设备身份失败"
+            }
+            return false
+        }
+
+        var verified = false
+        for attempt in 0..<SmartSwitchPolicy.silentSwitchVerifyAttempts {
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: SmartSwitchPolicy.silentSwitchVerifyDelaySeconds * 1_000_000_000)
+            }
+            if lastSyncHitDeviceUserLimit {
+                lastSilentSwitchFailureReason = "设备登录用户数已超限，静默会话不可用"
+                return false
+            }
+            if let synced = await syncActiveAppSessionAndQuota(),
+               let syncedIndex = accountIndex(id: synced),
+               state.accounts[syncedIndex].email.lowercased() == targetAccount.email.lowercased() {
+                liveAccountEmail = state.accounts[syncedIndex].email
+                liveRemainingCharacters = state.accounts[syncedIndex].remainingCharacters
+                lastKnownRemainingForInterval = liveRemainingCharacters
+                verified = true
+                break
+            }
+            if lastSyncHitDeviceUserLimit {
+                lastSilentSwitchFailureReason = syncStatusMessage.ifEmpty("设备登录用户数已超限，静默会话不可用")
+                return false
+            }
+        }
+
+        guard verified else {
+            if lastSilentSwitchFailureReason.isEmpty {
+                lastSilentSwitchFailureReason = lastSyncHitDeviceUserLimit
+                    ? "设备登录用户数已超限，静默会话不可用"
+                    : "静默注入后未能确认目标账号「\(targetAccount.email)」已生效"
+            }
+            return false
+        }
+
+        if let previousID,
+           let previousIndex = accountIndex(id: previousID),
+           previousID != accountID {
+            state.accounts[previousIndex].status = .exhausted
+            state.accounts[previousIndex].usedCharacters = state.accounts[previousIndex].monthlyLimit
+            state.accounts[previousIndex].notes = "已由无感换号切换到：\(targetAccount.email.ifEmpty(targetAccount.name))"
+        }
+
+        for idx in state.settings.checklist.indices {
+            state.settings.checklist[idx].isDone = false
+        }
+
+        liveAccountEmail = targetAccount.email
+        if liveRemainingCharacters == nil {
+            liveRemainingCharacters = targetAccount.remainingCharacters
+        }
+        save()
+        return true
+    }
+
+    /// 退出 Typeless →（可选）重置设备身份 → 写入加密会话 → 后台重开（默认不抢前台）。
+    /// - Parameter resetDeviceIdentity: 静默换号应传 true，避免同一 deviceId 挂过多账号触发服务端限制。
+    private func reinjectSessionPayload(
+        _ payload: String,
+        activateTypeless: Bool,
+        resetDeviceIdentity: Bool = true
+    ) async -> Bool {
         _ = terminateInstalledTypelessApp()
-        
+
+        if resetDeviceIdentity {
+            let backupRoot = automationDirectoryURL()
+                .appendingPathComponent("DesktopSessionBackups", isDirectory: true)
+                .appendingPathComponent("silent-\(Self.safeTimestamp())", isDirectory: true)
+            let resetLog = resetTypelessDeviceIdentityForAutomaticReplacement(backupRoot: backupRoot)
+            // 设备重置会删掉 user-data.json；紧接着用目标会话 payload 重新写入。
+            if resetLog.contains(where: { $0.contains("失败") && !$0.contains("未发现") }) {
+                lastSilentSwitchFailureReason = resetLog.first { $0.contains("失败") } ?? "设备身份重置失败"
+                // 仍继续尝试写入会话，但保留失败原因供上层降级。
+            }
+        }
+
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
         let scriptURL = folder.appendingPathComponent("write-active-session.js")
-        
+
         let result = await Task.detached(priority: .userInitiated) {
             return SwitchboardStore.runProcess(
                 arguments: ["node", scriptURL.path, payload],
@@ -755,19 +1387,32 @@ writeActiveSession(inputJson);
                 timeoutSeconds: 10
             )
         }.value
-        
+
         guard result.status == 0 else {
+            lastSilentSwitchFailureReason = "写入桌面会话失败：\(result.output.ifEmpty("退出码 \(result.status)"))"
             return false
         }
-        
-        openInstalledTypelessApp()
-        
-        for idx in state.settings.checklist.indices {
-            state.settings.checklist[idx].isDone = false
+
+        // 确保 Typeless 数据目录存在，避免设备缓存被清后 Electron 冷启动路径异常。
+        for directory in typelessDesktopSessionDataDirectories() {
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         }
-        
-        save()
+
+        launchTypelessInBackground(activate: activateTypeless)
+        // 给 Electron 一点时间读入新会话并生成新的 device.cache。
+        try? await Task.sleep(nanoseconds: SmartSwitchPolicy.silentInjectSettleSeconds * 1_000_000_000)
         return true
+    }
+
+    private func launchTypelessInBackground(activate: Bool) {
+        guard let path = typelessAppPath() else {
+            if activate { openInstalledTypelessApp() }
+            return
+        }
+        let url = URL(fileURLWithPath: path)
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = activate
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, _ in }
     }
 
 
@@ -1484,24 +2129,57 @@ writeActiveSession(inputJson);
         statusMessage = errors > 0 ? "自检完成：\(errors) 个问题需要处理" : "自检完成：\(warnings) 个注意项"
     }
 
+    /// 权限探测结果缓存，避免后台热备/巡检反复触发系统弹窗。
+    private var cachedAccessibilityTrusted: Bool?
+    private var cachedAutomationOK: Bool?
+    private var cachedAutomationDetail = ""
+    private var lastPermissionProbeAt: Date?
+    private var didAutoOpenPermissionSettingsThisSession = false
+    private let permissionProbeCacheTTL: TimeInterval = 30 * 60
+
+    private func refreshPermissionCacheIfNeeded(force: Bool = false, probeAppleEvents: Bool = true) {
+        if !force,
+           let last = lastPermissionProbeAt,
+           Date().timeIntervalSince(last) < permissionProbeCacheTTL,
+           cachedAccessibilityTrusted != nil {
+            return
+        }
+
+        // 只做静默检查，绝不调用 AXIsProcessTrustedWithOptions(prompt:true)。
+        // prompt:true 会在未授权/签名变化时反复弹出“想使用辅助功能”。
+        cachedAccessibilityTrusted = AXIsProcessTrusted()
+
+        if probeAppleEvents {
+            // Apple Events 探测也可能弹“自动化”授权；后台路径默认跳过，仅自检/手动时探测。
+            let chromeProbe = Self.runAppleEventsProbe(#"tell application "Google Chrome" to get version"#)
+            let systemEventsProbe = Self.runAppleEventsProbe(#"tell application "System Events" to count processes"#)
+            cachedAutomationOK = chromeProbe.success && systemEventsProbe.success
+            cachedAutomationDetail = "Chrome：\(chromeProbe.message)；System Events：\(systemEventsProbe.message)"
+        } else if cachedAutomationOK == nil {
+            cachedAutomationOK = true
+            cachedAutomationDetail = "后台路径跳过 Apple Events 探测，避免重复弹窗"
+        }
+
+        lastPermissionProbeAt = Date()
+    }
+
     private func appendMacPermissionDiagnostics(to results: inout [DiagnosticItem]) {
-        let accessibilityTrusted = AXIsProcessTrusted()
+        refreshPermissionCacheIfNeeded(force: true, probeAppleEvents: true)
+        let accessibilityTrusted = cachedAccessibilityTrusted == true
         results.append(DiagnosticItem(
             title: "电脑权限：辅助功能",
             detail: accessibilityTrusted
                 ? "已允许辅助功能控制；可自动点击 Chrome 弹窗、System Events 弹窗和 Typeless 交接。"
-                : "需要在系统设置 → 隐私与安全性 → 辅助功能中允许 TypelessSwitchboard，才能自动点击 Chrome 的“打开 Typeless.app”弹窗。",
+                : "需要在系统设置 → 隐私与安全性 → 辅助功能中允许 TypelessSwitchboard，才能自动点击 Chrome 的“打开 Typeless.app”弹窗。请只开一次；工具不会反复弹授权窗。",
             level: accessibilityTrusted ? .ok : .warning
         ))
 
-        let chromeProbe = Self.runAppleEventsProbe(#"tell application "Google Chrome" to get version"#)
-        let systemEventsProbe = Self.runAppleEventsProbe(#"tell application "System Events" to count processes"#)
-        let automationOK = chromeProbe.success && systemEventsProbe.success
+        let automationOK = cachedAutomationOK == true
         results.append(DiagnosticItem(
             title: "电脑权限：自动化",
             detail: automationOK
                 ? "Apple Events 已可控制 Google Chrome 和 System Events。"
-                : "需要在系统设置 → 隐私与安全性 → 自动化（Privacy_Automation）允许 TypelessSwitchboard 控制 Google Chrome 和 System Events。Chrome：\(chromeProbe.message)；System Events：\(systemEventsProbe.message)",
+                : "需要在系统设置 → 隐私与安全性 → 自动化（Privacy_Automation）允许 TypelessSwitchboard 控制 Google Chrome 和 System Events。\(cachedAutomationDetail)",
             level: automationOK ? .ok : .warning
         ))
 
@@ -1525,27 +2203,48 @@ writeActiveSession(inputJson);
         ))
     }
 
-    private func preflightMacPermissionsBeforeAutomaticReplacement(log: inout [String]) -> Bool {
-        log.append("开始注册前权限预检：先触发/检查辅助功能、自动化、Chrome 外部协议和 Typeless 常用权限")
+    /// 注册前权限预检：只静默检查，绝不反复弹系统授权窗。
+    /// - Parameter interactive: 用户手动点换号时为 true，允许整次会话最多打开一次系统设置。
+    private func preflightMacPermissionsBeforeAutomaticReplacement(
+        log: inout [String],
+        interactive: Bool = false
+    ) -> Bool {
+        log.append("开始注册前权限预检：静默检查辅助功能与自动化（不弹系统授权窗）")
 
-        let accessibilityTrusted = AXIsProcessTrusted()
-        let chromeProbe = Self.runAppleEventsProbe(#"tell application "Google Chrome" to get version"#)
-        let systemEventsProbe = Self.runAppleEventsProbe(#"tell application "System Events" to count processes"#)
-        let automationOK = chromeProbe.success && systemEventsProbe.success
+        // 后台热备/巡检：只用缓存 + 静默 AX 检查，不探测 Apple Events，避免连环弹窗。
+        refreshPermissionCacheIfNeeded(force: interactive, probeAppleEvents: interactive)
+
+        let accessibilityTrusted = cachedAccessibilityTrusted == true
+        let automationOK = cachedAutomationOK != false
 
         if accessibilityTrusted {
             log.append("权限预检通过：辅助功能 Accessibility 已允许")
         } else {
-            log.append("权限预警：辅助功能 Accessibility 未允许，将尝试以无辅助功能模式继续运行（如自动点击失败可手动辅助）")
+            log.append("权限预警：辅助功能 Accessibility 未允许；Playwright 注册可继续，自动点 Chrome 弹窗可能受限")
+            if interactive {
+                openMacPermissionSettingsOnce("Privacy_Accessibility")
+            }
         }
 
         if automationOK {
-            log.append("权限预检通过：自动化 Apple Events 已可控制 Google Chrome 和 System Events")
+            log.append("权限预检通过：自动化 Apple Events 状态可用或已跳过探测")
         } else {
-            log.append("权限预警：自动化 Apple Events 未完全允许；Chrome：\(chromeProbe.message)；System Events：\(systemEventsProbe.message)")
+            log.append("权限预警：自动化 Apple Events 可能未完全允许。\(cachedAutomationDetail)")
+            if interactive {
+                openMacPermissionSettingsOnce("Privacy_Automation")
+            }
         }
 
-        log.append("权限预检完成：继续执行创建邮箱、清理环境和自动换号逻辑")
+        // 不再因权限缺失硬暂停：反复 hard-fail + 后台重试会导致用户一直看到授权/设置弹窗。
+        // Playwright 注册本身不依赖辅助功能；缺权限时最多降级自动点弹窗能力。
+        if !accessibilityTrusted || !automationOK {
+            log.append("权限未齐也继续执行；请在系统设置里一次性允许后，重建签名的 App 也只需再开一次")
+            if interactive {
+                statusMessage = "权限未齐：已继续换号；辅助功能/自动化请在系统设置里一次性打开"
+            }
+        } else {
+            log.append("权限预检完成：继续执行创建邮箱、清理环境和自动换号逻辑")
+        }
         return true
     }
 
@@ -1554,14 +2253,31 @@ writeActiveSession(inputJson);
         statusMessage = "已复制 macOS 权限清单"
     }
 
+    /// 用户主动点 UI 时打开系统设置；自动流程整次会话最多打开一次。
     func openMacPermissionSettings(_ settingsPaneIdentifier: String) {
-        let raw = "x-apple.systempreferences:com.apple.preference.security?\(settingsPaneIdentifier)"
-        guard let url = URL(string: raw) else {
-            statusMessage = "权限设置入口无效：\(settingsPaneIdentifier)"
+        openMacPermissionSettingsOnce(settingsPaneIdentifier, force: true)
+    }
+
+    private func openMacPermissionSettingsOnce(_ settingsPaneIdentifier: String, force: Bool = false) {
+        if !force, didAutoOpenPermissionSettingsThisSession {
             return
         }
-        NSWorkspace.shared.open(url)
-        statusMessage = "已打开系统设置：\(settingsPaneIdentifier)"
+        if !force {
+            didAutoOpenPermissionSettingsThisSession = true
+        }
+
+        // 优先用现代 System Settings URL，减少旧路径反复拉起。
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.security?\(settingsPaneIdentifier)",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(settingsPaneIdentifier)"
+        ]
+        for raw in candidates {
+            if let url = URL(string: raw), NSWorkspace.shared.open(url) {
+                statusMessage = "已打开系统设置：\(settingsPaneIdentifier)（只需允许一次）"
+                return
+            }
+        }
+        statusMessage = "权限设置入口无效：\(settingsPaneIdentifier)"
     }
 
     func openDataFolder() {
@@ -1900,7 +2616,9 @@ writeActiveSession(inputJson);
         apiKey: String,
         domain: String,
         expiryTime: Int,
-        from currentID: UUID?
+        from currentID: UUID?,
+        preserveCurrentAccount: Bool = false,
+        interactive: Bool = false
     ) async -> UUID? {
         guard !isRunningAutomaticReplacement else {
             statusMessage = "全自动换号正在运行中"
@@ -1910,12 +2628,18 @@ writeActiveSession(inputJson);
         isRunningAutomaticReplacement = true
         defer { isRunningAutomaticReplacement = false }
 
-        var log: [String] = ["开始全自动一键换号"]
+        var log: [String] = [
+            preserveCurrentAccount ? "开始热备注册（不切换当前使用号）" : "开始全自动一键换号"
+        ]
         let previousAccount = currentID
             .flatMap { id in accountIndex(id: id).map { state.accounts[$0] } }
         var previousAccountEmailForResult = previousAccount?.email
 
-        guard preflightMacPermissionsBeforeAutomaticReplacement(log: &log) else {
+        // 热备/后台：interactive=false，绝不弹辅助功能授权窗、不反复打开系统设置。
+        guard preflightMacPermissionsBeforeAutomaticReplacement(
+            log: &log,
+            interactive: interactive && !preserveCurrentAccount
+        ) else {
             state.lastAutomationResult = RegistrationAutomationResult(
                 previousAccountID: previousAccount?.id,
                 previousAccountEmail: previousAccount?.email,
@@ -1952,17 +2676,25 @@ writeActiveSession(inputJson);
             return nil
         }
         log.append(runtime.message)
-        let staleChromePromptLog = resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement()
-        log.append(contentsOf: staleChromePromptLog)
-        let staleChromeTabsLog = closePersonalChromeTypelessTabsBeforeReplacement()
-        log.append(contentsOf: staleChromeTabsLog)
-        let desktopPreparationLog = prepareLocalTypelessDesktopEnvironmentForAutomaticReplacement()
-        log.append(contentsOf: desktopPreparationLog)
-        let browserSessionPreparationLog = prepareRetainedTypelessBrowserSessionsForAutomaticReplacement()
-        log.append(contentsOf: browserSessionPreparationLog)
-        let chromePreparationLog = preparePersonalChromeTypelessWebSessionForAutomaticReplacement()
-        log.append(contentsOf: chromePreparationLog)
-        statusMessage = "正在创建新的 MoeMail 邮箱和 Typeless 注册资料..."
+
+        if preserveCurrentAccount {
+            // 热备：只在独立 Playwright profile 里注册，绝不碰当前桌面/Chrome 登录态。
+            log.append("热备模式：跳过桌面/Chrome 清理与 handoff，避免打断当前使用")
+        } else {
+            let staleChromePromptLog = resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement()
+            log.append(contentsOf: staleChromePromptLog)
+            let staleChromeTabsLog = closePersonalChromeTypelessTabsBeforeReplacement()
+            log.append(contentsOf: staleChromeTabsLog)
+            let desktopPreparationLog = prepareLocalTypelessDesktopEnvironmentForAutomaticReplacement()
+            log.append(contentsOf: desktopPreparationLog)
+            let browserSessionPreparationLog = prepareRetainedTypelessBrowserSessionsForAutomaticReplacement()
+            log.append(contentsOf: browserSessionPreparationLog)
+            let chromePreparationLog = preparePersonalChromeTypelessWebSessionForAutomaticReplacement()
+            log.append(contentsOf: chromePreparationLog)
+        }
+        statusMessage = preserveCurrentAccount
+            ? "正在后台注册热备账号…"
+            : "正在创建新的 MoeMail 邮箱和 Typeless 注册资料..."
 
         guard let newID = await createMoeMailRegistrationCandidate(
             apiKey: apiKey,
@@ -2082,6 +2814,7 @@ writeActiveSession(inputJson);
         )
 
         if automationComplete,
+           !preserveCurrentAccount,
            let currentIndex = accountIndex(id: currentID),
            state.accounts[currentIndex].id != account.id {
             state.accounts[currentIndex].status = .exhausted
@@ -2096,7 +2829,9 @@ writeActiveSession(inputJson);
                 state.accounts[refreshedIndex].reviewedAt = Date()
                 state.accounts[refreshedIndex].status = .available
                 state.accounts[refreshedIndex].usedCharacters = 0
-                state.accounts[refreshedIndex].notes = "自动换号已提取验证码，浏览器结果判定注册完成，可用于切换"
+                state.accounts[refreshedIndex].notes = preserveCurrentAccount
+                    ? "热备账号：已注册完成，等待无感静默切换"
+                    : "自动换号已提取验证码，浏览器结果判定注册完成，可用于切换"
             } else {
                 state.accounts[refreshedIndex].reviewState = .pending
                 state.accounts[refreshedIndex].reviewedAt = nil
@@ -2110,18 +2845,42 @@ writeActiveSession(inputJson);
 
         let browserProfileURL = makeBrowserProfileDirectoryURL(account: account)
         if automationComplete {
-            log.append(contentsOf: syncPersonalChromeTypelessWebSession(
-                account: account,
-                profileDirectoryPath: browserProfileURL.path
-            ))
-            log.append(handoffRetainedTypelessProfileToDesktopOnce(profileDirectoryPath: browserProfileURL.path, expectedEmail: account.email))
-            log.append("新账号浏览器会话已保留：\(browserProfileURL.path)；未自动打开额外浏览器，需要排查时再点“打开新账号会话”")
-            log.append(contentsOf: completeTypelessDesktopOnboardingIfPresent(expectedEmail: account.email, timeoutSeconds: 120))
+            // 优先从浏览器 profile 抽出 token，写成可静默注入的桌面会话 payload。
+            if let tokenInfo = extractTypelessTokenInfo(
+                fromBrowserProfile: browserProfileURL.path,
+                expectedEmail: account.email
+            ),
+               let desktopPayload = SmartSwitchPolicy.desktopUserDataPayload(fromBrowserTokenInfo: tokenInfo),
+               let refreshedIndex = accountIndex(id: account.id) {
+                state.accounts[refreshedIndex].rawUserDataPayload = desktopPayload
+                account = state.accounts[refreshedIndex]
+                log.append("已从浏览器 profile 固化静默会话缓存，可供下次无感换号秒切")
+            }
+
+            if !preserveCurrentAccount {
+                log.append(contentsOf: syncPersonalChromeTypelessWebSession(
+                    account: account,
+                    profileDirectoryPath: browserProfileURL.path
+                ))
+                log.append(handoffRetainedTypelessProfileToDesktopOnce(
+                    profileDirectoryPath: browserProfileURL.path,
+                    expectedEmail: account.email
+                ))
+                log.append("新账号浏览器会话已保留：\(browserProfileURL.path)；未自动打开额外浏览器，需要排查时再点“打开新账号会话”")
+                log.append(contentsOf: completeTypelessDesktopOnboardingIfPresent(
+                    expectedEmail: account.email,
+                    timeoutSeconds: 120
+                ))
+            } else {
+                log.append("热备模式：已保留浏览器 profile，未切换当前桌面/Chrome 使用号")
+            }
         }
 
-        copyToClipboard(automationComplete ? account.email : (verificationCode ?? account.email))
-        for index in state.settings.checklist.indices {
-            state.settings.checklist[index].isDone = false
+        if !preserveCurrentAccount {
+            copyToClipboard(automationComplete ? account.email : (verificationCode ?? account.email))
+            for index in state.settings.checklist.indices {
+                state.settings.checklist[index].isDone = false
+            }
         }
 
         let status: RegistrationAutomationStatus = automationComplete ? .completed : .needsAttention
@@ -2141,10 +2900,35 @@ writeActiveSession(inputJson);
             log: log
         )
         save()
-        if automationComplete {
-            Task {
-                _ = await syncActiveAppSessionAndQuota()
+        if automationComplete, !preserveCurrentAccount {
+            // 同步官方会话并把桌面登录态缓存写回账号池，供下次无感换号静默注入。
+            for attempt in 0..<SmartSwitchPolicy.sessionCaptureRetryAttempts {
+                if attempt > 0 {
+                    try? await Task.sleep(nanoseconds: SmartSwitchPolicy.sessionCaptureRetryDelaySeconds * 1_000_000_000)
+                }
+                if let synced = await syncActiveAppSessionAndQuota(),
+                   let syncedIndex = accountIndex(id: synced) {
+                    let email = state.accounts[syncedIndex].email.lowercased()
+                    if email == account.email.lowercased() {
+                        liveAccountEmail = state.accounts[syncedIndex].email
+                        liveRemainingCharacters = state.accounts[syncedIndex].remainingCharacters
+                        lastKnownRemainingForInterval = liveRemainingCharacters
+                        break
+                    }
+                    if state.accounts[syncedIndex].rawUserDataPayload != nil,
+                       let accountIndex = accountIndex(id: account.id),
+                       state.accounts[accountIndex].rawUserDataPayload == nil {
+                        // 桌面已是新号但邮箱匹配慢时，仍把 payload 留在账号上。
+                        break
+                    }
+                }
             }
+        }
+        if preserveCurrentAccount {
+            statusMessage = automationComplete
+                ? "热备账号已就绪：\(account.email)"
+                : "热备注册未完成，等待下次补齐：\(account.email)"
+            return automationComplete ? account.id : nil
         }
         statusMessage = automationComplete
             ? "全自动换号已完成，已同步 Google Chrome / Typeless 桌面端并复制新邮箱：\(account.email)"
@@ -4054,6 +4838,7 @@ enum KeychainStore {
 
 @main
 struct TypelessSwitchboardApp: App {
+    @NSApplicationDelegateAdaptor(SwitchboardAppDelegate.self) private var appDelegate
     @StateObject private var store = SwitchboardStore()
 
     var body: some Scene {
@@ -4061,12 +4846,162 @@ struct TypelessSwitchboardApp: App {
             ContentView()
                 .environmentObject(store)
                 .frame(minWidth: 1180, minHeight: 760)
+                .onAppear {
+                    appDelegate.bind(store: store)
+                }
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             CommandGroup(replacing: .newItem) { }
         }
+    }
+}
+
+/// 关窗继续跑 + 菜单栏状态，支撑「后台无感守护」。
+@MainActor
+final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
+    private weak var store: SwitchboardStore?
+    private var statusItem: NSStatusItem?
+    private var statusCancellable: AnyCancellable?
+    private var mainWindow: NSWindow?
+    private var didInstallWakeObserver = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 允许关主窗后进程仍在，靠菜单栏保活。
+        NSApp.setActivationPolicy(.regular)
+        installWakeObserverIfNeeded()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        // 默认不退出；用户可在设置里关掉 keepRunningInBackground。
+        !(store?.state.settings.keepRunningInBackground ?? true)
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // 从后台/其他 App 切回来时刷一次菜单栏；守护本身不依赖前台。
+        refreshStatusItemTitle()
+    }
+
+    func bind(store: SwitchboardStore) {
+        guard self.store == nil else { return }
+        self.store = store
+        installStatusItemIfNeeded()
+        installWakeObserverIfNeeded()
+        statusCancellable = store.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshStatusItemTitle()
+            }
+        // 启动后稍等再刷一次标题；守护循环由 store.init 负责启动。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.refreshStatusItemTitle()
+        }
+        // 再过几秒若还没读到剩余字数，主动踢一轮（避免用户以为「监控坏了」）。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self, let store = self.store else { return }
+            if store.state.settings.isAutoRotateEnabled, store.liveRemainingCharacters == nil {
+                store.resumeRotateMonitorAfterWakeOrManualKick()
+            }
+            self.refreshStatusItemTitle()
+        }
+    }
+
+    private func installWakeObserverIfNeeded() {
+        guard !didInstallWakeObserver else { return }
+        didInstallWakeObserver = true
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleSystemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func handleSystemDidWake() {
+        store?.resumeRotateMonitorAfterWakeOrManualKick()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.refreshStatusItemTitle()
+        }
+    }
+
+    private func installStatusItemIfNeeded() {
+        guard statusItem == nil else { return }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            button.image = NSImage(
+                systemSymbolName: "switch.2",
+                accessibilityDescription: "Typeless Switchboard"
+            )
+            button.imagePosition = .imageLeading
+            button.title = "守护"
+        }
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "打开主窗口", action: #selector(showMainWindow), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem(title: "立即巡检额度", action: #selector(runCheckNow), keyEquivalent: "r"))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
+        menu.items.forEach { $0.target = self }
+        item.menu = menu
+        statusItem = item
+        refreshStatusItemTitle()
+    }
+
+    private func refreshStatusItemTitle() {
+        guard let store, let button = statusItem?.button else { return }
+        let threshold = SmartSwitchPolicy.normalizeThreshold(store.state.settings.autoRotateRemainingThreshold)
+        if store.isRunningAutomaticReplacement || store.isRunningSmartSwitch {
+            button.title = "换号中"
+            button.toolTip = store.autoRotateMonitorStatus
+            return
+        }
+        if let remaining = store.liveRemainingCharacters {
+            // 菜单栏：剩余字数；低于阈值时加「↓」提示即将/正在低额度。
+            button.title = remaining < threshold ? "↓\(remaining)" : "\(remaining)"
+            button.toolTip = [
+                store.liveAccountEmail.isEmpty ? nil : "当前：\(store.liveAccountEmail)",
+                "剩余 \(remaining) 字 · 换号阈值 \(threshold)（仅低于阈值才自动换）",
+                store.autoRotateMonitorStatus,
+                store.lastAutoRotateDecisionReason.isEmpty ? nil : store.lastAutoRotateDecisionReason
+            ].compactMap { $0 }.joined(separator: "\n")
+        } else if store.state.settings.isAutoRotateEnabled {
+            button.title = "监控"
+            button.toolTip = [
+                "无感额度守护已开，等待读到官方剩余字数",
+                "换号阈值：剩余 < \(threshold) 才自动换号",
+                store.autoRotateMonitorStatus
+            ].joined(separator: "\n")
+        } else {
+            button.title = "关闭"
+            button.toolTip = "无感额度守护已关闭"
+        }
+    }
+
+    @objc private func showMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = NSApp.windows.first(where: { $0.canBecomeMain }) {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            // 若窗口已被关，发通知让系统重建（SwiftUI WindowGroup 会在 activate 时恢复）。
+            for window in NSApp.windows {
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+    }
+
+    @objc private func runCheckNow() {
+        guard let store else { return }
+        store.resumeRotateMonitorAfterWakeOrManualKick()
+        Task {
+            // resume 里已可能触发检查；再刷一次标题保证菜单栏更新。
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            refreshStatusItemTitle()
+        }
+    }
+
+    @objc private func quitApp() {
+        store?.stopRotateMonitor()
+        NSApp.terminate(nil)
     }
 }
 
@@ -4217,8 +5152,8 @@ struct ContentView: View {
                 .padding(.horizontal, 18)
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle("启用额度自动轮切", isOn: Binding(
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("无感额度守护（后台自动换号）", isOn: Binding(
                     get: { store.state.settings.isAutoRotateEnabled },
                     set: { newValue in
                         store.state.settings.isAutoRotateEnabled = newValue
@@ -4227,25 +5162,134 @@ struct ContentView: View {
                 ))
                 .toggleStyle(.checkbox)
                 .font(.subheadline.weight(.medium))
-                
-                Text("后台每 5 分钟巡检。若额度耗满，自动静默切换到池中下一个可用账号。")
+
+                Toggle("池空时自动注册新号", isOn: Binding(
+                    get: { store.state.settings.autoCreateWhenPoolEmpty },
+                    set: { newValue in
+                        store.state.settings.autoCreateWhenPoolEmpty = newValue
+                        store.save()
+                    }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .disabled(!store.state.settings.isAutoRotateEnabled)
+
+                Toggle("关窗后继续后台守护", isOn: Binding(
+                    get: { store.state.settings.keepRunningInBackground },
+                    set: { newValue in
+                        store.state.settings.keepRunningInBackground = newValue
+                        store.save()
+                    }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+
+                HStack {
+                    Text("剩余 <")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField(
+                        "阈值",
+                        value: Binding(
+                            get: { store.state.settings.autoRotateRemainingThreshold },
+                            set: { newValue in
+                                store.state.settings.autoRotateRemainingThreshold = SmartSwitchPolicy.normalizeThreshold(newValue)
+                                store.save()
+                            }
+                        ),
+                        format: .number
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 56)
+                    Text("字换号 · 热备")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField(
+                        "热备",
+                        value: Binding(
+                            get: { store.state.settings.hotSpareTargetCount },
+                            set: { newValue in
+                                store.state.settings.hotSpareTargetCount = SmartSwitchPolicy.normalizeHotSpareTarget(newValue)
+                                store.save()
+                            }
+                        ),
+                        format: .number
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 36)
+                    Text("个")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let remaining = store.liveRemainingCharacters {
+                    let threshold = SmartSwitchPolicy.normalizeThreshold(store.state.settings.autoRotateRemainingThreshold)
+                    let emailSuffix = store.liveAccountEmail.isEmpty ? "" : " · \(store.liveAccountEmail)"
+                    let line = remaining >= threshold
+                        ? "当前剩余 \(remaining) 字 ≥ 阈值 \(threshold)：只监控，不换号\(emailSuffix)"
+                        : "当前剩余 \(remaining) 字 < 阈值 \(threshold)：将自动换号\(emailSuffix)"
+                    Text(line)
+                        .font(.caption)
+                        .foregroundStyle(remaining >= threshold ? Color.secondary : Color.orange)
+                        .lineLimit(2)
+                } else if store.state.settings.isAutoRotateEnabled {
+                    Text("等待读到官方剩余字数…（需本机 Typeless 已登录，且 Switchboard 保持运行）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Text(store.autoRotateMonitorStatus)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(4)
+
+                if !store.lastAutoRotateDecisionReason.isEmpty {
+                    Text(store.lastAutoRotateDecisionReason)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(3)
+                }
+
+                Text("规则：一直监控额度；仅当剩余 < 阈值（默认 200）才自动换号。接近阈值约 20 秒巡检，否则按分钟巡检。热备后台预注册；静默换号会轮换设备身份。请保持本 App 在菜单栏运行。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(5)
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 4)
 
             Button {
-                selectedID = store.prepareSwitch(from: selectedID)
+                Task {
+                    selectedID = await store.runSmartSwitch(
+                        apiKey: apiKey,
+                        domain: store.state.settings.domains.first ?? "",
+                        expiryTime: 0,
+                        from: selectedID,
+                        forceSwitch: true
+                    )
+                }
             } label: {
-                Label("准备切换", systemImage: "forward.end.circle.fill")
-                    .frame(maxWidth: .infinity)
+                Label(
+                    store.isSwitchBusy ? "换号进行中…" : "智能换号（一点就换）",
+                    systemImage: "bolt.horizontal.circle.fill"
+                )
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(store.nextAvailableAccountID() == nil)
+            .tint(.purple)
+            .disabled(store.isSwitchBusy)
             .padding(.horizontal, 18)
 
+            Button {
+                selectedID = store.prepareSwitch(from: selectedID)
+            } label: {
+                Label("准备切换（打开页面兜底）", systemImage: "forward.end.circle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.nextAvailableAccountID() == nil || store.isSwitchBusy)
+            .padding(.horizontal, 18)
 
             Button {
                 Task {
@@ -4253,19 +5297,19 @@ struct ContentView: View {
                         apiKey: apiKey,
                         domain: store.state.settings.domains.first ?? "",
                         expiryTime: 0,
-                        from: selectedID
+                        from: selectedID,
+                        interactive: true
                     )
                 }
             } label: {
                 Label(
-                    store.isRunningAutomaticReplacement ? "自动换号中" : "全自动一键换号",
+                    store.isRunningAutomaticReplacement ? "注册换号中" : "强制全自动注册新号",
                     systemImage: "wand.and.stars.inverse"
                 )
                 .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.purple)
-            .disabled(store.isRunningAutomaticReplacement || apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .buttonStyle(.bordered)
+            .disabled(store.isSwitchBusy || apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .padding(.horizontal, 18)
             .padding(.bottom, 16)
         }
@@ -4976,9 +6020,30 @@ struct InspectorView: View {
                 } label: {
                     Label("准备切换", systemImage: "forward.end.circle")
                 }
-                .disabled(store.nextAvailableAccountID() == nil)
+                .disabled(store.nextAvailableAccountID() == nil || store.isSwitchBusy)
             }
             .buttonStyle(.bordered)
+
+            Button {
+                Task {
+                    selectedID = await store.runSmartSwitch(
+                        apiKey: apiKey,
+                        domain: generatedDomain,
+                        expiryTime: generatedExpiry,
+                        from: selectedID,
+                        forceSwitch: true
+                    )
+                }
+            } label: {
+                Label(
+                    store.isSwitchBusy ? "智能换号中…" : "智能换号（优先池内，必要时注册）",
+                    systemImage: "bolt.horizontal.circle.fill"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.purple)
+            .disabled(store.isSwitchBusy)
 
             Button {
                 Task {
@@ -4986,20 +6051,20 @@ struct InspectorView: View {
                         apiKey: apiKey,
                         domain: generatedDomain,
                         expiryTime: generatedExpiry,
-                        from: selectedID
+                        from: selectedID,
+                        interactive: true
                     )
                 }
             } label: {
                 Label(
-                    store.isRunningAutomaticReplacement ? "自动创建和切换中" : "全自动一键换新账号",
+                    store.isRunningAutomaticReplacement ? "自动创建和切换中" : "强制全自动注册新号",
                     systemImage: "wand.and.stars"
                 )
                 .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.purple)
+            .buttonStyle(.bordered)
             .disabled(
-                store.isRunningAutomaticReplacement ||
+                store.isSwitchBusy ||
                 apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
                 generatedDomain.isEmpty
             )

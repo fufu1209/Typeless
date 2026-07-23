@@ -4,13 +4,61 @@ const path = require('path');
 const os = require('os');
 const https = require('https');
 
+function looksLikeDeviceUserLimit(text) {
+  if (!text) return false;
+  const lower = String(text).toLowerCase();
+  const spaced = lower.replace(/\s+/g, ' ');
+  const compact = lower.replace(/\s+/g, '');
+  return (
+    spaced.includes('number of users logged into this device has exceeded the limit') ||
+    spaced.includes('users logged into this device has exceeded') ||
+    spaced.includes('device has exceeded the limit') ||
+    spaced.includes('device user limit') ||
+    spaced.includes('too many users on this device') ||
+    compact.includes('numberofusersloggedintothisdevicehasexceededthelimit') ||
+    compact.includes('usersloggedintothisdevicehasexceeded') ||
+    compact.includes('devicehasexceededthelimit') ||
+    compact.includes('deviceuserlimit') ||
+    compact.includes('toomanyusersonthisdevice') ||
+    spaced.includes('登录该设备的用户数已超过限制') ||
+    spaced.includes('设备登录用户数已超') ||
+    spaced.includes('设备用户数超限') ||
+    spaced.includes('此设备登录的用户数已超过限制')
+  );
+}
+
+function summarizeApiError(statusCode, bodyText) {
+  const compact = String(bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+  let message = '';
+  try {
+    const parsed = JSON.parse(bodyText || '{}');
+    message = parsed.message || parsed.error || parsed.detail || parsed.msg || '';
+    if (!message && parsed.data && typeof parsed.data === 'object') {
+      message = parsed.data.message || parsed.data.error || '';
+    }
+  } catch (_) {}
+  const combined = [message, compact].filter(Boolean).join(' | ');
+  if (looksLikeDeviceUserLimit(combined) || looksLikeDeviceUserLimit(bodyText)) {
+    return {
+      code: 'DEVICE_USER_LIMIT',
+      error: `设备登录用户数已超限 (HTTP ${statusCode}): ${combined || 'The number of users logged into this device has exceeded the limit.'}`
+    };
+  }
+  return {
+    code: statusCode === 200 ? 'API_PAYLOAD_MISMATCH' : 'API_HTTP_ERROR',
+    error: statusCode === 200
+      ? (combined ? `API 返回格式不匹配：${combined}` : 'API 返回格式不匹配')
+      : `API 额度拉取失败 (HTTP ${statusCode})${combined ? ': ' + combined : ''}`
+  };
+}
+
 function getActiveSession() {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     try {
       const platform = os.platform();
       const arch = os.arch();
       const appName = 'Typeless';
-      
+
       const sha256Hex = crypto.createHash('sha256').update(platform + '-' + arch).digest('hex');
       const pbkdf2Key = crypto.pbkdf2Sync(sha256Hex + appName, 'typeless-user-service', 10000, 32, 'sha256');
 
@@ -29,11 +77,13 @@ function getActiveSession() {
       const derivedPassword = crypto.pbkdf2Sync(pbkdf2Key, iv.toString(), 10000, 32, 'sha512');
 
       let credentials;
+      let rawJsonString = "";
       try {
         const decipher = crypto.createDecipheriv('aes-256-cbc', derivedPassword, iv);
         let dec = decipher.update(ciphertext);
         dec = Buffer.concat([dec, decipher.final()]);
-        const parsed = JSON.parse(dec.toString('utf8'));
+        rawJsonString = dec.toString('utf8');
+        const parsed = JSON.parse(rawJsonString);
         credentials = JSON.parse(parsed.userData);
       } catch (e) {
         return resolve({ success: false, error: "本地缓存解密失败，可能是指纹不匹配或客户端已退出" });
@@ -47,7 +97,7 @@ function getActiveSession() {
       // 获取额度使用状况
       const Qs = "7d4a8f2e6b9c3a1f5e8d2c7b4a9f6e3d1b5a2f9e6d3c0b7a4f1e8d5c2b9f6a3d";
       const yc = "9b1c67af3f7ecd1501d7da7196f281f5e0c7c292ebc2227d49ff9d20";
-      
+
       const timestamp = Math.floor(Date.now() / 1000);
       const appVersion = "mac_2.0.0";
       const pathname = "/user/usage_stats";
@@ -83,11 +133,14 @@ function getActiveSession() {
         res.on('data', (chunk) => body += chunk);
         res.on('end', () => {
           if (res.statusCode !== 200) {
+            const summarized = summarizeApiError(res.statusCode, body);
             return resolve({
               success: true,
               email: email,
               userId: user_id,
-              error: `API 额度拉取失败 (HTTP ${res.statusCode})`
+              rawJson: rawJsonString,
+              errorCode: summarized.code,
+              error: summarized.error
             });
           }
           try {
@@ -98,24 +151,30 @@ function getActiveSession() {
                 success: true,
                 email: email,
                 userId: user_id,
+                rawJson: rawJsonString,
                 usedCharacters: vt.week_word_usage_value,
                 monthlyLimit: vt.week_word_usage_limit,
                 info: `总字数: ${vt.total_words}, 已用秒数: ${Math.round(vt.total_audio_seconds)}秒`
               });
-            } else {
-              return resolve({
-                success: true,
-                email: email,
-                userId: user_id,
-                error: "API 返回格式不匹配"
-              });
             }
-          } catch (e) {
+            const summarized = summarizeApiError(200, body);
             return resolve({
               success: true,
               email: email,
               userId: user_id,
-              error: "解析 API 报文失败"
+              rawJson: rawJsonString,
+              errorCode: summarized.code,
+              error: summarized.error
+            });
+          } catch (e) {
+            const summarized = summarizeApiError(200, body);
+            return resolve({
+              success: true,
+              email: email,
+              userId: user_id,
+              rawJson: rawJsonString,
+              errorCode: summarized.code,
+              error: summarized.error || "解析 API 报文失败"
             });
           }
         });
@@ -126,6 +185,7 @@ function getActiveSession() {
           success: true,
           email: email,
           userId: user_id,
+          rawJson: rawJsonString,
           error: `API 请求网络连接失败: ${e.message}`
         });
       });
@@ -136,6 +196,7 @@ function getActiveSession() {
           success: true,
           email: email,
           userId: user_id,
+          rawJson: rawJsonString,
           error: "API 请求连接超时"
         });
       });

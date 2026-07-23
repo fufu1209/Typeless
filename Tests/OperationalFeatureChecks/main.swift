@@ -236,8 +236,11 @@ struct OperationalFeatureChecks {
         check(switchboardSource.contains("pressToStopDictationOnboardingShown"), "onboarding patch dismisses press-to-stop dictation tips")
         check(switchboardSource.contains("func appendMacPermissionDiagnostics"), "setup diagnostics include macOS permission checks")
         check(switchboardSource.contains("func preflightMacPermissionsBeforeAutomaticReplacement"), "one-click flow includes a dedicated up-front permission preflight")
-        check(switchboardSource.contains("AXIsProcessTrustedWithOptions"), "permission preflight prompts for Accessibility before registration")
-        check(switchboardSource.contains("一键换号已在注册前暂停"), "permission preflight stops before account generation if critical permissions are missing")
+        check(switchboardSource.contains("AXIsProcessTrusted()"), "permission preflight uses silent Accessibility check")
+        check(!switchboardSource.contains("AXTrustedCheckOptionPrompt"), "permission preflight must not force Accessibility system prompts")
+        check(switchboardSource.contains("didAutoOpenPermissionSettingsThisSession"), "permission settings open at most once per session automatically")
+        check(switchboardSource.contains("权限未齐也继续执行"), "missing permissions no longer hard-stop registration with repeated prompts")
+        check(switchboardSource.contains("interactive: false") || switchboardSource.contains("interactive && !preserveCurrentAccount"), "background/hot-spare paths avoid interactive permission prompts")
         check(switchboardSource.contains("全自动换号确认状态"), "empty review queue explains automatic confirmation instead of showing manual approval work")
         check(switchboardSource.contains("兜底确认队列"), "pending accounts are framed as fallback confirmation only")
         check(!switchboardSource.contains("人工审核队列"), "successful one-click UI must not show an artificial/manual review queue label")
@@ -250,6 +253,136 @@ struct OperationalFeatureChecks {
         check(switchboardSource.contains("runCommandLineAutomaticReplacementIfRequested"), "switchboard can run repeated one-click replacements from CLI")
         check(switchboardSource.contains("lastCompletedAutomationAccountID"), "CLI multi-switch continues from the last completed account")
         check(switchboardSource.contains("KeychainStore.readAPIKey()"), "CLI multi-switch reads MoeMail API key from Keychain")
+        check(switchboardSource.contains("func runSmartSwitch"), "switchboard exposes a unified smart switch entrypoint")
+        check(switchboardSource.contains("智能换号（一点就换）"), "sidebar exposes one-click smart switch as the primary action")
+        check(switchboardSource.contains("autoRotateRemainingThreshold"), "auto-rotate threshold is configurable")
+        check(switchboardSource.contains("autoCreateWhenPoolEmpty"), "monitor can auto-create when the silent pool is empty")
+        check(switchboardSource.contains("autoRotateMonitorStatus"), "UI surfaces live auto-rotate monitor status")
+        check(switchboardSource.contains("SmartSwitchPolicy.sessionCaptureRetryAttempts"), "successful registration retries session capture for silent reuse")
+        check(switchboardSource.contains("markPreviousExhausted"), "silent pool switch can mark the previous account exhausted")
+        check(switchboardSource.contains("无感额度守护"), "sidebar labels seamless quota guardian")
+        check(switchboardSource.contains("keepRunningInBackground"), "app can keep running after window close")
+        check(switchboardSource.contains("SwitchboardAppDelegate"), "menu bar / background lifecycle is wired")
+        check(switchboardSource.contains("ensureHotSpareIfNeeded"), "monitor top-ups a silent hot-spare pool")
+        check(switchboardSource.contains("preserveCurrentAccount"), "hot-spare registration can avoid switching the active account")
+        check(switchboardSource.contains("desktopUserDataPayload"), "browser tokens can be converted into silent desktop payloads")
+        check(switchboardSource.contains("launchTypelessInBackground"), "silent switch relaunches Typeless without forcing foreground by default")
+        check(switchboardSource.contains("activateTypeless: false"), "auto-rotate silent switch does not steal focus")
+        check(switchboardSource.contains("resetDeviceIdentity: true"), "silent switch resets Typeless device identity before injecting the next account")
+        check(switchboardSource.contains("resetTypelessDeviceIdentityForAutomaticReplacement(backupRoot:"), "silent reinject reuses the toolkit-style device identity reset")
+        check(switchboardSource.contains("silentSwitchVerifyAttempts"), "silent switch verifies the target email before marking success")
+        check(switchboardSource.contains("lastSyncHitDeviceUserLimit"), "switchboard tracks Typeless device-user-limit errors from quota sync")
+        check(switchboardSource.contains("lastSilentSwitchFailureReason"), "silent switch exposes a failure reason for automatic fallback")
+        check(switchboardSource.contains("DEVICE_USER_LIMIT"), "quota sync script classifies device user limit responses")
+        check(switchboardSource.contains("isDeviceUserLimitError"), "smart switch policy can detect device user limit errors")
+        check(switchboardSource.contains("跳过静默切换并全自动重置设备身份") || switchboardSource.contains("设备登录用户数已超限"), "device user limit forces full automatic replacement instead of silent pool reuse")
+        check(switchboardSource.contains("已轮换设备身份") || switchboardSource.contains("含设备身份轮换"), "UI/status copy documents silent device rotation")
+
+        // SmartSwitchPolicy pure-logic checks
+        let silentCandidate = SmartSwitchCandidate(
+            id: UUID(),
+            email: "pool@example.com",
+            remainingCharacters: 5000,
+            hasSilentSessionPayload: true
+        )
+        let noPayloadCandidate = SmartSwitchCandidate(
+            id: UUID(),
+            email: "nopayload@example.com",
+            remainingCharacters: 3000,
+            hasSilentSessionPayload: false
+        )
+        let lowQuotaIdle = SmartSwitchPolicy.decide(
+            currentRemaining: 500,
+            threshold: 200,
+            forceSwitch: false,
+            candidates: [silentCandidate],
+            allowFullAutomaticReplacement: true
+        )
+        check(lowQuotaIdle.path == .none, "monitor does nothing when remaining is still above threshold")
+        check(lowQuotaIdle.reason.contains("只巡检") || lowQuotaIdle.reason.contains("额度充足"), "idle reason explains monitoring-only above threshold")
+        check(
+            SmartSwitchPolicy.monitorIdleStatus(remaining: 500, threshold: 200).contains("只巡检不换号"),
+            "idle status copy says monitor-only when remaining is above threshold"
+        )
+        check(
+            SmartSwitchPolicy.monitorIdleStatus(remaining: 100, threshold: 200).contains("准备换号"),
+            "idle status copy flags low quota"
+        )
+        let lowQuotaRotate = SmartSwitchPolicy.decide(
+            currentRemaining: 100,
+            threshold: 200,
+            forceSwitch: false,
+            candidates: [silentCandidate],
+            allowFullAutomaticReplacement: true
+        )
+        check(lowQuotaRotate.path == .silentPoolSwitch, "monitor prefers silent pool switch when payload exists")
+        check(lowQuotaRotate.targetEmail == "pool@example.com", "monitor selects the silent-ready candidate")
+        let forceWithoutPayload = SmartSwitchPolicy.decide(
+            currentRemaining: 5000,
+            threshold: 200,
+            forceSwitch: true,
+            candidates: [noPayloadCandidate],
+            allowFullAutomaticReplacement: true
+        )
+        check(forceWithoutPayload.path == .fullAutomaticReplacement, "manual smart switch falls back to full automatic when no silent payload")
+        let monitorEmptyPoolNoCreate = SmartSwitchPolicy.decide(
+            currentRemaining: 50,
+            threshold: 200,
+            forceSwitch: false,
+            candidates: [],
+            allowFullAutomaticReplacement: false
+        )
+        check(monitorEmptyPoolNoCreate.path == .none, "monitor stays idle when pool empty and auto-create disabled")
+        let monitorEmptyPoolCreate = SmartSwitchPolicy.decide(
+            currentRemaining: 50,
+            threshold: 200,
+            forceSwitch: false,
+            candidates: [],
+            allowFullAutomaticReplacement: true
+        )
+        check(monitorEmptyPoolCreate.path == .fullAutomaticReplacement, "monitor auto-registers when pool empty and auto-create enabled")
+        check(SmartSwitchPolicy.normalizeCheckIntervalMinutes(0) == 1, "interval minutes clamp to at least 1")
+        check(SmartSwitchPolicy.normalizeCheckIntervalMinutes(999) == 120, "interval minutes clamp to at most 120")
+        check(SmartSwitchPolicy.isQuotaLow(remaining: 199, threshold: 200), "quota is low when remaining is below threshold")
+        check(!SmartSwitchPolicy.isQuotaLow(remaining: 200, threshold: 200), "quota is not low when remaining equals threshold")
+        check(SmartSwitchPolicy.defaultRemainingThreshold == 200, "default threshold is 200 characters")
+        check(SmartSwitchPolicy.defaultCheckIntervalMinutes == 1, "default check interval is 1 minute")
+        check(SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 5000, threshold: 200, intervalMinutes: 1) == 60, "normal interval uses configured minutes")
+        check(SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 300, threshold: 200, intervalMinutes: 1) == SmartSwitchPolicy.urgentCheckIntervalSeconds, "near-threshold uses urgent interval")
+        check(SmartSwitchPolicy.needsHotSpare(candidates: [], target: 1), "empty pool needs hot spare")
+        check(!SmartSwitchPolicy.needsHotSpare(candidates: [silentCandidate], target: 1), "one silent-ready account satisfies hot spare target 1")
+        let tokenInfo = #"{"accessToken":"at-1","refreshToken":"rt-1","userId":"u-1","email":"a@example.com"}"#
+        let desktopPayload = SmartSwitchPolicy.desktopUserDataPayload(fromBrowserTokenInfo: tokenInfo)
+        check(desktopPayload != nil, "token info converts to desktop payload")
+        check(desktopPayload?.contains("access_token") == true, "desktop payload includes access_token")
+        check(desktopPayload?.contains("at-1") == true, "desktop payload preserves access token value")
+        check(
+            SmartSwitchPolicy.isDeviceUserLimitError(
+                "The number of users logged into this device has exceeded the limit."
+            ),
+            "English device user limit message is detected"
+        )
+        check(
+            SmartSwitchPolicy.isDeviceUserLimitError(
+                "The number of users logged into this device hasexceeded the limit."
+            ),
+            "English device user limit message without space before exceeded is detected"
+        )
+        check(
+            SmartSwitchPolicy.isDeviceUserLimitError("设备登录用户数已超限 (HTTP 403)"),
+            "Chinese device user limit message is detected"
+        )
+        check(
+            !SmartSwitchPolicy.isDeviceUserLimitError("API 请求连接超时"),
+            "unrelated API errors are not classified as device user limit"
+        )
+        check(SmartSwitchPolicy.silentSwitchVerifyAttempts >= 3, "silent switch verification retries enough times")
+        check(TypelessToolkitCompatibilityMatrix.resetDeviceSteps.contains { $0.contains("静默换号") }, "compatibility matrix documents silent-switch device rotation")
+        check(TypelessToolkitCompatibilityMatrix.resetDeviceSteps.contains { $0.contains("exceeded the limit") }, "compatibility matrix documents device user limit fallback")
+        check(switchboardSource.contains("resumeRotateMonitorAfterWakeOrManualKick"), "monitor can resume after wake or manual kick")
+        check(switchboardSource.contains("didWakeNotification"), "app resumes quota monitor after system wake")
+        check(switchboardSource.contains("monitorIdleStatus"), "switchboard uses shared monitor-idle status copy")
+        check(switchboardSource.contains("只监控，不换号") || switchboardSource.contains("只巡检不换号"), "UI explains monitor-only when remaining is above threshold")
         check(switchboardSource.contains("isAutomationRuntimeCached"), "automation runtime skips install when Playwright is already cached")
         check(switchboardSource.contains("isPlaywrightChromiumExecutableAvailable"), "automation runtime cache verifies the Playwright Chromium executable before skipping install")
         check(switchboardSource.contains("chromium.executablePath()"), "automation runtime cache probes Chromium executable path through Playwright")

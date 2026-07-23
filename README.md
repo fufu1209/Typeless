@@ -16,7 +16,8 @@
 - 通过 MoeMail API 生成邮箱并导入账号池。
 - 一键用 MoeMail 生成注册候选账号：创建真实邮箱、生成用户名、复制强密码，并放入兜底确认队列。
 - 读取当前已关联 MoeMail 邮箱的邮件摘要，方便兜底查看验证码邮件。
-- **无感额度守护（默认开启）**：必须保持本 App 在菜单栏运行（关主窗默认不退出）。**一直监控额度**；**只有剩余字数 &lt; 阈值（默认 200）才自动换号**。额度充足时状态为「只巡检不换号」。接近阈值约 20 秒巡检，否则按分钟巡检。菜单栏显示剩余字数；休眠唤醒后会自动续巡检。
+- **开机轻量额度守护（推荐，不必常驻 GUI）**：用 macOS LaunchAgent 定时执行 `--daemon-check`。**只有剩余字数 &lt; 阈值（默认 200）才自动换号**；额度够只检查就退出。登录后自动跑，不要求一直开着本窗口。
+- **App 内循环监控（可选）**：打开 App 时可勾选「打开本 App 时循环监控」；默认关闭，避免占后台。
 - **热备池**：额度还够时，后台预注册 1 个带静默会话缓存的备用号；真正低额度时秒切，尽量让你感觉不到。
 - **智能换号**：也可手动点一次。优先池内静默注入；没有可注入会话时再全自动注册；静默失败自动降级注册。
 - **静默换号也会轮换设备身份**：注入新号会话前按 `resetDevice` 清理 Keychain / `device.cache` / 桌面登录残留，避免同一 deviceId 挂过多账号触发 Typeless「设备登录用户数超限」。
@@ -152,6 +153,38 @@ node scripts/typeless-portable-preflight.js --config config.local.json
 
 ```bash
 swift run TypelessSwitchboard
+```
+
+## 开机轻量额度守护（推荐：不必一直开着 App）
+
+适合「不想让工具常驻后台，但额度低了要自动换号」：
+
+```bash
+# 打包 App（若还没有）并安装 LaunchAgent：登录后 + 每 1 分钟单次巡检
+./scripts/install-quota-guard.sh
+
+# 立刻手动跑一轮（无界面）
+./scripts/install-quota-guard.sh --run-once
+
+# 查看状态 / 卸载
+./scripts/install-quota-guard.sh --status
+./scripts/install-quota-guard.sh --uninstall
+```
+
+或在 App 侧栏点 **「安装/更新开机插件」**。
+
+行为说明：
+
+1. 插件定时唤醒：`TypelessSwitchboard.app … --daemon-check`
+2. 读取本机 Typeless 登录态与官方额度
+3. **剩余 ≥ 阈值**：只记日志，进程退出（不换号）
+4. **剩余 &lt; 阈值**：静默换号（含设备身份轮换）；失败则全自动注册换号
+5. 日志：`~/Library/Application Support/TypelessSwitchboard/Logs/`
+
+也可用自定义间隔（分钟）：
+
+```bash
+INTERVAL_MINUTES=5 ./scripts/install-quota-guard.sh
 ```
 
 

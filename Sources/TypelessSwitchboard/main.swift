@@ -244,12 +244,13 @@ struct AppSettings: Codable, Equatable, Sendable {
             SwitchTask(title: "自动轮询对应邮箱验证码，必要时手动兜底", isRequired: true),
             SwitchTask(title: "登录完成后更新本工具里的已用字数", isRequired: false)
         ],
-        isAutoRotateEnabled: true,
+        // 默认不常驻 GUI：额度守护交给开机轻量 LaunchAgent；打开 App 时再按需开循环监控。
+        isAutoRotateEnabled: false,
         autoRotateCheckIntervalMinutes: SmartSwitchPolicy.defaultCheckIntervalMinutes,
         autoRotateRemainingThreshold: SmartSwitchPolicy.defaultRemainingThreshold,
         autoCreateWhenPoolEmpty: true,
         hotSpareTargetCount: SmartSwitchPolicy.defaultHotSpareTarget,
-        keepRunningInBackground: true
+        keepRunningInBackground: false
     )
 
     enum CodingKeys: String, CodingKey {
@@ -296,8 +297,9 @@ struct AppSettings: Codable, Equatable, Sendable {
         moeMailBaseURL = try container.decodeIfPresent(String.self, forKey: .moeMailBaseURL) ?? fallback.moeMailBaseURL
         domains = try container.decodeIfPresent([String].self, forKey: .domains) ?? fallback.domains
         checklist = try container.decodeIfPresent([SwitchTask].self, forKey: .checklist) ?? fallback.checklist
-        // 旧版默认是关；新版无感守护默认开。若 JSON 里明确写了 false 仍尊重用户选择。
-        isAutoRotateEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAutoRotateEnabled) ?? true
+        // 未写字段时：默认不常驻 GUI；额度守护推荐 LaunchAgent。
+        isAutoRotateEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAutoRotateEnabled)
+            ?? fallback.isAutoRotateEnabled
         autoRotateCheckIntervalMinutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(
             try container.decodeIfPresent(Int.self, forKey: .autoRotateCheckIntervalMinutes)
                 ?? fallback.autoRotateCheckIntervalMinutes
@@ -351,6 +353,15 @@ struct PersistedState: Codable, Equatable, Sendable {
     )
 }
 
+/// App / CLI 运行模式：GUI 可常驻监控；daemon 只做单次巡检后退出。
+enum SwitchboardRunMode: Equatable {
+    case gui
+    /// LaunchAgent / 定时任务：读额度，低于阈值则换号，然后退出（不常驻）。
+    case daemonOnce
+    /// CLI 批量全自动换号测试。
+    case cliAutoSwitch
+}
+
 @MainActor
 final class SwitchboardStore: ObservableObject {
     @Published var state: PersistedState
@@ -373,8 +384,11 @@ final class SwitchboardStore: ObservableObject {
     /// 当前官方账号剩余字数（菜单栏展示用）。
     @Published var liveRemainingCharacters: Int?
     @Published var liveAccountEmail = ""
+    /// 开机自启 LaunchAgent 状态摘要（侧栏展示）。
+    @Published var launchAgentStatusMessage = ""
 
     private let fileURL: URL
+    private let runMode: SwitchboardRunMode
     private var rotateMonitorTask: Task<Void, Never>?
     private var isAutoRotateCheckInFlight = false
     /// 上一轮巡检得到的剩余额度，用于自适应巡检间隔。
@@ -389,7 +403,8 @@ final class SwitchboardStore: ObservableObject {
         isRunningAutomaticReplacement || isRunningSmartSwitch || isSyncingSession
     }
 
-    init() {
+    init(runMode: SwitchboardRunMode = .gui) {
+        self.runMode = runMode
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
         self.fileURL = folder.appendingPathComponent("store.json")
@@ -402,13 +417,16 @@ final class SwitchboardStore: ObservableObject {
         }
         migrateDefaultsIfNeeded()
         ensureExtractScript()
-        
-        // 无感守护：默认开启；旧用户若未写字段也默认开。
-        if state.settings.isAutoRotateEnabled {
+        refreshLaunchAgentStatus()
+
+        // GUI 才常驻循环监控；daemon 单次巡检由 CLI 入口触发，避免无界面进程挂后台。
+        if runMode == .gui, state.settings.isAutoRotateEnabled {
             startRotateMonitor()
-            autoRotateMonitorStatus = "无感守护已开启，等待首次巡检"
+            autoRotateMonitorStatus = "无感守护已开启，等待首次巡检（也可装开机轻量插件，不必开着本窗口）"
+        } else if runMode == .gui {
+            autoRotateMonitorStatus = "App 内循环守护已关闭（推荐用开机轻量插件）"
         } else {
-            autoRotateMonitorStatus = "无感守护已关闭"
+            autoRotateMonitorStatus = "daemon 单次巡检模式"
         }
     }
 
@@ -431,6 +449,18 @@ final class SwitchboardStore: ObservableObject {
                 SmartSwitchPolicy.defaultHotSpareTarget
             )
             UserDefaults.standard.set(true, forKey: seamlessMigrationKey)
+        }
+
+        // v2：默认不再要求 GUI 常驻；额度守护交给 LaunchAgent 轻量插件（定时 --daemon-check）。
+        let noResidentGUIKey = "didApplyLaunchAgentPreferredDefaults_v2"
+        if !UserDefaults.standard.bool(forKey: noResidentGUIKey) {
+            state.settings.keepRunningInBackground = false
+            state.settings.isAutoRotateEnabled = false
+            UserDefaults.standard.set(true, forKey: noResidentGUIKey)
+            try? FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let data = try? JSONEncoder.appEncoder.encode(state) {
+                try? data.write(to: fileURL, options: [.atomic])
+            }
         }
 
         if state.settings.autoRotateCheckIntervalMinutes <= 0 {
@@ -2936,6 +2966,66 @@ writeActiveSession(inputJson);
         return automationComplete ? account.id : currentID
     }
 
+    /// 解析启动参数：GUI / 单次 daemon 巡检 / CLI 批量换号。
+    static func resolveRunMode(from arguments: [String] = CommandLine.arguments) -> SwitchboardRunMode {
+        if arguments.contains("--daemon-check") || arguments.contains("--quota-guard-once") {
+            return .daemonOnce
+        }
+        if arguments.contains("--auto-switch-count") {
+            return .cliAutoSwitch
+        }
+        return .gui
+    }
+
+    /// LaunchAgent / 定时任务入口：同步额度 → 低额度自动换号 → 可选补热备 → 退出。
+    /// 不启动 GUI、不常驻循环。
+    func runDaemonQuotaGuardOnceIfRequested() async -> Bool {
+        let arguments = CommandLine.arguments
+        guard arguments.contains("--daemon-check") || arguments.contains("--quota-guard-once") else {
+            return false
+        }
+
+        let startedAt = Date()
+        print("TypelessSwitchboard daemon: quota guard check starting")
+        autoRotateMonitorStatus = "daemon：正在单次巡检额度…"
+
+        // 单次巡检：忽略 GUI 的 isAutoRotateEnabled 开关（Agent 本身就是用户选择的守护方式）。
+        // 但仍尊重阈值、热备、池空自动注册配置。
+        let previousAutoRotate = state.settings.isAutoRotateEnabled
+        let previousCreate = state.settings.autoCreateWhenPoolEmpty
+        state.settings.isAutoRotateEnabled = true
+        // 无 API Key 时 performAutoRotateCheck 仍可做静默池切换，但无法全自动注册。
+        let apiKey = KeychainStore.readAPIKey().trimmingCharacters(in: .whitespacesAndNewlines)
+        if apiKey.isEmpty {
+            print("TypelessSwitchboard daemon: warning — MoeMail API Key missing; silent switch only, no auto-register")
+        }
+
+        let resultID = await performAutoRotateCheck(apiKey: apiKey.isEmpty ? nil : apiKey)
+        // 额度充足时也尝试补热备（与 GUI 巡检一致）。
+        if !apiKey.isEmpty, state.settings.autoCreateWhenPoolEmpty {
+            await ensureHotSpareIfNeeded(apiKey: apiKey, domain: state.settings.domains.first ?? "")
+        }
+
+        state.settings.isAutoRotateEnabled = previousAutoRotate
+        state.settings.autoCreateWhenPoolEmpty = previousCreate
+        save()
+
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let remainingText = liveRemainingCharacters.map(String.init) ?? "unknown"
+        print(
+            "TypelessSwitchboard daemon: done remaining=\(remainingText) email=\(liveAccountEmail.ifEmpty("-")) " +
+            "resultID=\(resultID?.uuidString ?? "nil") reason=\(lastAutoRotateDecisionReason.ifEmpty(autoRotateMonitorStatus)) " +
+            "elapsed=\(String(format: "%.1f", elapsed))s"
+        )
+        appendDaemonLog(
+            remaining: liveRemainingCharacters,
+            email: liveAccountEmail,
+            reason: lastAutoRotateDecisionReason.ifEmpty(autoRotateMonitorStatus),
+            resultID: resultID
+        )
+        return true
+    }
+
     func runCommandLineAutomaticReplacementIfRequested() async -> Bool {
         let arguments = CommandLine.arguments
         guard let countIndex = arguments.firstIndex(of: "--auto-switch-count") else {
@@ -2982,6 +3072,92 @@ writeActiveSession(inputJson);
             return ""
         }
         return arguments[index + 1]
+    }
+
+    private func appendDaemonLog(remaining: Int?, email: String, reason: String, resultID: UUID?) {
+        let dir = fileURL.deletingLastPathComponent().appendingPathComponent("Logs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let logURL = dir.appendingPathComponent("quota-guard-daemon.log")
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(stamp)] remaining=\(remaining.map(String.init) ?? "-") email=\(email.ifEmpty("-")) result=\(resultID?.uuidString ?? "-") \(reason)\n"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logURL.path),
+               let handle = try? FileHandle(forWritingTo: logURL) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? data.write(to: logURL, options: .atomic)
+            }
+        }
+    }
+
+    // MARK: - 开机轻量插件（LaunchAgent）
+
+    func refreshLaunchAgentStatus() {
+        launchAgentStatusMessage = QuotaGuardLaunchAgent.statusSummary(
+            intervalMinutes: state.settings.autoRotateCheckIntervalMinutes
+        )
+    }
+
+    @discardableResult
+    func installQuotaGuardLaunchAgent(intervalMinutes: Int? = nil) -> Bool {
+        let minutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(
+            intervalMinutes ?? state.settings.autoRotateCheckIntervalMinutes
+        )
+        do {
+            let program = try QuotaGuardLaunchAgent.resolveProgramPath()
+            try QuotaGuardLaunchAgent.install(programPath: program, intervalMinutes: minutes)
+            // 装上 Agent 后：默认关掉 GUI 常驻循环，避免双开巡检。
+            state.settings.keepRunningInBackground = false
+            state.settings.isAutoRotateEnabled = false
+            stopRotateMonitor()
+            autoRotateMonitorStatus = "已改用开机轻量插件（LaunchAgent），App 内循环守护已关"
+            save()
+            refreshLaunchAgentStatus()
+            statusMessage = "已安装开机轻量额度守护（每 \(minutes) 分钟巡检一次，不常驻窗口）"
+            return true
+        } catch {
+            refreshLaunchAgentStatus()
+            statusMessage = "安装开机轻量插件失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult
+    func uninstallQuotaGuardLaunchAgent() -> Bool {
+        do {
+            try QuotaGuardLaunchAgent.uninstall()
+            refreshLaunchAgentStatus()
+            statusMessage = "已卸载开机轻量额度守护"
+            return true
+        } catch {
+            refreshLaunchAgentStatus()
+            statusMessage = "卸载开机轻量插件失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    /// 立刻跑一轮与 LaunchAgent 相同的单次巡检（不退出 App）。
+    func runQuotaGuardOnceFromUI() async {
+        statusMessage = "正在执行与开机插件相同的单次额度巡检…"
+        autoRotateMonitorStatus = "手动：单次 daemon 巡检中…"
+        let apiKey = KeychainStore.readAPIKey().trimmingCharacters(in: .whitespacesAndNewlines)
+        let resultID = await performAutoRotateCheck(apiKey: apiKey.isEmpty ? nil : apiKey)
+        if !apiKey.isEmpty, state.settings.autoCreateWhenPoolEmpty {
+            await ensureHotSpareIfNeeded(apiKey: apiKey, domain: state.settings.domains.first ?? "")
+        }
+        if let resultID, let index = accountIndex(id: resultID) {
+            liveAccountEmail = state.accounts[index].email
+            liveRemainingCharacters = state.accounts[index].remainingCharacters
+        }
+        statusMessage = "单次巡检完成：\(lastAutoRotateDecisionReason.ifEmpty(autoRotateMonitorStatus))"
+        appendDaemonLog(
+            remaining: liveRemainingCharacters,
+            email: liveAccountEmail,
+            reason: "ui-once " + lastAutoRotateDecisionReason.ifEmpty(autoRotateMonitorStatus),
+            resultID: resultID
+        )
     }
 
     func retryLastAutomation() async -> UUID? {
@@ -4836,10 +5012,79 @@ enum KeychainStore {
     }
 }
 
+/// 真正入口：GUI 开窗口；`--daemon-check` / `--auto-switch-count` 走无界面单次任务后退出。
 @main
+enum TypelessSwitchboardMain {
+    static func main() {
+        let mode = SwitchboardStore.resolveRunMode()
+        switch mode {
+        case .gui:
+            TypelessSwitchboardApp.main()
+        case .daemonOnce, .cliAutoSwitch:
+            // NSApplication / AppKit 入口必须在主线程 + MainActor 上下文完成装配。
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    runHeadlessCLI(mode: mode)
+                }
+            } else {
+                DispatchQueue.main.sync {
+                    MainActor.assumeIsolated {
+                        runHeadlessCLI(mode: mode)
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private static func runHeadlessCLI(mode: SwitchboardRunMode) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        let runner = HeadlessCLIRunner(mode: mode)
+        // 强引用 runner，避免 delegate 被释放。
+        HeadlessCLIRunner.retained = runner
+        app.delegate = runner
+        app.run()
+    }
+}
+
+/// 无界面 CLI：不弹主窗口，跑完 daemon/批量换号后 exit。
+@MainActor
+final class HeadlessCLIRunner: NSObject, NSApplicationDelegate {
+    /// 保持进程级强引用，防止 `app.delegate` 的 weak 语义导致 runner 被回收。
+    static var retained: HeadlessCLIRunner?
+
+    private let mode: SwitchboardRunMode
+    private var store: SwitchboardStore?
+
+    init(mode: SwitchboardRunMode) {
+        self.mode = mode
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let store = SwitchboardStore(runMode: mode)
+        self.store = store
+        Task { @MainActor in
+            switch mode {
+            case .daemonOnce:
+                _ = await store.runDaemonQuotaGuardOnceIfRequested()
+            case .cliAutoSwitch:
+                _ = await store.runCommandLineAutomaticReplacementIfRequested()
+            case .gui:
+                break
+            }
+            // 给一点时间把日志/文件刷盘。
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            NSApp.terminate(nil)
+            exit(0)
+        }
+    }
+}
+
 struct TypelessSwitchboardApp: App {
     @NSApplicationDelegateAdaptor(SwitchboardAppDelegate.self) private var appDelegate
-    @StateObject private var store = SwitchboardStore()
+    @StateObject private var store = SwitchboardStore(runMode: .gui)
 
     var body: some Scene {
         WindowGroup {
@@ -4854,6 +5099,145 @@ struct TypelessSwitchboardApp: App {
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             CommandGroup(replacing: .newItem) { }
+        }
+    }
+}
+
+// MARK: - 开机轻量额度守护 LaunchAgent
+
+/// macOS LaunchAgent：开机登录后按间隔执行 `--daemon-check`，不常驻 GUI。
+enum QuotaGuardLaunchAgent {
+    static let label = "local.typeless.switchboard.quota-guard"
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static var isInstalled: Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    static func statusSummary(intervalMinutes: Int) -> String {
+        if isInstalled {
+            let minutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(intervalMinutes)
+            return "开机轻量插件：已安装 · 约每 \(minutes) 分钟巡检（不常驻窗口）"
+        }
+        return "开机轻量插件：未安装（推荐安装，不必一直开着本 App）"
+    }
+
+    /// 优先用已打包的 .app 可执行文件；否则用当前进程路径（swift run / 开发构建）。
+    static func resolveProgramPath() throws -> String {
+        if let bundled = Bundle.main.executablePath,
+           bundled.contains(".app/"),
+           FileManager.default.isExecutableFile(atPath: bundled) {
+            return bundled
+        }
+
+        let candidates = [
+            "/Users/fucaixie/BC/Typeless/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard",
+            FileManager.default.currentDirectoryPath + "/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard"
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+
+        // 开发态：当前可执行文件本身
+        let argv0 = CommandLine.arguments[0]
+        if argv0.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: argv0) {
+            return argv0
+        }
+        if let path = Bundle.main.executablePath, FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        throw NSError(
+            domain: "QuotaGuardLaunchAgent",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "找不到 TypelessSwitchboard 可执行文件，请先 ./scripts/build-app.sh"]
+        )
+    }
+
+    static func install(programPath: String, intervalMinutes: Int) throws {
+        let minutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(intervalMinutes)
+        let seconds = minutes * 60
+        let logDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/TypelessSwitchboard/Logs", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        let stdout = logDir.appendingPathComponent("quota-guard-launchd.out.log").path
+        let stderr = logDir.appendingPathComponent("quota-guard-launchd.err.log").path
+
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>Label</key>
+          <string>\(label)</string>
+          <key>ProgramArguments</key>
+          <array>
+            <string>\(programPath)</string>
+            <string>--daemon-check</string>
+          </array>
+          <key>RunAtLoad</key>
+          <true/>
+          <key>StartInterval</key>
+          <integer>\(seconds)</integer>
+          <key>StandardOutPath</key>
+          <string>\(stdout)</string>
+          <key>StandardErrorPath</key>
+          <string>\(stderr)</string>
+          <key>ProcessType</key>
+          <string>Background</string>
+          <key>Nice</key>
+          <integer>10</integer>
+        </dict>
+        </plist>
+        """
+
+        let agentsDir = plistURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: agentsDir, withIntermediateDirectories: true)
+        try plist.write(to: plistURL, atomically: true, encoding: .utf8)
+
+        // 先 bootout 再 bootstrap，兼容已安装场景。
+        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
+        let load = runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
+        if load.status != 0 {
+            // 旧系统 fallback
+            let legacy = runLaunchctl(["load", "-w", plistURL.path])
+            if legacy.status != 0 {
+                throw NSError(
+                    domain: "QuotaGuardLaunchAgent",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "launchctl 加载失败：\(load.output.ifEmpty(legacy.output))"]
+                )
+            }
+        }
+        // 立刻 kick 一次，方便确认可用。
+        _ = runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(label)"])
+    }
+
+    static func uninstall() throws {
+        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
+        _ = runLaunchctl(["unload", "-w", plistURL.path])
+        if FileManager.default.fileExists(atPath: plistURL.path) {
+            try FileManager.default.removeItem(at: plistURL)
+        }
+    }
+
+    private static func runLaunchctl(_ arguments: [String]) -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return (process.terminationStatus, output)
+        } catch {
+            return (-1, error.localizedDescription)
         }
     }
 }
@@ -5153,15 +5537,36 @@ struct ContentView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                Toggle("无感额度守护（后台自动换号）", isOn: Binding(
-                    get: { store.state.settings.isAutoRotateEnabled },
-                    set: { newValue in
-                        store.state.settings.isAutoRotateEnabled = newValue
-                        store.save()
+                Text("额度守护（推荐开机插件，不必常驻本 App）")
+                    .font(.subheadline.weight(.semibold))
+
+                Text(store.launchAgentStatusMessage)
+                    .font(.caption)
+                    .foregroundStyle(QuotaGuardLaunchAgent.isInstalled ? Color.green : Color.secondary)
+                    .lineLimit(2)
+
+                HStack(spacing: 6) {
+                    Button("安装/更新开机插件") {
+                        _ = store.installQuotaGuardLaunchAgent()
                     }
-                ))
-                .toggleStyle(.checkbox)
-                .font(.subheadline.weight(.medium))
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.green)
+
+                    Button("卸载") {
+                        _ = store.uninstallQuotaGuardLaunchAgent()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!QuotaGuardLaunchAgent.isInstalled)
+
+                    Button("立刻巡检一次") {
+                        Task { await store.runQuotaGuardOnceFromUI() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(store.isSwitchBusy)
+                }
 
                 Toggle("池空时自动注册新号", isOn: Binding(
                     get: { store.state.settings.autoCreateWhenPoolEmpty },
@@ -5172,9 +5577,18 @@ struct ContentView: View {
                 ))
                 .toggleStyle(.checkbox)
                 .font(.caption)
-                .disabled(!store.state.settings.isAutoRotateEnabled)
 
-                Toggle("关窗后继续后台守护", isOn: Binding(
+                Toggle("打开本 App 时循环监控（可选）", isOn: Binding(
+                    get: { store.state.settings.isAutoRotateEnabled },
+                    set: { newValue in
+                        store.state.settings.isAutoRotateEnabled = newValue
+                        store.save()
+                    }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+
+                Toggle("关窗后继续挂菜单栏（可选）", isOn: Binding(
                     get: { store.state.settings.keepRunningInBackground },
                     set: { newValue in
                         store.state.settings.keepRunningInBackground = newValue
@@ -5232,11 +5646,6 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(remaining >= threshold ? Color.secondary : Color.orange)
                         .lineLimit(2)
-                } else if store.state.settings.isAutoRotateEnabled {
-                    Text("等待读到官方剩余字数…（需本机 Typeless 已登录，且 Switchboard 保持运行）")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
                 }
 
                 Text(store.autoRotateMonitorStatus)
@@ -5251,7 +5660,7 @@ struct ContentView: View {
                         .lineLimit(3)
                 }
 
-                Text("规则：一直监控额度；仅当剩余 < 阈值（默认 200）才自动换号。接近阈值约 20 秒巡检，否则按分钟巡检。热备后台预注册；静默换号会轮换设备身份。请保持本 App 在菜单栏运行。")
+                Text("推荐：安装开机插件后关掉本 App。插件定时醒来读额度；仅剩余 < 阈值（默认 200）才自动换号。静默换号会轮换设备身份。日志在 Application Support/TypelessSwitchboard/Logs/。")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(5)

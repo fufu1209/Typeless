@@ -260,7 +260,7 @@ struct OperationalFeatureChecks {
         check(switchboardSource.contains("autoRotateMonitorStatus"), "UI surfaces live auto-rotate monitor status")
         check(switchboardSource.contains("SmartSwitchPolicy.sessionCaptureRetryAttempts"), "successful registration retries session capture for silent reuse")
         check(switchboardSource.contains("markPreviousExhausted"), "silent pool switch can mark the previous account exhausted")
-        check(switchboardSource.contains("无感额度守护"), "sidebar labels seamless quota guardian")
+        check(switchboardSource.contains("开机轻量") || switchboardSource.contains("LaunchAgent") || switchboardSource.contains("开机插件"), "sidebar exposes boot-time lightweight quota guard")
         check(switchboardSource.contains("keepRunningInBackground"), "app can keep running after window close")
         check(switchboardSource.contains("SwitchboardAppDelegate"), "menu bar / background lifecycle is wired")
         check(switchboardSource.contains("ensureHotSpareIfNeeded"), "monitor top-ups a silent hot-spare pool")
@@ -277,6 +277,12 @@ struct OperationalFeatureChecks {
         check(switchboardSource.contains("isDeviceUserLimitError"), "smart switch policy can detect device user limit errors")
         check(switchboardSource.contains("跳过静默切换并全自动重置设备身份") || switchboardSource.contains("设备登录用户数已超限"), "device user limit forces full automatic replacement instead of silent pool reuse")
         check(switchboardSource.contains("已轮换设备身份") || switchboardSource.contains("含设备身份轮换"), "UI/status copy documents silent device rotation")
+        check(switchboardSource.contains("--daemon-check"), "headless daemon once-check flag is available for LaunchAgent")
+        check(switchboardSource.contains("func runDaemonQuotaGuardOnceIfRequested"), "daemon once-check entrypoint exists")
+        check(switchboardSource.contains("enum QuotaGuardLaunchAgent") || switchboardSource.contains("QuotaGuardLaunchAgent"), "LaunchAgent installer is built in")
+        check(switchboardSource.contains("HeadlessCLIRunner") || switchboardSource.contains("runHeadlessCLI"), "CLI/daemon path does not require the main window")
+        check(switchboardSource.contains("installQuotaGuardLaunchAgent"), "UI can install the boot quota-guard agent")
+        check(FileManager.default.fileExists(atPath: "scripts/install-quota-guard.sh"), "install-quota-guard.sh script is present")
 
         // SmartSwitchPolicy pure-logic checks
         let silentCandidate = SmartSwitchCandidate(

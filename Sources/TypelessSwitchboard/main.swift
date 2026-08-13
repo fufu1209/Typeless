@@ -548,6 +548,18 @@ function getActiveSession() {
         return resolve({ success: false, error: "登录缓存中未包含有效的授权 Token" });
       }
 
+      // 本地快速校验模式：只解密会话，不请求官方额度 API。
+      // 用于静默换号验证等「只需要确认当前桌面账号」的场景，快且不受网络波动影响。
+      if (process.argv.includes('--local-only')) {
+        return resolve({
+          success: true,
+          email: email,
+          userId: user_id,
+          rawJson: rawJsonString,
+          info: "本地会话校验（未请求额度 API）"
+        });
+      }
+
       function looksLikeDeviceUserLimit(text) {
         if (!text) return false;
         const lower = String(text).toLowerCase();
@@ -772,20 +784,32 @@ writeActiveSession(inputJson);
     }
 
 
-    func syncActiveAppSessionAndQuota() async -> UUID? {
+    /// - Parameter localOnly: 只做本地解密 + 账号匹配 + 会话缓存更新，不请求官方额度 API。
+    ///   静默换号验证等「只需确认当前桌面账号」的场景使用，快且不受网络波动影响。
+    func syncActiveAppSessionAndQuota(localOnly: Bool = false) async -> UUID? {
         isSyncingSession = true
         lastSyncHitDeviceUserLimit = false
-        lastQuotaSyncFresh = false
-        syncStatusMessage = "正在读取本地 Typeless 登录状态并向云端同步本周额度..."
+        if !localOnly {
+            // 只有完整同步才清空「新鲜额度」标记；本地校验不动该标记，避免误判额度陈旧。
+            lastQuotaSyncFresh = false
+        }
+        syncStatusMessage = localOnly
+            ? "正在本地校验 Typeless 登录态..."
+            : "正在读取本地 Typeless 登录状态并向云端同步本周额度..."
         statusMessage = syncStatusMessage
         
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
         let scriptURL = folder.appendingPathComponent("extract-active-session.js")
+
+        var arguments = ["node", scriptURL.path]
+        if localOnly {
+            arguments.append("--local-only")
+        }
         
         let result = await Task.detached(priority: .userInitiated) {
             return SwitchboardStore.runProcess(
-                arguments: ["node", scriptURL.path],
+                arguments: arguments,
                 environment: SwitchboardStore.automationEnvironment(),
                 currentDirectory: folder,
                 timeoutSeconds: 15
@@ -860,7 +884,7 @@ writeActiveSession(inputJson);
                         liveAccountEmail = state.accounts[i].email
                         let remaining = state.accounts[i].remainingCharacters
                         state.accounts[i].notes = "本周额度：已用 \(used)/\(limit)，剩余 \(remaining) · 官方同步 \(Self.shortClock(Date()))"
-                    } else if let info = res.info, res.error == nil {
+                    } else if let info = res.info, res.error == nil, !localOnly {
                         state.accounts[i].notes = "已同步：\(info)"
                     }
                     // 额度 API 正常时才刷新静默会话缓存；设备超限/API 错误时保留旧 payload。
@@ -885,6 +909,8 @@ writeActiveSession(inputJson);
                     let limit = lastQuotaMonthlyLimit ?? 8000
                     let remaining = liveRemainingCharacters ?? max(limit - used, 0)
                     syncStatusMessage = "本周额度已更新「\(email)」：已用 \(used)/\(limit)，剩余 \(remaining)"
+                } else if localOnly {
+                    syncStatusMessage = "本地校验：当前桌面会话账号「\(email)」"
                 } else {
                     lastQuotaSyncFresh = false
                     syncStatusMessage = "已读到账号「\(email)」，但未拿到完整本周额度字段"
@@ -915,7 +941,9 @@ writeActiveSession(inputJson);
                     newAcc.usedCharacters = res.usedCharacters ?? 0
                     newAcc.monthlyLimit = res.monthlyLimit ?? 8000
                     newAcc.notes = "从官方 App 自动导入（本周额度待刷新）"
-                    lastQuotaSyncFresh = false
+                    if !localOnly {
+                        lastQuotaSyncFresh = false
+                    }
                 }
                 if res.error == nil {
                     newAcc.rawUserDataPayload = res.rawJson
@@ -974,11 +1002,17 @@ writeActiveSession(inputJson);
     }
 
 
+    /// 最近一次成功写盘的内容快照：UI 逐字符输入也会触发 save，内容未变时跳过编码与写盘。
+    private var lastSavedStateData: Data?
+
     func save() {
         do {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try JSONEncoder.appEncoder.encode(state)
-            try data.write(to: fileURL, options: [.atomic])
+            if data != lastSavedStateData {
+                try data.write(to: fileURL, options: [.atomic])
+                lastSavedStateData = data
+            }
             
             if state.settings.isAutoRotateEnabled {
                 startRotateMonitor()
@@ -1416,7 +1450,8 @@ writeActiveSession(inputJson);
                 lastSilentSwitchFailureReason = "设备登录用户数已超限，静默会话不可用"
                 return false
             }
-            if let synced = await syncActiveAppSessionAndQuota(),
+            // 验证只需要本地解密出的当前桌面账号，无需每次请求官方额度 API。
+            if let synced = await syncActiveAppSessionAndQuota(localOnly: true),
                let syncedIndex = accountIndex(id: synced),
                state.accounts[syncedIndex].email.lowercased() == targetAccount.email.lowercased() {
                 liveAccountEmail = state.accounts[syncedIndex].email
@@ -1439,6 +1474,9 @@ writeActiveSession(inputJson);
             }
             return false
         }
+
+        // 本地校验已确认切到目标号：补一次完整同步刷新本周额度数字（失败不影响已确认结果）。
+        _ = await syncActiveAppSessionAndQuota()
 
         if let previousID,
            let previousIndex = accountIndex(id: previousID),
@@ -1467,7 +1505,7 @@ writeActiveSession(inputJson);
         activateTypeless: Bool,
         resetDeviceIdentity: Bool = true
     ) async -> Bool {
-        _ = terminateInstalledTypelessApp()
+        _ = await terminateInstalledTypelessApp()
 
         if resetDeviceIdentity {
             let backupRoot = automationDirectoryURL()
@@ -2787,15 +2825,15 @@ writeActiveSession(inputJson);
             // 热备：只在独立 Playwright profile 里注册，绝不碰当前桌面/Chrome 登录态。
             log.append("热备模式：跳过桌面/Chrome 清理与 handoff，避免打断当前使用")
         } else {
-            let staleChromePromptLog = resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement()
+            let staleChromePromptLog = await resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement()
             log.append(contentsOf: staleChromePromptLog)
-            let staleChromeTabsLog = closePersonalChromeTypelessTabsBeforeReplacement()
+            let staleChromeTabsLog = await closePersonalChromeTypelessTabsBeforeReplacement()
             log.append(contentsOf: staleChromeTabsLog)
-            let desktopPreparationLog = prepareLocalTypelessDesktopEnvironmentForAutomaticReplacement()
+            let desktopPreparationLog = await prepareLocalTypelessDesktopEnvironmentForAutomaticReplacement()
             log.append(contentsOf: desktopPreparationLog)
-            let browserSessionPreparationLog = prepareRetainedTypelessBrowserSessionsForAutomaticReplacement()
+            let browserSessionPreparationLog = await prepareRetainedTypelessBrowserSessionsForAutomaticReplacement()
             log.append(contentsOf: browserSessionPreparationLog)
-            let chromePreparationLog = preparePersonalChromeTypelessWebSessionForAutomaticReplacement()
+            let chromePreparationLog = await preparePersonalChromeTypelessWebSessionForAutomaticReplacement()
             log.append(contentsOf: chromePreparationLog)
         }
         statusMessage = preserveCurrentAccount
@@ -2964,16 +3002,16 @@ writeActiveSession(inputJson);
             }
 
             if !preserveCurrentAccount {
-                log.append(contentsOf: syncPersonalChromeTypelessWebSession(
+                log.append(contentsOf: await syncPersonalChromeTypelessWebSession(
                     account: account,
                     profileDirectoryPath: browserProfileURL.path
                 ))
-                log.append(handoffRetainedTypelessProfileToDesktopOnce(
+                log.append(await handoffRetainedTypelessProfileToDesktopOnce(
                     profileDirectoryPath: browserProfileURL.path,
                     expectedEmail: account.email
                 ))
                 log.append("新账号浏览器会话已保留：\(browserProfileURL.path)；未自动打开额外浏览器，需要排查时再点“打开新账号会话”")
-                log.append(contentsOf: completeTypelessDesktopOnboardingIfPresent(
+                log.append(contentsOf: await completeTypelessDesktopOnboardingIfPresent(
                     expectedEmail: account.email,
                     timeoutSeconds: 120
                 ))
@@ -3007,26 +3045,36 @@ writeActiveSession(inputJson);
         )
         save()
         if automationComplete, !preserveCurrentAccount {
-            // 同步官方会话并把桌面登录态缓存写回账号池，供下次无感换号静默注入。
+            // 先用本地解密快速确认桌面已切到新号并固化会话缓存，避免每轮验证都请求官方额度 API。
+            var matchedNewAccount = false
             for attempt in 0..<SmartSwitchPolicy.sessionCaptureRetryAttempts {
                 if attempt > 0 {
                     try? await Task.sleep(nanoseconds: SmartSwitchPolicy.sessionCaptureRetryDelaySeconds * 1_000_000_000)
                 }
-                if let synced = await syncActiveAppSessionAndQuota(),
+                if let synced = await syncActiveAppSessionAndQuota(localOnly: true),
                    let syncedIndex = accountIndex(id: synced) {
                     let email = state.accounts[syncedIndex].email.lowercased()
                     if email == account.email.lowercased() {
-                        liveAccountEmail = state.accounts[syncedIndex].email
-                        liveRemainingCharacters = state.accounts[syncedIndex].remainingCharacters
-                        lastKnownRemainingForInterval = liveRemainingCharacters
+                        matchedNewAccount = true
                         break
                     }
                     if state.accounts[syncedIndex].rawUserDataPayload != nil,
                        let accountIndex = accountIndex(id: account.id),
                        state.accounts[accountIndex].rawUserDataPayload == nil {
                         // 桌面已是新号但邮箱匹配慢时，仍把 payload 留在账号上。
+                        matchedNewAccount = true
                         break
                     }
+                }
+            }
+            if matchedNewAccount {
+                // 桌面会话已确认：补一次完整同步刷新本周额度数字。
+                if let synced = await syncActiveAppSessionAndQuota(),
+                   let syncedIndex = accountIndex(id: synced),
+                   state.accounts[syncedIndex].email.lowercased() == account.email.lowercased() {
+                    liveAccountEmail = state.accounts[syncedIndex].email
+                    liveRemainingCharacters = state.accounts[syncedIndex].remainingCharacters
+                    lastKnownRemainingForInterval = liveRemainingCharacters
                 }
             }
         }
@@ -3364,7 +3412,8 @@ writeActiveSession(inputJson);
         }
 
         do {
-            let data = try await moeMailRequest(url: url, apiKey: apiKey)
+            // 验证码轮询路径必须用短超时：轮询总窗口有限，慢请求会挤占后续轮次。
+            let data = try await moeMailRequest(url: url, apiKey: apiKey, timeoutInterval: 8)
             moeMailMessages = parseMoeMailMessages(from: data)
             statusMessage = moeMailMessages.isEmpty ? "没有读取到邮件" : "已读取 \(moeMailMessages.count) 封邮件"
         } catch {
@@ -3552,9 +3601,9 @@ writeActiveSession(inputJson);
         return try? JSONDecoder().decode(BrowserAutomationResultPayload.self, from: data)
     }
 
-    private func prepareLocalTypelessDesktopEnvironmentForAutomaticReplacement() -> [String] {
+    private func prepareLocalTypelessDesktopEnvironmentForAutomaticReplacement() async -> [String] {
         var log: [String] = []
-        log.append(terminateInstalledTypelessApp())
+        log.append(await terminateInstalledTypelessApp())
 
         let backupRoot = automationDirectoryURL()
             .appendingPathComponent("DesktopSessionBackups", isDirectory: true)
@@ -3738,9 +3787,9 @@ writeActiveSession(inputJson);
         try patchedData.write(to: storageURL, options: .atomic)
     }
 
-    private func prepareRetainedTypelessBrowserSessionsForAutomaticReplacement() -> [String] {
+    private func prepareRetainedTypelessBrowserSessionsForAutomaticReplacement() async -> [String] {
         var log: [String] = []
-        log.append(terminateRetainedTypelessBrowserSessions())
+        log.append(await terminateRetainedTypelessBrowserSessions())
 
         let source = retainedTypelessBrowserProfileRootURL()
         guard FileManager.default.fileExists(atPath: source.path) else {
@@ -3768,8 +3817,8 @@ writeActiveSession(inputJson);
         return log
     }
 
-    private func resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement() -> [String] {
-        let result = approveChromeTypelessAppPrompt()
+    private func resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement() async -> [String] {
+        let result = await approveChromeTypelessAppPrompt()
         let output = result.output.ifEmpty("退出码 \(result.status)")
         if result.status == 0,
            output.localizedCaseInsensitiveContains("approved") {
@@ -3782,7 +3831,7 @@ writeActiveSession(inputJson);
         return ["处理 Google Chrome 遗留 Typeless.app 弹窗未完成：\(output)；继续清理环境"]
     }
 
-    private func closePersonalChromeTypelessTabsBeforeReplacement() -> [String] {
+    private func closePersonalChromeTypelessTabsBeforeReplacement() async -> [String] {
         let script = """
         tell application "Google Chrome"
           set closedCount to 0
@@ -3802,7 +3851,7 @@ writeActiveSession(inputJson);
           return "closed " & closedCount & " typeless tabs"
         end tell
         """
-        let result = runInlineAppleScript(
+        let result = await runInlineAppleScript(
             script,
             label: "close-personal-chrome-typeless-tabs",
             timeoutSeconds: 10
@@ -3813,7 +3862,7 @@ writeActiveSession(inputJson);
         return ["关闭 Google Chrome 旧 Typeless 标签失败：\(result.output.ifEmpty("退出码 \(result.status)"))"]
     }
 
-    private func preparePersonalChromeTypelessWebSessionForAutomaticReplacement() -> [String] {
+    private func preparePersonalChromeTypelessWebSessionForAutomaticReplacement() async -> [String] {
         let clearScript = """
         (async () => {
           try { localStorage.clear(); } catch (error) {}
@@ -3850,7 +3899,7 @@ writeActiveSession(inputJson);
         })();
         """
 
-        let result = runJavaScriptInPersonalChrome(
+        let result = await runJavaScriptInPersonalChrome(
             clearScript,
             label: "clear-personal-chrome-typeless-session",
             targetURL: typelessDefaultLoginURL,
@@ -3862,7 +3911,7 @@ writeActiveSession(inputJson);
             : ["清理 Google Chrome 里的 Typeless 网页旧账号会话失败：\(result.output.ifEmpty("退出码 \(result.status)"))"]
     }
 
-    private func syncPersonalChromeTypelessWebSession(account: Account, profileDirectoryPath: String) -> [String] {
+    private func syncPersonalChromeTypelessWebSession(account: Account, profileDirectoryPath: String) async -> [String] {
         guard let tokenInfo = extractTypelessTokenInfo(fromBrowserProfile: profileDirectoryPath, expectedEmail: account.email) else {
             return ["未能从新账号浏览器 profile 提取 Typeless 登录态，跳过同步 Google Chrome"]
         }
@@ -3875,7 +3924,7 @@ writeActiveSession(inputJson);
         'synced typeless chrome session';
         """
 
-        let syncResult = runJavaScriptInPersonalChrome(
+        let syncResult = await runJavaScriptInPersonalChrome(
             syncScript,
             label: "sync-personal-chrome-typeless-session",
             targetURL: "https://www.typeless.com/login",
@@ -3898,25 +3947,25 @@ writeActiveSession(inputJson);
           'desktop handoff button not found';
         }
         """
-        _ = runJavaScriptInPersonalChrome(
+        _ = await runJavaScriptInPersonalChrome(
             openDesktopScript,
             label: "open-typeless-desktop-from-personal-chrome",
             targetURL: "https://www.typeless.com/login/app/success",
             delayBeforeJavaScriptSeconds: chromeSessionJavaScriptDelaySeconds,
             timeoutSeconds: 20
         )
-        _ = approveChromeTypelessAppPrompt()
+        _ = await approveChromeTypelessAppPrompt()
 
         return ["已把 Google Chrome 的 Typeless 网页会话切到新账号：\(account.email)"]
     }
 
-    private func handoffRetainedTypelessProfileToDesktopOnce(profileDirectoryPath: String, expectedEmail: String) -> String {
+    private func handoffRetainedTypelessProfileToDesktopOnce(profileDirectoryPath: String, expectedEmail: String) async -> String {
         if let tokenInfo = extractTypelessTokenInfo(fromBrowserProfile: profileDirectoryPath, expectedEmail: expectedEmail),
            let authURL = makeTypelessDesktopAuthURL(fromTokenInfo: tokenInfo) {
-            forceLaunchTypelessBeforeAuthProtocol()
-            let firstOpen = openTypelessAuthProtocol(authURL)
-            Thread.sleep(forTimeInterval: 2.0)
-            let secondOpen = openTypelessAuthProtocol(authURL)
+            await forceLaunchTypelessBeforeAuthProtocol()
+            let firstOpen = await openTypelessAuthProtocol(authURL)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            let secondOpen = await openTypelessAuthProtocol(authURL)
             if firstOpen || secondOpen {
                 return "已用完整 access_token / refresh_token / user_id 后台触发 Typeless 桌面端登录协议"
             }
@@ -3928,12 +3977,15 @@ writeActiveSession(inputJson);
             let scriptURL = folder.appendingPathComponent("typeless-desktop-handoff-\(Date().timeIntervalSince1970).js")
             try makeDesktopHandoffScript(profileDirectoryPath: profileDirectoryPath)
                 .write(to: scriptURL, atomically: true, encoding: .utf8)
-            let result = SwitchboardStore.runProcess(
-                arguments: ["node", scriptURL.path],
-                environment: SwitchboardStore.automationEnvironment(),
-                currentDirectory: folder,
-                timeoutSeconds: 45
-            )
+            // 该脚本会启动 Playwright 并在页面中点击 handoff，可能在后台线程执行，避免冻结主线程。
+            let result = await Task.detached(priority: .utility) {
+                SwitchboardStore.runProcess(
+                    arguments: ["node", scriptURL.path],
+                    environment: SwitchboardStore.automationEnvironment(),
+                    currentDirectory: folder,
+                    timeoutSeconds: 45
+                )
+            }.value
             if result.status == 0 {
                 return "已后台触发新账号 Typeless 桌面端 handoff：\(result.output.ifEmpty("无输出"))"
             }
@@ -3943,19 +3995,22 @@ writeActiveSession(inputJson);
         }
     }
 
-    private func forceLaunchTypelessBeforeAuthProtocol() {
+    private func forceLaunchTypelessBeforeAuthProtocol() async {
         if let path = typelessAppPath() {
             NSWorkspace.shared.open(URL(fileURLWithPath: path))
-            Thread.sleep(forTimeInterval: 6.0)
+            // 给 Electron 冷启动留时间，但用可取消 sleep，不再硬冻结主线程。
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
         }
     }
 
-    private func openTypelessAuthProtocol(_ authURL: String) -> Bool {
-        let result = SwitchboardStore.runProcess(
-            arguments: ["open", authURL],
-            environment: SwitchboardStore.automationEnvironment(),
-            timeoutSeconds: 15
-        )
+    private func openTypelessAuthProtocol(_ authURL: String) async -> Bool {
+        let result = await Task.detached(priority: .utility) {
+            SwitchboardStore.runProcess(
+                arguments: ["open", authURL],
+                environment: SwitchboardStore.automationEnvironment(),
+                timeoutSeconds: 15
+            )
+        }.value
         return result.status == 0
     }
 
@@ -4061,13 +4116,13 @@ writeActiveSession(inputJson);
         """
     }
 
-    private func completeTypelessDesktopOnboardingIfPresent(expectedEmail: String, timeoutSeconds: TimeInterval = 60) -> [String] {
+    private func completeTypelessDesktopOnboardingIfPresent(expectedEmail: String, timeoutSeconds: TimeInterval = 60) async -> [String] {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let typelessFolder = appSupport.appendingPathComponent("Typeless", isDirectory: true)
         let storageURL = typelessFolder.appendingPathComponent("app-storage.json")
         let onboardingURL = typelessFolder.appendingPathComponent("app-onboarding.json")
 
-        let readiness = waitForTypelessDesktopStorage(
+        let readiness = await waitForTypelessDesktopStorage(
             storageURL: storageURL,
             onboardingURL: onboardingURL,
             expectedEmail: expectedEmail,
@@ -4082,12 +4137,12 @@ writeActiveSession(inputJson);
         }
 
         do {
-            logOutAndStopTypelessForOnboardingPatch()
+            await logOutAndStopTypelessForOnboardingPatch()
             try writeTypelessOnboardingCompletion(to: onboardingURL)
             try writeTypelessStorageOnboardingCompletion(to: storageURL, expectedEmail: expectedEmail)
             if let path = typelessAppPath() {
                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                enforceTypelessDesktopOnboardingPatchAfterRelaunch(
+                await enforceTypelessDesktopOnboardingPatchAfterRelaunch(
                     storageURL: storageURL,
                     onboardingURL: onboardingURL,
                     expectedEmail: expectedEmail
@@ -4207,9 +4262,10 @@ writeActiveSession(inputJson);
         storageURL: URL,
         onboardingURL: URL,
         expectedEmail: String
-    ) {
+    ) async {
         for delay in [1.0, 3.0, 6.0, 12.0, 24.0, 60.0] {
-            Thread.sleep(forTimeInterval: delay)
+            // 可取消 sleep，不再硬冻结主线程；总等待上限不变。
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard let email = readTypelessDesktopEmail(from: storageURL),
                   email.caseInsensitiveCompare(expectedEmail) == .orderedSame else {
                 continue
@@ -4224,12 +4280,12 @@ writeActiveSession(inputJson);
         onboardingURL: URL,
         expectedEmail: String,
         timeoutSeconds: TimeInterval
-    ) -> (email: String?, onboardingExists: Bool) {
+    ) async -> (email: String?, onboardingExists: Bool) {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         var lastEmail: String?
         var onboardingExists = FileManager.default.fileExists(atPath: onboardingURL.path)
 
-        repeat {
+        while Date() < deadline {
             if let email = readTypelessDesktopEmail(from: storageURL) {
                 lastEmail = email
                 onboardingExists = FileManager.default.fileExists(atPath: onboardingURL.path)
@@ -4237,8 +4293,8 @@ writeActiveSession(inputJson);
                     return (email, onboardingExists)
                 }
             }
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
-        } while Date() < deadline
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
 
         return (lastEmail, onboardingExists)
     }
@@ -4254,12 +4310,12 @@ writeActiveSession(inputJson);
         return email
     }
 
-    private func logOutAndStopTypelessForOnboardingPatch() {
-        _ = terminateInstalledTypelessApp()
-        Thread.sleep(forTimeInterval: 1.5)
+    private func logOutAndStopTypelessForOnboardingPatch() async {
+        _ = await terminateInstalledTypelessApp()
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
     }
 
-    private func terminateInstalledTypelessApp() -> String {
+    private func terminateInstalledTypelessApp() async -> String {
         let running = NSWorkspace.shared.runningApplications.filter { app in
             app.bundleIdentifier == "now.typeless.desktop" ||
                 app.localizedName == "Typeless" ||
@@ -4284,38 +4340,45 @@ writeActiveSession(inputJson);
             if !stillRunning {
                 return "已正常退出本机 Typeless App"
             }
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+            try? await Task.sleep(nanoseconds: 200_000_000)
         }
 
-        let forced = SwitchboardStore.runProcess(
-            arguments: ["pkill", "-f", "Typeless.app/Contents"],
-            environment: SwitchboardStore.automationEnvironment(),
-            timeoutSeconds: 5
-        )
+        let forced = await Task.detached(priority: .utility) {
+            SwitchboardStore.runProcess(
+                arguments: ["pkill", "-f", "Typeless.app/Contents"],
+                environment: SwitchboardStore.automationEnvironment(),
+                timeoutSeconds: 5
+            )
+        }.value
         return forced.status == 0
             ? "已强制退出残留 Typeless App 进程"
             : "已请求退出 Typeless App；未发现可强制结束的残留进程"
     }
 
-    private func terminateRetainedTypelessBrowserSessions() -> String {
+    private func terminateRetainedTypelessBrowserSessions() async -> String {
         guard FileManager.default.fileExists(atPath: retainedTypelessBrowserProfileRootURL().path) else {
             return "旧网页登录态 profile 根目录不存在，无需关闭浏览器窗口"
         }
 
-        let running = SwitchboardStore.runProcess(
-            arguments: ["pgrep", "-f", retainedTypelessBrowserProfileRootURL().path],
-            environment: SwitchboardStore.automationEnvironment(),
-            timeoutSeconds: 5
-        )
+        let profileRoot = retainedTypelessBrowserProfileRootURL().path
+        let running = await Task.detached(priority: .utility) {
+            SwitchboardStore.runProcess(
+                arguments: ["pgrep", "-f", profileRoot],
+                environment: SwitchboardStore.automationEnvironment(),
+                timeoutSeconds: 5
+            )
+        }.value
         guard running.status == 0 else {
             return "未发现旧网页登录浏览器窗口"
         }
 
-        let forced = SwitchboardStore.runProcess(
-            arguments: ["pkill", "-f", retainedTypelessBrowserProfileRootURL().path],
-            environment: SwitchboardStore.automationEnvironment(),
-            timeoutSeconds: 5
-        )
+        let forced = await Task.detached(priority: .utility) {
+            SwitchboardStore.runProcess(
+                arguments: ["pkill", "-f", profileRoot],
+                environment: SwitchboardStore.automationEnvironment(),
+                timeoutSeconds: 5
+            )
+        }.value
         return forced.status == 0
             ? "已关闭旧网页登录浏览器窗口"
             : "尝试关闭旧网页登录浏览器窗口失败：\(forced.output.ifEmpty("退出码 \(forced.status)"))"
@@ -4347,18 +4410,21 @@ writeActiveSession(inputJson);
         _ appleScript: String,
         label: String,
         timeoutSeconds: TimeInterval
-    ) -> (status: Int32, output: String) {
+    ) async -> (status: Int32, output: String) {
         do {
             let folder = automationDirectoryURL()
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let url = folder.appendingPathComponent("\(label)-\(Date().timeIntervalSince1970).applescript")
             try appleScript.write(to: url, atomically: true, encoding: .utf8)
-            return SwitchboardStore.runProcess(
-                arguments: ["osascript", url.path],
-                environment: SwitchboardStore.automationEnvironment(),
-                currentDirectory: folder,
-                timeoutSeconds: timeoutSeconds
-            )
+            // osascript 可能被自动化授权弹窗/系统挂起拖住，必须在后台线程执行，避免冻结主线程。
+            return await Task.detached(priority: .utility) {
+                SwitchboardStore.runProcess(
+                    arguments: ["osascript", url.path],
+                    environment: SwitchboardStore.automationEnvironment(),
+                    currentDirectory: folder,
+                    timeoutSeconds: timeoutSeconds
+                )
+            }.value
         } catch {
             return (-1, error.localizedDescription)
         }
@@ -4370,7 +4436,7 @@ writeActiveSession(inputJson);
         targetURL: String,
         delayBeforeJavaScriptSeconds: Int,
         timeoutSeconds: TimeInterval
-    ) -> (status: Int32, output: String) {
+    ) async -> (status: Int32, output: String) {
         do {
             let folder = automationDirectoryURL()
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -4407,18 +4473,21 @@ writeActiveSession(inputJson);
             end tell
             """
             try appleScript.write(to: appleScriptURL, atomically: true, encoding: .utf8)
-            return SwitchboardStore.runProcess(
-                arguments: ["osascript", appleScriptURL.path],
-                environment: SwitchboardStore.automationEnvironment(),
-                currentDirectory: folder,
-                timeoutSeconds: timeoutSeconds
-            )
+            // Chrome AppleScript 可能等待页面加载 / 自动化授权，必须在后台线程执行，避免冻结主线程。
+            return await Task.detached(priority: .utility) {
+                SwitchboardStore.runProcess(
+                    arguments: ["osascript", appleScriptURL.path],
+                    environment: SwitchboardStore.automationEnvironment(),
+                    currentDirectory: folder,
+                    timeoutSeconds: timeoutSeconds
+                )
+            }.value
         } catch {
             return (-1, error.localizedDescription)
         }
     }
 
-    private func approveChromeTypelessAppPrompt() -> (status: Int32, output: String) {
+    private func approveChromeTypelessAppPrompt() async -> (status: Int32, output: String) {
         let script = """
         -- Handles Chrome external-protocol prompt:
         -- AXCheckBox / “始终允许 www.typeless.com ...” / “Always allow ...”
@@ -4578,12 +4647,15 @@ writeActiveSession(inputJson);
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let url = folder.appendingPathComponent("approve-chrome-typeless-prompt-\(Date().timeIntervalSince1970).applescript")
             try script.write(to: url, atomically: true, encoding: .utf8)
-            return SwitchboardStore.runProcess(
-                arguments: ["osascript", url.path],
-                environment: SwitchboardStore.automationEnvironment(),
-                currentDirectory: folder,
-                timeoutSeconds: 10
-            )
+            // 该脚本可能被 Chrome 弹窗 / 自动化授权卡住，必须在后台线程执行，避免冻结主线程。
+            return await Task.detached(priority: .utility) {
+                SwitchboardStore.runProcess(
+                    arguments: ["osascript", url.path],
+                    environment: SwitchboardStore.automationEnvironment(),
+                    currentDirectory: folder,
+                    timeoutSeconds: 10
+                )
+            }.value
         } catch {
             return (-1, error.localizedDescription)
         }
@@ -4854,25 +4926,71 @@ writeActiveSession(inputJson);
         process.standardOutput = pipe
         process.standardError = pipe
 
+        // 边跑边读：子进程输出超过管道缓冲（约 64KB）时会写阻塞，若等进程退出后才读会永远等不到退出。
+        // 这里用一个后台读取线程持续消费管道，最多保留 512KB，超时终止时也能拿到已产生的部分输出。
+        let readHandle = pipe.fileHandleForReading
+        let outputBuffer = OutputBuffer(maxBytes: 512 * 1024)
+
         do {
             try process.run()
-            let group = DispatchGroup()
-            group.enter()
-            DispatchQueue.global(qos: .utility).async {
-                process.waitUntilExit()
-                group.leave()
-            }
-            if group.wait(timeout: .now() + timeoutSeconds) == .timedOut {
-                process.terminate()
-                return (-2, "命令超时：\(arguments.joined(separator: " "))")
-            }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return (
-                process.terminationStatus,
-                String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            )
         } catch {
             return (-1, error.localizedDescription)
+        }
+
+        let group = DispatchGroup()
+        group.enter() // 进程退出
+        group.enter() // 管道读完
+        DispatchQueue.global(qos: .utility).async {
+            process.waitUntilExit()
+            group.leave()
+        }
+        DispatchQueue.global(qos: .utility).async {
+            while true {
+                let chunk = readHandle.availableData
+                if chunk.isEmpty { break }
+                outputBuffer.append(chunk)
+            }
+            group.leave()
+        }
+
+        let timedOut = group.wait(timeout: .now() + timeoutSeconds) == .timedOut
+        if timedOut {
+            process.terminate()
+            // 给子进程死亡、管道 EOF 一点收尾时间。
+            _ = group.wait(timeout: .now() + 2)
+        }
+
+        let output = outputBuffer.string()
+        if timedOut {
+            return (-2, "命令超时：\(arguments.joined(separator: " "))\(output.isEmpty ? "" : "\n\(output)")")
+        }
+        return (process.terminationStatus, output)
+    }
+
+    /// 线程安全的进程输出缓冲：后台读取线程持续写入，主调用方在结束时快照。
+    private final class OutputBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private let maxBytes: Int
+        private var data = Data()
+
+        init(maxBytes: Int) {
+            self.maxBytes = maxBytes
+        }
+
+        func append(_ chunk: Data) {
+            lock.lock()
+            defer { lock.unlock() }
+            if data.count < maxBytes {
+                let remaining = maxBytes - data.count
+                data.append(chunk.prefix(remaining))
+            }
+        }
+
+        func string() -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            return String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
     }
 
@@ -4881,9 +4999,11 @@ writeActiveSession(inputJson);
         return URL(string: path, relativeTo: base)
     }
 
-    private func moeMailRequest(url: URL, apiKey: String, method: String = "GET", body: Data? = nil) async throws -> Data {
+    private func moeMailRequest(url: URL, apiKey: String, method: String = "GET", body: Data? = nil, timeoutInterval: TimeInterval = 15) async throws -> Data {
         var request = URLRequest(url: url)
         request.httpMethod = method
+        // 必须显式超时：轮询路径总窗口只有约 101 秒，一次请求挂起（默认 60s）就会吃掉整个窗口。
+        request.timeoutInterval = timeoutInterval
         request.addValue(apiKey, forHTTPHeaderField: "X-API-Key")
         if let body {
             request.httpBody = body

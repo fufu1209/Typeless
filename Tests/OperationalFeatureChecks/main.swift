@@ -175,7 +175,7 @@ struct OperationalFeatureChecks {
         check(switchboardSource.contains("func prepareRetainedTypelessBrowserSessionsForAutomaticReplacement"), "switchboard can isolate previously retained Typeless web sessions")
         check(switchboardSource.contains("BrowserSessionBackups"), "retained Typeless web session isolation keeps backups")
         check(switchboardSource.contains("terminateRetainedTypelessBrowserSessions"), "retained Typeless web session isolation terminates old browser windows")
-        check(switchboardSource.contains("pkill\", \"-f\", retainedTypelessBrowserProfileRootURL().path"), "retained Typeless web session isolation closes old Playwright Chromium processes by profile root")
+        check(switchboardSource.contains("\"pkill\", \"-f\", profileRoot"), "retained Typeless web session isolation closes old Playwright Chromium processes by profile root")
         check(switchboardSource.contains("已隔离旧网页登录态"), "retained Typeless web session isolation logs old web session backup")
         check(switchboardSource.contains("func resetTypelessDeviceIdentityForAutomaticReplacement"), "one-click automation fully resets Typeless device identity like typeless-toolkit resetDevice")
         check(switchboardSource.contains("now.typeless.desktop.deviceIdentifier"), "device reset deletes the real macOS Typeless Keychain service")

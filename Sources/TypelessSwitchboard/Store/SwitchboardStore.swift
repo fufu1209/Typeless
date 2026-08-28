@@ -40,6 +40,22 @@ final class SwitchboardStore: ObservableObject {
     /// 开机自启 LaunchAgent 状态摘要（侧栏展示）。
     @Published var launchAgentStatusMessage = ""
 
+    // MARK: - v2.5.4 周额度周期看门狗
+    //
+    // 原先 `reviveExpiredAccountsIfNeeded` 只在 `syncActiveAppSessionAndQuota` 里被调用，
+    // 而同步本身依赖 node 脚本 + Typeless 登录态。两个后果：
+    //   1. 关掉「无感守护」时，周一 00:00 之后账号不会自动复活，额度被错杀；
+    //   2. 整个周末没开 App，周一打开也不会复活，要等用户手动点「同步额度」。
+    // 看门狗与守护开关解耦：不管 isAutoRotateEnabled 开不开都会跑，
+    // 且只在本地纯计算，不请求网络、不依赖 node。
+    var quotaCycleWatchdogTask: Task<Void, Never>?
+    /// 最近一次自动复活的时间点（UI 展示用）。
+    @Published var lastWeeklyRevivalAt: Date?
+    /// 最近一次自动复活了哪些账号（UI 展示用）。
+    @Published var lastWeeklyRevivalEmails: [String] = []
+    /// Typeless 桌面端引导状态是否未完成（v2.5.4：启动自检后提示用户一键跳过）。
+    @Published var desktopOnboardingNeedsPatch = false
+
     let fileURL: URL
     let runMode: SwitchboardRunMode
     var rotateMonitorTask: Task<Void, Never>?

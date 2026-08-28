@@ -178,7 +178,65 @@ extension SwitchboardStore {
             timeoutSeconds: 2,
             stopAndRelaunch: true
         ))
+        // 打完立刻复查，让 UI 横幅能马上消失。
+        let stillNeeded = desktopOnboardingIsIncomplete()
+        await MainActor.run { desktopOnboardingNeedsPatch = stillNeeded }
+        log.append(stillNeeded
+                   ? "复查：仍未生效，可关闭 Typeless 后再点一次"
+                   : "复查：引导已完成标记已生效")
         return log
+    }
+
+    // MARK: - 启动自检与自愈（v2.5.4）
+
+    /// 桌面端引导是否仍未完成。文件不存在时返回 false —— Typeless 还没生成过这个文件，
+    /// 不代表需要修，避免在没装 Typeless 的机器上误报警。
+    func desktopOnboardingIsIncomplete() -> Bool {
+        guard let data = try? Data(contentsOf: typelessOnboardingURL()),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        if let done = object["isCompleted"] as? Bool { return !done }
+        // 没有 isCompleted 字段时用 step 兜底。
+        if let step = object["step"] as? Int { return step < 99 }
+        return true
+    }
+
+    /// 刷新 `desktopOnboardingNeedsPatch`。App 启动时调一次，UI 据此显示一键修复横幅。
+    @discardableResult
+    func refreshDesktopOnboardingState() -> Bool {
+        let needs = desktopOnboardingIsIncomplete()
+        desktopOnboardingNeedsPatch = needs
+        if needs {
+            appendOnboardingPatchLog("启动自检：检测到 Typeless 桌面端新手引导未完成")
+        }
+        return needs
+    }
+
+    /// 启动自愈：只在「Typeless 没在跑」时静默写引导标记，完全不打扰用户。
+    ///
+    /// Typeless 正在跑时**不写** —— 它内存里持有 isCompleted=false，
+    /// 退出时会把我们写的值覆盖回去，白写还可能造成状态打架。
+    /// 那种情况改由顶部横幅提示用户点一下，走完整的「退出 → 写盘 → 重启」流程。
+    @discardableResult
+    func autoHealDesktopOnboardingIfSafe() -> Bool {
+        guard desktopOnboardingIsIncomplete() else { return false }
+        let running = NSWorkspace.shared.runningApplications.contains { app in
+            app.bundleIdentifier == "now.typeless.desktop" ||
+                app.localizedName == "Typeless" ||
+                app.bundleURL?.path == typelessAppPath()
+        }
+        guard !running else { return false }
+
+        do {
+            try writeTypelessOnboardingCompletion(to: typelessOnboardingURL())
+            appendOnboardingPatchLog("启动自愈：Typeless 未运行，已静默写入引导完成标记")
+            desktopOnboardingNeedsPatch = desktopOnboardingIsIncomplete()
+            return true
+        } catch {
+            appendOnboardingPatchLog("启动自愈失败：\(error.localizedDescription)")
+            return false
+        }
     }
 
     // MARK: - 文件写入

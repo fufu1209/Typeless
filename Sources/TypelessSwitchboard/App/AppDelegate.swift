@@ -35,6 +35,14 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
         self.store = store
         installStatusItemIfNeeded()
         installWakeObserverIfNeeded()
+
+        // v2.5.4：启动即复活 + 周界看门狗。与「无感守护」开关解耦，
+        // 关掉守护、或整个周末没开 App，周一打开也能立刻把额度恢复回来。
+        store.startQuotaCycleWatchdogIfNeeded()
+        // v2.5.4：Typeless 没在跑时静默自愈引导标记；在跑则只标记状态，由横幅提示用户点一下。
+        if !store.autoHealDesktopOnboardingIfSafe() {
+            store.refreshDesktopOnboardingState()
+        }
         statusCancellable = store.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -157,6 +165,7 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
 
     @objc private func quitApp() {
         store?.stopRotateMonitor()
+        store?.stopQuotaCycleWatchdog()
         NSApp.terminate(nil)
     }
 }

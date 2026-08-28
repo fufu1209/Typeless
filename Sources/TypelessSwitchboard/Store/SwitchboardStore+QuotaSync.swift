@@ -16,10 +16,9 @@ extension SwitchboardStore {
         }
         // v2.1.0 接线：每次同步都让 QuotaCycleEngine 先把过期的 .exhausted 账号翻成 .available。
         // 周一 00:00 之后第一次同步就会触发「账号一复活」，避免额度错杀。
-        let revivedSnapshot = reviveExpiredAccountsIfNeeded()
+        let revivedSnapshot = performWeeklyRevivalIfNeeded(reason: "额度同步")
         if !revivedSnapshot.isEmpty {
             syncStatusMessage = "已复活 \(revivedSnapshot.count) 个账号（本周额度刷新）：\(revivedSnapshot.joined(separator: "、"))"
-            statusMessage = syncStatusMessage
         }
         syncStatusMessage = localOnly
             ? "正在本地校验 Typeless 登录态..."

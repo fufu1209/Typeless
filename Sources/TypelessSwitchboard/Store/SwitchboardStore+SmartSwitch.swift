@@ -32,10 +32,63 @@ extension SwitchboardStore {
         return revivedEmails
     }
 
+    // MARK: - v2.5.4 周额度周期看门狗
+
+    /// 独立于「无感守护」开关的周额度复活看门狗。
+    ///
+    /// 为什么必须独立：`reviveExpiredAccountsIfNeeded` 原来只挂在
+    /// `syncActiveAppSessionAndQuota` 里，而同步依赖 node 脚本和 Typeless 登录态，
+    /// 且巡检循环受 `isAutoRotateEnabled` 控制。关掉守护、或整个周末没开 App，
+    /// 周一 00:00 之后的复活就不会发生，账号被白白闲置一整周。
+    ///
+    /// 看门狗做两件事：
+    /// 1. 启动立刻复活一次（覆盖「周末没开 App」）；
+    /// 2. 精确睡到下一个周一 00:00 再复活，然后重新排程（覆盖「App 一直开着跨过周界」）。
+    func startQuotaCycleWatchdogIfNeeded() {
+        guard quotaCycleWatchdogTask == nil else { return }
+        quotaCycleWatchdogTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { break }
+
+                await MainActor.run { self.performWeeklyRevivalIfNeeded(reason: "周期看门狗") }
+
+                // 睡到下一个周一 00:00（+2 秒余量避开边界抖动），上限 7 天防呆。
+                let waitSeconds = QuotaCycleEngine.secondsUntilReset(
+                    now: Date(),
+                    mode: .calendarWeek,
+                    calendar: .current
+                )
+                let clamped = min(max(waitSeconds + 2, 60), QuotaCycleEngine.weekSeconds)
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(clamped * 1_000_000_000))
+                } catch {
+                    break
+                }
+            }
+        }
+    }
+
+    func stopQuotaCycleWatchdog() {
+        quotaCycleWatchdogTask?.cancel()
+        quotaCycleWatchdogTask = nil
+    }
+
+    /// 复活并把结果同步到 UI 状态。所有入口（启动 / 看门狗 / 同步 / 手动）都走这里，
+    /// 保证「复活了哪些号」只有一种记录方式，不会出现 UI 与日志说法不一致。
+    @discardableResult
+    func performWeeklyRevivalIfNeeded(reason: String) -> [String] {
+        let revived = reviveExpiredAccountsIfNeeded()
+        guard !revived.isEmpty else { return [] }
+        lastWeeklyRevivalAt = Date()
+        lastWeeklyRevivalEmails = revived
+        statusMessage = "本周额度已刷新，自动复活 \(revived.count) 个账号（\(reason)）：\(revived.joined(separator: "、"))"
+        return revived
+    }
+
     /// v2.1.0 接线：候选池生成前先复活已过期账号，再走原 SmartSwitchPolicy 决策。
     /// 这样 `smartSwitchCandidates` 会自然把复活号纳入静默池，无需改 decide() 内部逻辑。
     func smartSwitchCandidatesAfterRevival(excluding currentID: UUID?) -> [SmartSwitchCandidate] {
-        _ = reviveExpiredAccountsIfNeeded()
+        _ = performWeeklyRevivalIfNeeded(reason: "换号决策")
         return smartSwitchCandidates(excluding: currentID)
     }
 

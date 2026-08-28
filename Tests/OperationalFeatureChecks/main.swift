@@ -409,7 +409,120 @@ struct OperationalFeatureChecks {
         runNextAvailabilityChecks()
         runOnboardingSchemaChecks()
 
+        // MARK: - v2.5.4：周额度完整生命周期（用尽 → 倒计时 → 周一复活 → 回到 8000）
+        runWeeklyQuotaLifecycleChecks()
+
         print("Operational feature checks passed")
+    }
+
+    // MARK: - v2.5.4 周额度完整生命周期
+    //
+    // 用户问：「每个账号没额度之后会倒计时 7 天，7 天之后下一周不就又有 8000 了吗？」
+    // 答案是「会」，但前提是复活逻辑真的被触发。原先 reviveExpiredAccountsIfNeeded
+    // 只挂在 syncActiveAppSessionAndQuota 里，关掉守护或整个周末不开 App 就不会跑。
+    // v2.5.4 加了周期看门狗，这里把整条链路钉死。
+
+    private static func runWeeklyQuotaLifecycleChecks() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.firstWeekday = 2 // Monday
+
+        // 2026-08-24 是周一
+        let monday = cal.date(from: DateComponents(year: 2026, month: 8, day: 24, hour: 10))!
+        let tuesday = cal.date(from: DateComponents(year: 2026, month: 8, day: 25, hour: 10))!
+        let sunday = cal.date(from: DateComponents(year: 2026, month: 8, day: 30, hour: 22))!
+        let nextMonday = cal.date(from: DateComponents(year: 2026, month: 8, day: 31, hour: 0, minute: 1))!
+
+        func makeAccount(used: Int, status: AccountQuotaSnapshot.Status, lastResetAt: Date)
+            -> AccountQuotaSnapshot {
+            AccountQuotaSnapshot(
+                id: UUID(), email: "lifecycle@example.com", status: status, reviewState: .approved,
+                usedCharacters: used, monthlyLimit: 8000, lastResetAt: lastResetAt,
+                createdAt: monday, hasSilentSessionPayload: true
+            )
+        }
+
+        // 1) 周二把 8000 用完
+        let spent = makeAccount(used: 8000, status: .exhausted, lastResetAt: monday)
+        check(spent.remainingCharacters == 0, "生命周期：用尽后剩余为 0")
+
+        // 2) 用尽当天不应复活（还在同一周内）
+        check(
+            !QuotaCycleEngine.shouldRevive(account: spent, now: tuesday, mode: .calendarWeek, calendar: cal),
+            "生命周期：同一周内用尽不应复活"
+        )
+
+        // 3) 周日晚上仍不应复活，但倒计时应该指向周一 00:00
+        check(
+            !QuotaCycleEngine.shouldRevive(account: spent, now: sunday, mode: .calendarWeek, calendar: cal),
+            "生命周期：周日晚上仍未跨周，不应复活"
+        )
+        let sundayCountdown = QuotaCycleEngine.nextAvailabilityText(for: spent, now: sunday, calendar: cal)
+        check(sundayCountdown.contains("后（周一 00:00）"), "生命周期：周日晚上倒计时指向周一 00:00")
+        check(!sundayCountdown.contains("立即可用"), "生命周期：用尽期间不能显示立即可用")
+
+        // 4) 跨过周一 00:00 后应复活
+        check(
+            QuotaCycleEngine.shouldRevive(account: spent, now: nextMonday, mode: .calendarWeek, calendar: cal),
+            "生命周期：跨过周一 00:00 后应复活"
+        )
+
+        // 5) 复活后额度回到 8000
+        let revived = AccountQuotaSnapshot.revive(from: spent, now: nextMonday)
+        check(revived.remainingCharacters == 8000, "生命周期：复活后剩余额度回到 8000")
+        check(revived.status == .available, "生命周期：复活后状态变为 available")
+        check(revived.usedCharacters == 0, "生命周期：复活后已用归零")
+        check(
+            QuotaCycleEngine.nextAvailabilityText(for: revived, now: nextMonday, calendar: cal) == "立即可用",
+            "生命周期：复活后立即变为立即可用"
+        )
+
+        // 6) 复活幂等：复活后 lastResetAt 已推进，同一周内不会被重复复活
+        check(
+            !QuotaCycleEngine.shouldRevive(account: revived, now: nextMonday, mode: .calendarWeek, calendar: cal),
+            "生命周期：复活后同一周内不应被重复复活（幂等）"
+        )
+
+        // 7) 暂停的号即使跨周也不能被自动复活（尊重用户主动决定）
+        let pausedAccount = makeAccount(used: 8000, status: .paused, lastResetAt: monday)
+        check(
+            !QuotaCycleEngine.shouldRevive(account: pausedAccount, now: nextMonday, mode: .calendarWeek, calendar: cal),
+            "生命周期：暂停的号跨周也不自动复活"
+        )
+        check(
+            QuotaCycleEngine.nextAvailabilityText(for: pausedAccount, now: nextMonday, calendar: cal) == "已暂停，需手动恢复",
+            "生命周期：暂停的号显示需手动恢复"
+        )
+
+        // 8) 未审核通过的号也不能被复活
+        let pendingAccount = AccountQuotaSnapshot(
+            id: UUID(), email: "p@example.com", status: .exhausted, reviewState: .pending,
+            usedCharacters: 8000, monthlyLimit: 8000, lastResetAt: monday,
+            createdAt: monday, hasSilentSessionPayload: false
+        )
+        check(
+            !QuotaCycleEngine.shouldRevive(account: pendingAccount, now: nextMonday, mode: .calendarWeek, calendar: cal),
+            "生命周期：未审核通过的号不自动复活"
+        )
+
+        // 9) 跨年边界：2026 最后一周 → 2027 第一周（ISO 周用 year+week 复合 key）
+        let dec28_2026 = cal.date(from: DateComponents(year: 2026, month: 12, day: 28, hour: 10))!
+        let jan4_2027 = cal.date(from: DateComponents(year: 2027, month: 1, day: 4, hour: 10))!
+        let yearEnd = makeAccount(used: 8000, status: .exhausted, lastResetAt: dec28_2026)
+        check(
+            !QuotaCycleEngine.shouldRevive(account: yearEnd, now: dec28_2026, mode: .calendarWeek, calendar: cal),
+            "生命周期：跨年当周用尽当天不复活"
+        )
+        check(
+            QuotaCycleEngine.shouldRevive(account: yearEnd, now: jan4_2027, mode: .calendarWeek, calendar: cal),
+            "生命周期：跨年后新一周应复活（ISO 周复合 key 正确）"
+        )
+
+        // 10) 看门狗排程：等待时长必须落在合理区间
+        let wait = QuotaCycleEngine.secondsUntilReset(now: tuesday, mode: .calendarWeek, calendar: cal)
+        check(wait > 0, "看门狗：等待时长必须为正")
+        check(wait <= QuotaCycleEngine.weekSeconds, "看门狗：等待时长不超过 7 天")
+        let clamped = min(max(wait + 2, 60), QuotaCycleEngine.weekSeconds)
+        check(clamped >= 60, "看门狗：最小间隔 60 秒，避免边界抖动时空转")
     }
 
     // MARK: - v2.5.3 「下次可用」文案

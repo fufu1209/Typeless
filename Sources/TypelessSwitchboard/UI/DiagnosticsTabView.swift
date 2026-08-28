@@ -100,8 +100,42 @@ struct DiagnosticsTabView: View {
             }
             .buttonStyle(.bordered)
 
+            // v2.5.4：Typeless 2.4.0 起换号后可能重新弹新手引导，这里给一个常驻修复入口。
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    isPatchingOnboarding = true
+                    Task {
+                        onboardingLog = await store.skipTypelessDesktopOnboardingNow()
+                        isPatchingOnboarding = false
+                    }
+                } label: {
+                    Label(isPatchingOnboarding ? "处理中…" : "跳过 Typeless 新手引导", systemImage: "forward.end.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.purple)
+                .disabled(isPatchingOnboarding)
+
+                if !onboardingLog.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(onboardingLog, id: \.self) { line in
+                            Text(line)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                } else {
+                    Text("Typeless 2.4.0 起引导状态分散在两个文件里，换号后可能被重置。点这里会退出 Typeless、写入完成标记再重新打开。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
         }
     }
+
+    @State private var isPatchingOnboarding = false
+    @State private var onboardingLog: [String] = []
 
     // MARK: 报告与快照
 

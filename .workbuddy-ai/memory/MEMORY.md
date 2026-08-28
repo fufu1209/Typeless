@@ -48,3 +48,26 @@
 - 极度强调"稳定是基础" + "100% 强大稳定"
 - 喜欢多智能体/多 worktree 并行
 - 沟通风格：直接给可执行结论 + 命令，催了就立刻开干
+
+## Typeless 桌面端 onboarding 真相（2.4.0，v2.5.3 实测）
+- `~/Library/Application Support/Typeless/app-onboarding.json`
+  → **引导向导真正的开关**（isCompleted / step / setUpStep）
+  → 本地改得动；Typeless 重启是「合并」不是「重置」，跨重启持久
+- `app-storage.json` 的 `userData.is_new_user`
+  → **服务端真值**，每次联网同步都被覆盖，本地压不住，不要试图硬压
+- 平台枚举 4 → 7：ios/android/macos/windows/**linux**/**harmony**/**webpage**
+  macos 节点另带 app_version / completed_at
+  → 补丁用「文件已有键 ∪ 官方枚举」，未来加平台自动兼容
+- 补丁入口：账号详情按钮 / CLI `--skip-onboarding` / 换号自动
+- 日志：`~/Library/Application Support/TypelessSwitchboard/Logs/onboarding-patch.log`
+- 完整实测时间线见 `docs/onboarding-patch-truth.md`
+
+## 工程铁律（踩过的坑）
+- **验证必须跨越被测对象的重启**：补丁后立刻读文件 = 假阳性，
+  必须 quit → relaunch → 等同步完 → 再读
+- **功能保真审计只看 store 成员集合，看不出「接线断了」**：
+  Core 的 static 方法（QuotaCycleEngine）和调用点语义变化都会漏
+- **Spotlight 索引不受 .gitignore 约束**：构建产物必须落在仓库目录之外，
+  否则用户会看到「好几个一样的 app」
+- 本工程测试是可执行 target 的 main.swift，不是 XCTest
+  → `swift test` 报 no tests found，必须 `swift run OperationalFeatureChecks`

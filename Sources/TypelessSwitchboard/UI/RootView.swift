@@ -107,6 +107,27 @@ private struct GlobalStatusBar: View {
 
             Spacer(minLength: 8)
 
+            // v2.5.4：Typeless 桌面端引导未完成时给一个显眼的一键修复入口。
+            // Typeless 2.4.0 起换号后可能重新弹新手引导，这个入口不依赖换号流程。
+            if store.desktopOnboardingNeedsPatch {
+                Button {
+                    Task { _ = await store.skipTypelessDesktopOnboardingNow() }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "forward.end.circle.fill")
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text("Typeless 新手引导未完成")
+                                .font(.caption.weight(.semibold))
+                            Text("点此跳过（会重启 Typeless）")
+                                .font(.caption2)
+                        }
+                    }
+                    .foregroundStyle(.purple)
+                }
+                .buttonStyle(.plain)
+                .help("跳过 Typeless 桌面端新手引导：退出 Typeless → 写入完成标记 → 重新打开")
+            }
+
             if store.diagnostics.contains(where: { $0.level == .error }) {
                 // v2.2.0 只留了一个图标 + help 提示，用户看不到「去哪修」。
                 // v2.5.3：把这句找回并做成可点的，直接跳到自检 tab。

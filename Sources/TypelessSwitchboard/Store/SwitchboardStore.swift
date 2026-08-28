@@ -51,6 +51,12 @@ final class SwitchboardStore: ObservableObject {
     var quotaCycleWatchdogTask: Task<Void, Never>?
     /// 引导巡检循环（v2.5.5）：5 分钟一轮，Typeless 未运行且引导标记被重置时静默补写。
     var onboardingGuardTask: Task<Void, Never>?
+    /// 各账号最近一次观测到的「本周已用」数值（v2.5.6）。
+    /// 官方 `/user/usage_stats` 不返回重置时间戳，只能靠数值下降沿来识别重置 ——
+    /// 这是实测周期口径（自然周 vs 滚动 7 天）的唯一办法。仅内存态，不做持久化。
+    var quotaUsageSamples: [UUID: Int] = [:]
+    /// 观测到的额度重置时刻（v2.5.6）。攒够样本后自动给出口径结论，不再靠猜。
+    var quotaObservedResets: [QuotaCycleEngine.ObservedReset] = []
     /// 最近一次自动复活的时间点（UI 展示用）。
     @Published var lastWeeklyRevivalAt: Date?
     /// 最近一次自动复活了哪些账号（UI 展示用）。

@@ -367,3 +367,135 @@ public extension AccountQuotaSnapshot {
         )
     }
 }
+
+// MARK: - 周期口径观测（v2.5.6）
+//
+// 背景：`/user/usage_stats` 只返回 `week_word_usage_value / week_word_usage_limit`，
+// **不返回任何重置时间戳**；免费账号的 `userData.current_period_end` 也是 null。
+// 也就是说「额度到底是『周一 00:00 刷新』还是『用尽后滚动 7 天』」这件事，
+// 服务端没告诉我们，之前一直是按「周额度 = 服务端按自然周分桶」推断的。
+//
+// 正确做法不是继续猜，而是**观测**：额度数值下降的那一刻就是一次真实重置。
+// 把每次下降的时间点记下来，看它们落在周一 00:00 还是散落在七天里，答案自然浮现。
+
+public extension QuotaCycleEngine {
+
+    /// 一次额度采样。
+    struct UsageSample: Equatable, Sendable {
+        public let at: Date
+        public let usedCharacters: Int
+
+        public init(at: Date, usedCharacters: Int) {
+            self.at = at
+            self.usedCharacters = usedCharacters
+        }
+    }
+
+    /// 观测到的重置时刻（额度数值显著下降）。
+    struct ObservedReset: Equatable, Sendable {
+        public let at: Date
+        public let from: Int
+        public let to: Int
+
+        public init(at: Date, from: Int, to: Int) {
+            self.at = at
+            self.from = from
+            self.to = to
+        }
+    }
+
+    /// 从一串采样里找出重置时刻。
+    ///
+    /// - Parameter dropThreshold: 下降幅度超过该值才算重置。默认 50，
+    ///   用来滤掉「同一周内正常波动」和个别识别结果回退造成的微小抖动。
+    /// - Note: 采样必须按时间升序传入。
+    static func observedResetInstants(
+        in samples: [UsageSample],
+        dropThreshold: Int = 50
+    ) -> [ObservedReset] {
+        guard samples.count > 1 else { return [] }
+        var result: [ObservedReset] = []
+        for i in 1..<samples.count {
+            let previous = samples[i - 1]
+            let current = samples[i]
+            if previous.usedCharacters - current.usedCharacters > dropThreshold {
+                result.append(ObservedReset(
+                    at: current.at,
+                    from: previous.usedCharacters,
+                    to: current.usedCharacters
+                ))
+            }
+        }
+        return result
+    }
+
+    /// 观测结论：目前还没观测到任何重置时返回 `.insufficient`。
+    enum CycleInference: Equatable, Sendable {
+        /// 还没观测到足够的重置，结论未定。UI 不该把倒计时说成确定时间。
+        case insufficient(observations: Int)
+        /// 所有观测到的重置都落在周一 00:00 附近 → 自然周。
+        case calendarWeek(observations: Int)
+        /// 重置散落在七天里、与周界无关 → 滚动 7 天。
+        case rollingWeek(observations: Int)
+        /// 有的在周界、有的不在 —— 口径可能变了，或数据有噪声，需要人工看。
+        case inconsistent(observations: Int)
+
+        public var observationCount: Int {
+            switch self {
+            case .insufficient(let n), .calendarWeek(let n), .rollingWeek(let n), .inconsistent(let n):
+                return n
+            }
+        }
+    }
+
+    /// 判断某个时刻距离最近的周一 00:00 有多远（秒）。
+    /// 用来判定「这次重置是不是卡在周界上」。
+    static func secondsFromWeeklyBoundary(_ date: Date, calendar: Calendar) -> TimeInterval {
+        var cal = calendar
+        cal.firstWeekday = 2 // Monday
+        guard let monday = cal.date(from: cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)) else {
+            return .greatestFiniteMagnitude
+        }
+        let thisMonday = cal.startOfDay(for: monday)
+        let nextMonday = cal.date(byAdding: .day, value: 7, to: thisMonday) ?? thisMonday
+        let previousMonday = cal.date(byAdding: .day, value: -7, to: thisMonday) ?? thisMonday
+        return min(
+            abs(date.timeIntervalSince(thisMonday)),
+            abs(date.timeIntervalSince(nextMonday)),
+            abs(date.timeIntervalSince(previousMonday))
+        )
+    }
+
+    /// 从观测到的重置时刻反推周期口径。
+    ///
+    /// - Parameter toleranceSeconds: 判定「落在周界上」的容差。默认 1 小时 ——
+    ///   客户端轮询有间隔（守护最快 20 秒一轮，但用户可能几小时才开一次 App），
+    ///   观测时刻天然滞后于真实重置时刻，容差太小会把自然周误判成滚动。
+    static func inferCycleMode(
+        fromResets resets: [ObservedReset],
+        calendar: Calendar,
+        toleranceSeconds: TimeInterval = 3_600
+    ) -> CycleInference {
+        guard !resets.isEmpty else { return .insufficient(observations: 0) }
+        let onBoundary = resets.filter {
+            secondsFromWeeklyBoundary($0.at, calendar: calendar) <= toleranceSeconds
+        }
+        if onBoundary.count == resets.count { return .calendarWeek(observations: resets.count) }
+        if onBoundary.isEmpty { return .rollingWeek(observations: resets.count) }
+        return .inconsistent(observations: resets.count)
+    }
+
+    /// 给 UI 的口径说明。观测不足时必须说实话，不能把推断包装成确定结论。
+    static func cycleConfidenceText(_ inference: CycleInference) -> String {
+        switch inference {
+        case .insufficient(let n):
+            return "周期口径待确认（已观测 \(n) 次额度刷新）"
+        case .calendarWeek(let n):
+            return "已确认按自然周刷新（周一的 00:00），依据 \(n) 次实测"
+        case .rollingWeek(let n):
+            return "已确认为滚动 7 天刷新，依据 \(n) 次实测"
+        case .inconsistent(let n):
+            return "刷新时刻不规律（\(n) 次实测有落在周一的也有不落的），建议人工核一下"
+        }
+    }
+}

@@ -102,6 +102,14 @@ extension SwitchboardStore {
                 if state.accounts[i].email.lowercased() == email.lowercased() {
                     matchedID = state.accounts[i].id
                     if quotaFresh, let used = res.usedCharacters, let limit = res.monthlyLimit {
+                        // v2.5.6：官方接口不返回重置时间戳，所以「周一刷新」还是
+                        // 「滚动 7 天」只能靠实测。每次同步都记一笔采样，
+                        // 额度数值下降那一刻就是一次真实重置，记进日志供事后判定。
+                        recordQuotaUsageObservation(
+                            accountID: state.accounts[i].id,
+                            email: email,
+                            usedCharacters: used
+                        )
                         state.accounts[i].usedCharacters = used
                         state.accounts[i].monthlyLimit = max(limit, 1)
                         lastQuotaUsedCharacters = used
@@ -253,4 +261,53 @@ extension SwitchboardStore {
     // MARK: - 智能换号 / 账号池自动轮切与额度监控
 
     /// 启动或重启无感守护循环。`kickImmediately` 用于休眠唤醒 / 菜单「立即巡检」后的续跑。
+}
+
+// MARK: - 周期口径实测（v2.5.6）
+//
+// 官方 `/user/usage_stats` 只给 `week_word_usage_value / week_word_usage_limit`，
+// **不给重置时间戳**；免费账号的 `current_period_end` 也是 null。
+// 所以「额度到底是周一刷新还是滚动 7 天」服务端没说，以前是按「周额度 = 自然周分桶」推断。
+//
+// 现在改成实测：每次拿到新鲜额度就记一笔采样，数值显著下降即记为一次重置，
+// 把时刻写进日志。攒够样本后 `QuotaCycleEngine.inferCycleMode` 自动给出结论，
+// 不用再靠人猜，也不用等用户报障。
+
+extension SwitchboardStore {
+
+    /// 记一笔额度采样；若相对上一笔显著下降，判定为一次真实重置并落日志。
+    func recordQuotaUsageObservation(accountID: UUID, email: String, usedCharacters: Int) {
+        let previous = quotaUsageSamples[accountID]
+        quotaUsageSamples[accountID] = usedCharacters
+
+        guard let previous, previous - usedCharacters > 50 else { return }
+
+        // 观测到了重置 —— 这是判定周期口径的唯一硬证据，必须记清楚。
+        let now = Date()
+        quotaObservedResets.append(
+            QuotaCycleEngine.ObservedReset(at: now, from: previous, to: usedCharacters)
+        )
+        let stamp = ISO8601DateFormatter().string(from: now)
+        let calendar = QuotaCycleClock.shared.calendar
+        let distance = QuotaCycleEngine.secondsFromWeeklyBoundary(now, calendar: calendar)
+        let onBoundary = distance <= 3_600
+        let line = "额度重置实测：\(email) \(previous) → \(usedCharacters) @ \(stamp)"
+            + " | 距最近周一 00:00 \(Int(distance / 60)) 分钟 → "
+            + (onBoundary ? "落在周界上（支持自然周口径）" : "不在周界上（支持滚动 7 天口径）")
+        // 同时进守护日志和引导日志所在目录，方便一处翻。
+        appendDaemonLog(remaining: nil, email: email, reason: line, resultID: nil)
+    }
+
+    /// 当前已观测到的重置次数（UI 用来显示「口径待确认 / 已确认」）。
+    var observedQuotaResetCount: Int {
+        quotaObservedResets.count
+    }
+
+    /// 按已观测到的重置给出的周期口径结论。还没观测到时是「未定」。
+    func quotaCycleInference() -> QuotaCycleEngine.CycleInference {
+        QuotaCycleEngine.inferCycleMode(
+            fromResets: quotaObservedResets,
+            calendar: QuotaCycleClock.shared.calendar
+        )
+    }
 }

@@ -416,6 +416,9 @@ struct OperationalFeatureChecks {
         runQuotaCycleClockChecks()
         runOnboardingSelfHealChecks()
 
+        // MARK: - v2.5.6：周期口径改为实测观测，不再靠猜
+        runQuotaCycleObservationChecks()
+
         print("Operational feature checks passed")
     }
 
@@ -473,6 +476,77 @@ struct OperationalFeatureChecks {
 
         // 5) 恢复默认，避免污染后续用例
         QuotaCycleClock.shared.setTimeZone(nil)
+    }
+
+    // MARK: - v2.5.6 周期口径观测
+    //
+    // 用户问：「额度用完的倒计时，应该从用完的时候开始算一个星期吧？
+    //          不是说明天是周一、明天就能用吧？」
+    //
+    // 老实说：官方 /user/usage_stats **不返回重置时间戳**，免费账号的
+    // current_period_end 也是 null —— 这件事服务端没告诉我们，之前是推断的。
+    // 不继续猜，改成观测：额度数值下降那一刻就是一次真实重置。
+
+    private static func runQuotaCycleObservationChecks() {
+        var cal = Calendar(identifier: .iso8601)
+        cal.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+
+        // 2026-08-24 与 08-31 都是周一
+        let monday1 = cal.date(from: DateComponents(year: 2026, month: 8, day: 24, hour: 0, minute: 0))!
+        let monday2 = cal.date(from: DateComponents(year: 2026, month: 8, day: 31, hour: 0, minute: 0))!
+        let wednesday = cal.date(from: DateComponents(year: 2026, month: 8, day: 26, hour: 15, minute: 0))!
+
+        // 1) 没观测到重置 → 结论必须是「未定」，不许假装知道
+        let noResets: [QuotaCycleEngine.ObservedReset] = []
+        check(QuotaCycleEngine.inferCycleMode(fromResets: noResets, calendar: cal) == .insufficient(observations: 0),
+              "周期观测：无观测 → 结论未定（不许把推断包装成确定结论）")
+
+        // 2) 重置都落在周一 00:00 → 自然周
+        let weeklyResets = [
+            QuotaCycleEngine.ObservedReset(at: monday1, from: 8000, to: 0),
+            QuotaCycleEngine.ObservedReset(at: monday2, from: 7500, to: 0)
+        ]
+        check(QuotaCycleEngine.inferCycleMode(fromResets: weeklyResets, calendar: cal) == .calendarWeek(observations: 2),
+              "周期观测：重置都落在周一 00:00 → 判定自然周")
+
+        // 3) 重置散落在七天里 → 滚动 7 天
+        let rollingResets = [
+            QuotaCycleEngine.ObservedReset(at: wednesday, from: 8000, to: 0),
+            QuotaCycleEngine.ObservedReset(
+                at: cal.date(byAdding: .day, value: 7, to: wednesday)!, from: 8000, to: 0)
+        ]
+        check(QuotaCycleEngine.inferCycleMode(fromResets: rollingResets, calendar: cal) == .rollingWeek(observations: 2),
+              "周期观测：重置散落在周中 → 判定滚动 7 天")
+
+        // 4) 有的落在周界、有的不落 → 不一致，需要人工看
+        let mixed = weeklyResets + [rollingResets[0]]
+        check(QuotaCycleEngine.inferCycleMode(fromResets: mixed, calendar: cal) == .inconsistent(observations: 3),
+              "周期观测：混合 → 判定不一致，提示人工核")
+
+        // 5) 从采样序列里找下降点；小幅抖动不算重置（默认阈值 50）
+        let samples = [
+            QuotaCycleEngine.UsageSample(at: monday1.addingTimeInterval(-3600), usedCharacters: 8000),
+            QuotaCycleEngine.UsageSample(at: monday1, usedCharacters: 0),
+            QuotaCycleEngine.UsageSample(at: monday1.addingTimeInterval(3600), usedCharacters: 300),
+            // 掉 30，低于阈值 50，不应被当成重置
+            QuotaCycleEngine.UsageSample(at: monday1.addingTimeInterval(7200), usedCharacters: 270)
+        ]
+        let found = QuotaCycleEngine.observedResetInstants(in: samples)
+        check(found.count == 1, "周期观测：只识别出 1 次真实重置（小幅抖动被阈值滤掉，实测 \(found.count)）")
+        check(found.first?.at == monday1, "周期观测：重置时刻定位到周一 00:00")
+        check(found.first?.from == 8000, "周期观测：记录了重置前的用量")
+
+        // 6) 周界距离：周一 00:00 应为 0，周中应远大于容差
+        check(QuotaCycleEngine.secondsFromWeeklyBoundary(monday1, calendar: cal) < 1,
+              "周期观测：周一 00:00 距周界为 0")
+        check(QuotaCycleEngine.secondsFromWeeklyBoundary(wednesday, calendar: cal) > 3_600,
+              "周期观测：周三下午距周界大于 1 小时容差")
+
+        // 7) 文案必须诚实：观测不足时不能给出确定结论
+        check(QuotaCycleEngine.cycleConfidenceText(.insufficient(observations: 0)).contains("待确认"),
+              "周期观测：观测不足时文案必须说“待确认”")
+        check(QuotaCycleEngine.cycleConfidenceText(.calendarWeek(observations: 2)).contains("已确认"),
+              "周期观测：确认后文案才说“已确认”")
     }
 
     // MARK: - v2.5.5 引导补丁自愈补强

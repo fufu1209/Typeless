@@ -215,6 +215,20 @@ struct QuotaGuardTabView: View {
             }
 
             NoteLine(text: quotaCycleFootnote, color: .secondary, lineLimit: 3)
+
+            // v2.5.6：官方接口不返回重置时间戳，「周一刷新」目前仍是**推断**。
+            // 观测到真实重置后这里会自动变成「已确认」并给出依据次数。
+            // 确认之前，不许把推断包装成确定结论给用户。
+            let inference = store.quotaCycleInference()
+            if case .insufficient = inference {
+                NoteLine(
+                    text: "\(QuotaCycleEngine.cycleConfidenceText(inference))。目前按自然周（周一 00:00）排程；一旦实测到额度重置，会自动校准口径。",
+                    color: .orange,
+                    lineLimit: 3
+                )
+            } else {
+                NoteLine(text: QuotaCycleEngine.cycleConfidenceText(inference), color: .secondary, lineLimit: 2)
+            }
         }
     }
 

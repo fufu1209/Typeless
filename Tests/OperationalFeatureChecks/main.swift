@@ -503,7 +503,10 @@ struct OperationalFeatureChecks {
         check(Self.onboardingIsIncomplete(nil, appInstalled: false) == false,
               "引导状态：文件缺失 + 未安装 → 不误报警")
 
-        // 3) 日志轮转：直接打真实实现（LogFileRotator），不另抄一份逻辑
+        // 3) 写盘路径：以前只能等 Typeless 关掉才能实测，现在 Core 层可直接构造现场
+        runOnboardingPatchWriterChecks()
+
+        // 4) 日志轮转：直接打真实实现（LogFileRotator），不另抄一份逻辑
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("switchboard-log-rotate-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -561,6 +564,141 @@ struct OperationalFeatureChecks {
         if let done = object["isCompleted"] as? Bool { return !done }
         if let step = object["step"] as? Int { return step < 99 }
         return true
+    }
+
+    // MARK: - v2.5.5 引导补丁写入层（OnboardingPatchWriter）
+    //
+    // 这段逻辑以前住在 App 层，验证只能靠「真机关掉 Typeless 再重启」，
+    // 而用户的 Typeless 基本常开 —— 等于从来没被测过。下沉到 Core 之后，
+    // 可以在临时目录构造任意现场逐个断言。
+
+    private static func runOnboardingPatchWriterChecks() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("onboarding-patch-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let onboardingURL = root.appendingPathComponent("app-onboarding.json")
+        let storageURL = root.appendingPathComponent("app-storage.json")
+
+        // --- 场景 1：文件被删（Typeless 升级/重装的典型现场）→ 从零补写 ---
+        check(OnboardingPatchWriter.state(ofOnboardingFile: onboardingURL) == .missing,
+              "写入层：文件不存在 → state = missing")
+        check(OnboardingPatchWriter.needsPatch(state: .missing, treatMissingAsNeedsPatch: true),
+              "写入层：missing + 已安装 → 需要补写")
+        check(!OnboardingPatchWriter.needsPatch(state: .missing, treatMissingAsNeedsPatch: false),
+              "写入层：missing + 未安装 → 不补写（不误报警）")
+
+        try? OnboardingPatchWriter.writeCompletion(toOnboardingFile: onboardingURL)
+        check(OnboardingPatchWriter.state(ofOnboardingFile: onboardingURL) == .complete,
+              "写入层：空白现场补写后 → 完成态")
+        let fresh = Self.readJSON(onboardingURL)
+        check(fresh?["isCompleted"] as? Bool == true, "写入层：isCompleted=true")
+        check(fresh?["step"] as? Int == OnboardingPatchWriter.completedStep, "写入层：step=99")
+        check(fresh?["setUpStep"] as? Int == OnboardingPatchWriter.completedStep, "写入层：setUpStep=99")
+        check(fresh?["tryItStep"] as? Int == OnboardingPatchWriter.completedStep, "写入层：tryItStep=99")
+
+        // --- 场景 2：引导被重置（isCompleted=false, step=0）→ 覆盖回完成态，且保留其他键 ---
+        let withExtras: [String: Any] = [
+            "isCompleted": false, "step": 0,
+            "userSettingNotToTouch": "keep-me",
+            "translationModeFeatureOnboarding": ["settingDot": ["dismissed": false], "newTags": ["dismissed": false]]
+        ]
+        try? Self.writeJSON(withExtras, to: onboardingURL)
+        check(OnboardingPatchWriter.state(ofOnboardingFile: onboardingURL) == .incomplete,
+              "写入层：重置现场 → incomplete")
+        try? OnboardingPatchWriter.writeCompletion(toOnboardingFile: onboardingURL)
+        let healed = Self.readJSON(onboardingURL)
+        check(healed?["isCompleted"] as? Bool == true, "写入层：重置后补写 → isCompleted=true")
+        check(healed?["step"] as? Int == 99, "写入层：重置后补写 → step=99")
+        check(healed?["userSettingNotToTouch"] as? String == "keep-me",
+              "写入层：补写不能吞掉文件里的其他键")
+        let nested = healed?["translationModeFeatureOnboarding"] as? [String: Any]
+        check((nested?["settingDot"] as? [String: Any])?["dismissed"] as? Bool == true,
+              "写入层：已存在的嵌套节点要钻进去改 dismissed")
+        check((nested?["newTags"] as? [String: Any])?["dismissed"] as? Bool == true,
+              "写入层：newTags 同样置为 dismissed")
+
+        // --- 场景 3：备份只留第一份 ---
+        let backupURL = OnboardingPatchWriter.backupURL(for: onboardingURL)
+        check(backupURL.lastPathComponent == "app-onboarding.json.switchboard-orig.bak",
+              "写入层：备份文件名带原扩展名（\(backupURL.lastPathComponent)）")
+        try? FileManager.default.removeItem(at: backupURL)
+        OnboardingPatchWriter.backupIfNeeded(onboardingURL)
+        check(FileManager.default.fileExists(atPath: backupURL.path), "写入层：首次调用生成备份")
+        let backupSnapshot = (try? Data(contentsOf: backupURL))?.count ?? -1
+        try? OnboardingPatchWriter.writeCompletion(toOnboardingFile: onboardingURL)
+        OnboardingPatchWriter.backupIfNeeded(onboardingURL)
+        let backupAfterSecondWrite = (try? Data(contentsOf: backupURL))?.count ?? -2
+        check(backupSnapshot == backupAfterSecondWrite,
+              "写入层：第二次不再覆盖备份（否则备份就失去意义了）")
+
+        // --- 场景 4：app-storage.json 平台补齐 + is_new_user 落 false ---
+        let userData: [String: Any] = [
+            "email": "someone@example.com",
+            "is_new_user": true,
+            "onboarding": ["macos": ["completed": false]]
+        ]
+        try? Self.writeJSON(["userData": userData, "currentRoute": "/onboarding"], to: storageURL)
+        try? OnboardingPatchWriter.writeStorageCompletion(
+            to: storageURL, expectedEmail: nil, reportedVersion: "2.4.0"
+        )
+        let storage = Self.readJSON(storageURL)
+        let patchedUser = storage?["userData"] as? [String: Any]
+        check(patchedUser?["is_new_user"] as? Bool == false, "写入层：is_new_user 落为 false")
+        let platforms = patchedUser?["onboarding"] as? [String: Any]
+        // 官方 7 个平台 + 文件里原有的 macos，全都要是 completed=true
+        let allCompleted = OnboardingPatchWriter.officialPlatforms.allSatisfy { platform in
+            ((platforms?[platform] as? [String: Any])?["completed"] as? Bool) == true
+        }
+        check(allCompleted, "写入层：7 个官方平台全部标记 completed")
+        let macos = platforms?["macos"] as? [String: Any]
+        check(macos?["app_version"] as? String == "2.4.0", "写入层：macos.app_version 写入报告版本")
+        check(macos?["completed_at"] != nil, "写入层：macos.completed_at 已补")
+        check(storage?["currentRoute"] is NSNull, "写入层：currentRoute 清空，避免下次启动接着弹引导")
+
+        // --- 场景 5：账号不匹配必须报错（fail-safe 的另一半：不能静默改错号） ---
+        var mismatchThrown = false
+        do {
+            try OnboardingPatchWriter.writeStorageCompletion(
+                to: storageURL, expectedEmail: "other@example.com", reportedVersion: ""
+            )
+        } catch {
+            mismatchThrown = true
+        }
+        check(mismatchThrown, "写入层：期望邮箱与文件不符 → 抛错，不静默改别人的号")
+
+        // --- 场景 6：从未登录（没有 userData）→ 抛 missingUserData，调用方降级 ---
+        let emptyStorage = root.appendingPathComponent("empty-storage.json")
+        try? Self.writeJSON(["whatever": true], to: emptyStorage)
+        var missingThrown = false
+        do {
+            try OnboardingPatchWriter.writeStorageCompletion(to: emptyStorage, expectedEmail: nil)
+        } catch let error as OnboardingPatchError {
+            missingThrown = (error == .missingUserData)
+        } catch {
+            missingThrown = false
+        }
+        check(missingThrown, "写入层：没有 userData → 抛 missingUserData（App 层据此降级跳过）")
+
+        // --- 场景 7：读邮箱 / 判新用户 ---
+        check(OnboardingPatchWriter.readEmail(fromStorageFile: storageURL) == "someone@example.com",
+              "写入层：能读出当前登录邮箱")
+        check(!OnboardingPatchWriter.isNewUser(storageFile: storageURL),
+              "写入层：补写后不再是新用户")
+        check(!OnboardingPatchWriter.isNewUser(storageFile: emptyStorage),
+              "写入层：读不到 userData 时不谎报新用户")
+    }
+
+    private static func writeJSON(_ object: [String: Any], to url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
+    }
+
+    private static func readJSON(_ url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return object
     }
 
 

@@ -211,16 +211,14 @@ extension SwitchboardStore {
 
     /// 读取桌面端引导状态。只看 `app-onboarding.json` —— 它才是决定「弹不弹引导」的持久开关，
     /// `app-storage.json` 里的 `is_new_user` 是服务端真值，联网就会被同步覆盖。
+    ///
+    /// 判定规则在 Core 的 `OnboardingPatchWriter`（可被单测），App 层只负责拼路径。
     func desktopOnboardingState() -> DesktopOnboardingState {
-        guard let data = try? Data(contentsOf: typelessOnboardingURL()),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return .missing
+        switch OnboardingPatchWriter.state(ofOnboardingFile: typelessOnboardingURL()) {
+        case .complete: return .complete
+        case .incomplete: return .incomplete
+        case .missing: return .missing
         }
-        if let done = object["isCompleted"] as? Bool { return done ? .complete : .incomplete }
-        // 没有 isCompleted 字段时用 step 兜底。
-        if let step = object["step"] as? Int { return step >= 99 ? .complete : .incomplete }
-        // 文件在但两个字段都没有：按未完成处理，补写一遍没有副作用。
-        return .incomplete
     }
 
     /// 桌面端引导是否仍未完成。
@@ -228,11 +226,10 @@ extension SwitchboardStore {
     /// 「文件缺失」只有在 **Typeless 已安装** 时才算需要处理 —— 没装 Typeless 的机器上
     /// 根本没有这个文件，不该天天误报警。
     func desktopOnboardingIsIncomplete() -> Bool {
-        switch desktopOnboardingState() {
-        case .complete: return false
-        case .incomplete: return true
-        case .missing: return typelessAppPath() != nil
-        }
+        OnboardingPatchWriter.needsPatch(
+            state: OnboardingPatchWriter.state(ofOnboardingFile: typelessOnboardingURL()),
+            treatMissingAsNeedsPatch: typelessAppPath() != nil
+        )
     }
 
     /// 刷新 `desktopOnboardingNeedsPatch`。App 启动时调一次，UI 据此显示一键修复横幅。
@@ -300,11 +297,7 @@ extension SwitchboardStore {
     /// 首次改写前留一份原文件，万一补丁把状态写坏了能手动还原。
     /// 只留第一份 —— 每次巡检都覆盖的话，备份本身就失去意义了。
     func backupDesktopOnboardingFileIfNeeded(_ url: URL) {
-        let backupURL = url.deletingPathExtension()
-            .appendingPathExtension("json.switchboard-orig.bak")
-        guard !FileManager.default.fileExists(atPath: backupURL.path),
-              FileManager.default.fileExists(atPath: url.path) else { return }
-        try? FileManager.default.copyItem(at: url, to: backupURL)
+        OnboardingPatchWriter.backupIfNeeded(url)
     }
 
     // MARK: - 常驻巡检（v2.5.5）
@@ -337,66 +330,8 @@ extension SwitchboardStore {
     // MARK: - 文件写入
 
     func writeTypelessOnboardingCompletion(to onboardingURL: URL) throws {
-        var object: [String: Any] = [:]
-        if let data = try? Data(contentsOf: onboardingURL),
-           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            object = existing
-        }
-        object["isCompleted"] = true
-        object["step"] = 99
-        object["setUpStep"] = 99
-        object["tryItStep"] = 99
-        object["tryItPlaygroundStep"] = 99
-        object["onboardingStep"] = NSNull()
-        object["onboardingMaxReachedStep"] = NSNull()
-        object["onboardingAutoLanguageDetection"] = true
-        object["onboardingCompletedFloatingBarStart"] = true
-        object["onboardingCompletedFloatingBarRelease"] = true
-        object["onboardingHomePageClickAppToShowFloatingBar"] = []
-        object["onboardingTryItPlaygroundIsCompleted"] = true
-        object["onboardingMaxTryItPlaygroundStepValue"] = 99
-        object["onboardingShortcutCalloutDismissedStep"] = 99
-        object["pressToStopDictationOnboardingShown"] = [
-            "voice_transcript_release": true,
-            "voice_transcript": true,
-            "voice_command": true,
-            "voice_translation": true
-        ]
-        object["translationModeFeatureAlertOnboarding"] = [
-            "dictationCount": 99,
-            "shown": true
-        ]
-        if var translation = object["translationModeFeatureOnboarding"] as? [String: Any] {
-            if var settingDot = translation["settingDot"] as? [String: Any] {
-                settingDot["dismissed"] = true
-                translation["settingDot"] = settingDot
-            }
-            if var newTags = translation["newTags"] as? [String: Any] {
-                newTags["dismissed"] = true
-                translation["newTags"] = newTags
-            }
-            object["translationModeFeatureOnboarding"] = translation
-        }
-        if var appDownload = object["appDownloadButtonOnboarding"] as? [String: Any] {
-            appDownload["dismissed"] = true
-            object["appDownloadButtonOnboarding"] = appDownload
-        }
-        if var shortcut = object["shortcutChangeFeatureOnboarding"] as? [String: Any] {
-            if var settingDot = shortcut["settingDot"] as? [String: Any] {
-                settingDot["dismissed"] = true
-                shortcut["settingDot"] = settingDot
-            }
-            if var newTags = shortcut["newTags"] as? [String: Any] {
-                newTags["dismissed"] = true
-                shortcut["newTags"] = newTags
-            }
-            object["shortcutChangeFeatureOnboarding"] = shortcut
-        }
-        object["__ONBOARDING_UPGRADE_NOTICE"] = true
-
-        try FileManager.default.createDirectory(at: onboardingURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: onboardingURL, options: .atomic)
+        // 真正的字段写入在 Core，可被单测；App 层只负责转发。
+        try OnboardingPatchWriter.writeCompletion(toOnboardingFile: onboardingURL)
     }
 
     /// 把 `app-storage.json` 里的账号标记为「非新用户 + 全平台引导已完成」。
@@ -404,62 +339,11 @@ extension SwitchboardStore {
     /// - Parameter expectedEmail: 期望的登录邮箱。**传 nil 时不校验邮箱**，
     ///   直接改当前文件里那个 userData —— 这正是 fail-safe 的关键。
     func writeTypelessStorageOnboardingCompletion(to storageURL: URL, expectedEmail: String?) throws {
-        guard let data = try? Data(contentsOf: storageURL),
-              var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              var userData = object["userData"] as? [String: Any] else {
-            throw NSError(
-                domain: "TypelessOnboardingPatch",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "未找到 Typeless 桌面端 app-storage.json 里的 userData"]
-            )
-        }
-
-        if let expectedEmail, !expectedEmail.isEmpty {
-            guard let email = userData["email"] as? String,
-                  email.caseInsensitiveCompare(expectedEmail) == .orderedSame else {
-                let actualEmail = (userData["email"] as? String) ?? "未知"
-                throw NSError(
-                    domain: "TypelessOnboardingPatch",
-                    code: -2,
-                    userInfo: [NSLocalizedDescriptionKey: "app-storage.json 账号不匹配：\(actualEmail)"]
-                )
-            }
-        }
-
-        userData["is_new_user"] = false
-
-        // Typeless 2.4.0 把平台枚举扩到 7 个；这里用「文件里已有的键 ∪ 官方枚举」，
-        // 以后官方再加平台也能自动覆盖，不用再改代码。
-        var onboarding = userData["onboarding"] as? [String: Any] ?? [:]
-        let officialPlatforms = ["ios", "android", "macos", "windows", "linux", "harmony", "webpage"]
-        let platformKeys = Set(officialPlatforms).union(onboarding.keys)
-        let version = typelessDesktopReportedVersion()
-        let completedAt = ISO8601DateFormatter().string(from: Date())
-
-        for platform in platformKeys {
-            var platformState = onboarding[platform] as? [String: Any] ?? [:]
-            platformState["completed"] = true
-            if platform == "macos" {
-                // 2.4.0 起 macos 节点带 app_version / completed_at，缺了会被判定为「未完成过」。
-                if platformState["app_version"] == nil, !version.isEmpty {
-                    platformState["app_version"] = version
-                }
-                if platformState["completed_at"] == nil {
-                    platformState["completed_at"] = completedAt
-                }
-            }
-            onboarding[platform] = platformState
-        }
-        userData["onboarding"] = onboarding
-
-        object["userData"] = userData
-        if object.keys.contains("currentRoute") {
-            object["currentRoute"] = NSNull()
-        }
-
-        try FileManager.default.createDirectory(at: storageURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let patchedData = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-        try patchedData.write(to: storageURL, options: .atomic)
+        try OnboardingPatchWriter.writeStorageCompletion(
+            to: storageURL,
+            expectedEmail: expectedEmail,
+            reportedVersion: typelessDesktopReportedVersion()
+        )
     }
 
     /// 重启后的加固：Typeless 冷启动会按内存态重写 onboarding 片段，
@@ -532,24 +416,12 @@ extension SwitchboardStore {
     }
 
     func readTypelessDesktopEmail(from storageURL: URL) -> String? {
-        guard let data = try? Data(contentsOf: storageURL),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let userData = object["userData"] as? [String: Any],
-              let email = userData["email"] as? String,
-              !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-        return email
+        OnboardingPatchWriter.readEmail(fromStorageFile: storageURL)
     }
 
     /// 桌面端当前是否仍被判定为新用户（UI 用来提示「会有新手引导」）。
     func typelessDesktopIsNewUser() -> Bool {
-        guard let data = try? Data(contentsOf: typelessStorageURL()),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let userData = object["userData"] as? [String: Any] else {
-            return false
-        }
-        return (userData["is_new_user"] as? Bool) ?? false
+        OnboardingPatchWriter.isNewUser(storageFile: typelessStorageURL())
     }
 
     func logOutAndStopTypelessForOnboardingPatch() async {

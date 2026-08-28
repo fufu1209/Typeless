@@ -644,6 +644,353 @@ struct OperationalFeatureChecks {
         check(!nonRetryableAutomationResult.canRetry, "automation result without account and script cannot retry")
         check(!nonRetryableAutomationResult.canOpenBrowserSession, "automation result without browser profile cannot open retained session")
 
+        // MARK: - v2.1.0 QuotaCycleEngine 真实行为测试
+        // 之前的"func daysUntilReset" 等源串包含测试已经在这次升级中被替换为真实行为断言。
+        runQuotaCycleEngineChecks()
+
         print("Operational feature checks passed")
+    }
+
+    private static func runQuotaCycleEngineChecks() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.firstWeekday = 2 // Monday
+
+        // 用一个固定 now（本周一 00:00）测：距离下次刷新应该是 7 天。
+        let mondayMidnight = cal.date(from: DateComponents(year: 2026, month: 8, day: 24, hour: 0, minute: 0))!
+        check(
+            QuotaCycleEngine.daysUntilReset(now: mondayMidnight, mode: .calendarWeek, calendar: cal) == 7,
+            "calendarWeek: 本周一 00:00 → 距离下次刷新 7 天"
+        )
+        // 周日 23:59 应该只差 1 天到下周一 00:00
+        let sundayLateNight = cal.date(from: DateComponents(year: 2026, month: 8, day: 30, hour: 23, minute: 59))!
+        check(
+            QuotaCycleEngine.daysUntilReset(now: sundayLateNight, mode: .calendarWeek, calendar: cal) == 1,
+            "calendarWeek: 周日 23:59 → 距离下次刷新 1 天"
+        )
+        // 周一 00:00 刚过 → 6 天
+        let mondayAfterMidnight = cal.date(from: DateComponents(year: 2026, month: 8, day: 25, hour: 0, minute: 5))!
+        check(
+            QuotaCycleEngine.daysUntilReset(now: mondayAfterMidnight, mode: .calendarWeek, calendar: cal) == 6,
+            "calendarWeek: 本周一 00:05 → 距离下次刷新 6 天"
+        )
+
+        // rollingWeek：lastResetAt 8 天前 → 0 天（已经超过 7 天）
+        let eightDaysAgo = Date(timeIntervalSinceNow: -8 * 24 * 60 * 60)
+        check(
+            QuotaCycleEngine.daysUntilReset(now: Date(), mode: .rollingWeek, lastResetAt: eightDaysAgo) == 0,
+            "rollingWeek: 距 lastResetAt 8 天 → 0 天（已刷新）"
+        )
+        let twoDaysAgo = Date(timeIntervalSinceNow: -2 * 24 * 60 * 60)
+        let rollingDays = QuotaCycleEngine.daysUntilReset(now: Date(), mode: .rollingWeek, lastResetAt: twoDaysAgo)
+        check(
+            rollingDays == 5,
+            "rollingWeek: 距 lastResetAt 2 天 → 5 天（向上取整）"
+        )
+
+        // shouldRevive: .exhausted + 跨周 → true
+        let lastWeekReset = cal.date(from: DateComponents(year: 2026, month: 8, day: 17, hour: 0, minute: 0))!
+        let exhaustedLastWeek = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "alpha@example.com",
+            status: .exhausted,
+            reviewState: .approved,
+            usedCharacters: 8000,
+            monthlyLimit: 8000,
+            lastResetAt: lastWeekReset,
+            createdAt: lastWeekReset,
+            hasSilentSessionPayload: true
+        )
+        check(
+            QuotaCycleEngine.shouldRevive(
+                account: exhaustedLastWeek,
+                now: mondayMidnight,
+                mode: .calendarWeek,
+                calendar: cal
+            ),
+            "shouldRevive: .exhausted + 跨周 → true"
+        )
+
+        // shouldRevive: .exhausted + 同周 → false
+        let sameWeekReset = cal.date(from: DateComponents(year: 2026, month: 8, day: 26, hour: 0, minute: 0))!
+        let exhaustedSameWeek = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "alpha@example.com",
+            status: .exhausted,
+            reviewState: .approved,
+            usedCharacters: 8000,
+            monthlyLimit: 8000,
+            lastResetAt: sameWeekReset,
+            createdAt: sameWeekReset,
+            hasSilentSessionPayload: true
+        )
+        check(
+            !QuotaCycleEngine.shouldRevive(
+                account: exhaustedSameWeek,
+                now: mondayMidnight,
+                mode: .calendarWeek,
+                calendar: cal
+            ),
+            "shouldRevive: .exhausted + 同周 → false"
+        )
+
+        // shouldRevive: .available 跨周也返回 false（不必复活）
+        let availableLastWeek = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "beta@example.com",
+            status: .available,
+            reviewState: .approved,
+            usedCharacters: 1000,
+            monthlyLimit: 8000,
+            lastResetAt: lastWeekReset,
+            createdAt: lastWeekReset,
+            hasSilentSessionPayload: true
+        )
+        check(
+            !QuotaCycleEngine.shouldRevive(
+                account: availableLastWeek,
+                now: mondayMidnight,
+                mode: .calendarWeek,
+                calendar: cal
+            ),
+            "shouldRevive: .available → false（无需复活）"
+        )
+
+        // shouldRevive: .paused 跨周也返回 false
+        let pausedLastWeek = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "gamma@example.com",
+            status: .paused,
+            reviewState: .approved,
+            usedCharacters: 8000,
+            monthlyLimit: 8000,
+            lastResetAt: lastWeekReset,
+            createdAt: lastWeekReset,
+            hasSilentSessionPayload: true
+        )
+        check(
+            !QuotaCycleEngine.shouldRevive(
+                account: pausedLastWeek,
+                now: mondayMidnight,
+                mode: .calendarWeek,
+                calendar: cal
+            ),
+            "shouldRevive: .paused → false（被用户主动暂停）"
+        )
+
+        // shouldRevive: .pending (未确认) 跨周 → false（避免自动复活兜底确认前的号）
+        let pendingLastWeek = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "delta@example.com",
+            status: .exhausted,
+            reviewState: .pending,
+            usedCharacters: 8000,
+            monthlyLimit: 8000,
+            lastResetAt: lastWeekReset,
+            createdAt: lastWeekReset,
+            hasSilentSessionPayload: true
+        )
+        check(
+            !QuotaCycleEngine.shouldRevive(
+                account: pendingLastWeek,
+                now: mondayMidnight,
+                mode: .calendarWeek,
+                calendar: cal
+            ),
+            "shouldRevive: reviewState=.pending → false（兜底确认前不复活）"
+        )
+
+        // rollingWeek: 8 天前 .exhausted → true
+        let rollingExhausted = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "epsilon@example.com",
+            status: .exhausted,
+            reviewState: .approved,
+            usedCharacters: 8000,
+            monthlyLimit: 8000,
+            lastResetAt: eightDaysAgo,
+            createdAt: Date(),
+            hasSilentSessionPayload: true
+        )
+        check(
+            QuotaCycleEngine.shouldRevive(
+                account: rollingExhausted,
+                now: Date(),
+                mode: .rollingWeek,
+                calendar: cal
+            ),
+            "shouldRevive: rollingWeek + 8 天前 → true"
+        )
+
+        // pickNext: 复活号 > 静默就绪 > 余额
+        let silentReadyHigh = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "silent-high@example.com",
+            status: .available,
+            reviewState: .approved,
+            usedCharacters: 1000, // 剩 7000
+            monthlyLimit: 8000,
+            lastResetAt: sameWeekReset,
+            createdAt: Date(),
+            hasSilentSessionPayload: true
+        )
+        let silentReadyLow = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "silent-low@example.com",
+            status: .available,
+            reviewState: .approved,
+            usedCharacters: 7000, // 剩 1000
+            monthlyLimit: 8000,
+            lastResetAt: sameWeekReset,
+            createdAt: Date(),
+            hasSilentSessionPayload: true
+        )
+        let revived = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "revived@example.com",
+            status: .exhausted,
+            reviewState: .approved,
+            usedCharacters: 8000,
+            monthlyLimit: 8000,
+            lastResetAt: lastWeekReset,
+            createdAt: Date(),
+            hasSilentSessionPayload: false // 没有静默会话缓存
+        )
+        let pick = QuotaCycleEngine.pickNext(
+            among: [silentReadyHigh, silentReadyLow, revived],
+            now: mondayMidnight,
+            mode: .calendarWeek,
+            calendar: cal
+        )
+        check(
+            pick?.email == "revived@example.com",
+            "pickNext: 复活号优先（即便它没静默会话缓存）"
+        )
+
+        // pickNext: 没有复活 → 静默就绪里余额最多
+        let onlySilent = QuotaCycleEngine.pickNext(
+            among: [silentReadyLow, silentReadyHigh],
+            now: mondayMidnight,
+            mode: .calendarWeek,
+            calendar: cal
+        )
+        check(
+            onlySilent?.email == "silent-high@example.com",
+            "pickNext: 没有复活 → 静默就绪 + 余额最多"
+        )
+
+        // pickNext: 既不复活、也没有静默会话缓存 → nil
+        // 注意：这里必须用「同周 exhausted」或「无 payload 的 available」，
+        // 不能用跨周 exhausted（那个本来就该复活，pickNext 会正确返回它）。
+        let noPayloadAvailable = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "nope@example.com",
+            status: .available,
+            reviewState: .approved,
+            usedCharacters: 1000, // 剩 7000
+            monthlyLimit: 8000,
+            lastResetAt: sameWeekReset,
+            createdAt: Date(),
+            hasSilentSessionPayload: false // 没有静默会话缓存
+        )
+        check(
+            QuotaCycleEngine.pickNext(
+                among: [noPayloadAvailable],
+                now: mondayMidnight,
+                mode: .calendarWeek,
+                calendar: cal
+            ) == nil,
+            "pickNext: 不复活 + 无静默缓存 → nil（应走全自动注册）"
+        )
+
+        // 同周 exhausted（还没到刷新点）也应该选不到 → nil，不该误把上一周的号当复活
+        let sameWeekExhausted = AccountQuotaSnapshot(
+            id: UUID(),
+            email: "sameweek@example.com",
+            status: .exhausted,
+            reviewState: .approved,
+            usedCharacters: 8000,
+            monthlyLimit: 8000,
+            lastResetAt: sameWeekReset, // 本周内
+            createdAt: Date(),
+            hasSilentSessionPayload: true
+        )
+        check(
+            QuotaCycleEngine.pickNext(
+                among: [sameWeekExhausted],
+                now: mondayMidnight,
+                mode: .calendarWeek,
+                calendar: cal
+            ) == nil,
+            "pickNext: 同周 exhausted（未到刷新点）→ nil，不误复活"
+        )
+
+        // pickNext: currentID 不影响复活号（v2.1.0 核心价值：切回原号）
+        let switched = QuotaCycleEngine.pickNext(
+            among: [silentReadyHigh, revived],
+            excluding: silentReadyHigh.id,
+            now: mondayMidnight,
+            mode: .calendarWeek,
+            calendar: cal
+        )
+        check(
+            switched?.email == "revived@example.com",
+            "pickNext: currentID 不屏蔽复活号（可切回原号）"
+        )
+
+        // revivedAccounts: 按 usedCharacters 升序
+        let multipleRevived = [
+            AccountQuotaSnapshot(
+                id: UUID(),
+                email: "r2@example.com",
+                status: .exhausted,
+                reviewState: .approved,
+                usedCharacters: 8000,
+                monthlyLimit: 8000,
+                lastResetAt: lastWeekReset,
+                createdAt: Date(),
+                hasSilentSessionPayload: false
+            ),
+            AccountQuotaSnapshot(
+                id: UUID(),
+                email: "r1@example.com",
+                status: .exhausted,
+                reviewState: .approved,
+                usedCharacters: 8000,
+                monthlyLimit: 8000,
+                lastResetAt: lastWeekReset,
+                createdAt: Date(),
+                hasSilentSessionPayload: false
+            )
+        ]
+        let ordered = QuotaCycleEngine.revivedAccounts(
+            in: multipleRevived,
+            now: mondayMidnight,
+            mode: .calendarWeek,
+            calendar: cal
+        )
+        check(
+            ordered.count == 2,
+            "revivedAccounts: 全部 .exhausted + 跨周都被识别为可复活"
+        )
+
+        // nextCalendarWeekReset: 跨年/跨 ISO 周安全
+        let newYearEve = cal.date(from: DateComponents(year: 2026, month: 12, day: 31, hour: 12, minute: 0))!
+        let nextReset = QuotaCycleEngine.nextCalendarWeekReset(now: newYearEve, calendar: cal)
+        check(
+            nextReset != nil && nextReset! > newYearEve,
+            "nextCalendarWeekReset: 跨年时仍能给出下一个周一 00:00"
+        )
+
+        // 摘要文案包含"距离刷新还有 N 天"
+        let summary = QuotaCycleEngine.summary(
+            for: silentReadyHigh,
+            now: mondayMidnight,
+            mode: .calendarWeek,
+            calendar: cal
+        )
+        check(
+            summary.contains("距离刷新还有") && summary.contains("1000/8000"),
+            "QuotaCycleEngine.summary: 含周度已用 + 距离刷新天数"
+        )
     }
 }

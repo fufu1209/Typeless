@@ -381,6 +381,8 @@ final class SwitchboardStore: ObservableObject {
     @Published var lastSilentSwitchFailureReason = ""
     /// 最近一次同步官方会话时是否命中「设备登录用户数超限」。
     @Published var lastSyncHitDeviceUserLimit = false
+    /// P0-2：账号池文件解码失败时记录原因并保留损坏备份。UI 侧栏错误条要展示这个。
+    @Published var accountLoadError: String?
     /// 最近一次「本周额度」官方 API 是否拿到新鲜数值（失败时不得当成额度充足）。
     @Published var lastQuotaSyncFresh = false
     /// 最近一次成功拉到本周额度的时间。
@@ -416,10 +418,29 @@ final class SwitchboardStore: ObservableObject {
         let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
         self.fileURL = folder.appendingPathComponent("store.json")
 
-        if let data = try? Data(contentsOf: fileURL),
-           let decoded = try? JSONDecoder.appDecoder.decode(PersistedState.self, from: data) {
-            state = decoded
-        } else {
+        do {
+            let data = try Data(contentsOf: fileURL)
+            state = try JSONDecoder.appDecoder.decode(PersistedState.self, from: data)
+        } catch {
+            // P0-2：解码失败不能静默吞错 + 落盘成空 state，否则 Keychain 里的密码永久找不到。
+            // 先把损坏文件备份到 store.json.corrupted-<时间戳>，再置空，让用户从 UI 看到错误。
+            let timestamp = Self.storeCorruptedTimestamp(Date())
+            let backupURL = fileURL.deletingLastPathComponent()
+                .appendingPathComponent("store.json.corrupted-\(timestamp)")
+            let backupError: Error?
+            do {
+                if FileManager.default.fileExists(atPath: backupURL.path) {
+                    try FileManager.default.removeItem(at: backupURL)
+                }
+                try FileManager.default.moveItem(at: fileURL, to: backupURL)
+                backupError = nil
+            } catch let moveError {
+                backupError = moveError
+            }
+            let backupNote = backupError == nil
+                ? "已备份为 \(backupURL.lastPathComponent)"
+                : "备份损坏文件失败：\(backupError!.localizedDescription)"
+            accountLoadError = "无法读取账号池（\(backupNote)）：\(error.localizedDescription)"
             state = .empty
         }
         migrateDefaultsIfNeeded()
@@ -793,9 +814,17 @@ writeActiveSession(inputJson);
             // 只有完整同步才清空「新鲜额度」标记；本地校验不动该标记，避免误判额度陈旧。
             lastQuotaSyncFresh = false
         }
+        // v2.1.0 接线：每次同步都让 QuotaCycleEngine 先把过期的 .exhausted 账号翻成 .available。
+        // 周一 00:00 之后第一次同步就会触发「账号一复活」，避免额度错杀。
+        let revivedSnapshot = reviveExpiredAccountsIfNeeded()
+        if !revivedSnapshot.isEmpty {
+            syncStatusMessage = "已复活 \(revivedSnapshot.count) 个账号（本周额度刷新）：\(revivedSnapshot.joined(separator: "、"))"
+            statusMessage = syncStatusMessage
+        }
         syncStatusMessage = localOnly
             ? "正在本地校验 Typeless 登录态..."
             : "正在读取本地 Typeless 登录状态并向云端同步本周额度..."
+        statusMessage = syncStatusMessage
         statusMessage = syncStatusMessage
         
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -1408,6 +1437,65 @@ writeActiveSession(inputJson);
                 hasSilentSessionPayload: !payload.isEmpty
             )
         }
+    }
+
+    /// v2.1.0：让 QuotaCycleEngine 把过期的 `.exhausted` 账号翻成 `.available`。
+    /// 调用时机：每次 quota 同步入口、守护巡检开始处、热备补位前。
+    /// 返回本次复活的账号邮箱列表（用于 statusMessage 提示）。
+    @discardableResult
+    func reviveExpiredAccountsIfNeeded(now: Date = Date()) -> [String] {
+        let mode = QuotaCycleMode.calendarWeek
+        let calendar = Calendar.current
+        var revivedEmails: [String] = []
+        let now = now
+        for index in state.accounts.indices {
+            let account = state.accounts[index]
+            let snapshot = AccountQuotaSnapshot(
+                id: account.id,
+                email: account.email,
+                status: Self.snapshotStatus(from: account.status),
+                reviewState: Self.snapshotReviewState(from: account.effectiveReviewState),
+                usedCharacters: account.usedCharacters,
+                monthlyLimit: account.monthlyLimit,
+                lastResetAt: account.lastResetAt,
+                createdAt: account.createdAt,
+                hasSilentSessionPayload: !(account.rawUserDataPayload?.isEmpty ?? true)
+            )
+            guard QuotaCycleEngine.shouldRevive(account: snapshot, now: now, mode: mode, calendar: calendar) else { continue }
+            state.accounts[index].status = .available
+            state.accounts[index].usedCharacters = 0
+            state.accounts[index].lastResetAt = now
+            let displayEmail = account.email.ifEmpty(account.name)
+            revivedEmails.append(displayEmail)
+        }
+        if !revivedEmails.isEmpty {
+            save()
+        }
+        return revivedEmails
+    }
+
+    private static func snapshotStatus(from status: AccountStatus) -> AccountQuotaSnapshot.Status {
+        switch status {
+        case .available: return .available
+        case .nearlySpent: return .nearlySpent
+        case .exhausted: return .exhausted
+        case .paused: return .paused
+        }
+    }
+
+    private static func snapshotReviewState(from state: ReviewState) -> AccountQuotaSnapshot.ReviewState {
+        switch state {
+        case .pending: return .pending
+        case .approved: return .approved
+        case .rejected: return .rejected
+        }
+    }
+
+    /// v2.1.0 接线：候选池生成前先复活已过期账号，再走原 SmartSwitchPolicy 决策。
+    /// 这样 `smartSwitchCandidates` 会自然把复活号纳入静默池，无需改 decide() 内部逻辑。
+    private func smartSwitchCandidatesAfterRevival(excluding currentID: UUID?) -> [SmartSwitchCandidate] {
+        _ = reviveExpiredAccountsIfNeeded()
+        return smartSwitchCandidates(excluding: currentID)
     }
 
     func switchActiveAccountSilently(
@@ -4406,6 +4494,15 @@ writeActiveSession(inputJson);
             .replacingOccurrences(of: ".", with: "-")
     }
 
+    /// 文件名安全的时间戳后缀：`yyyyMMdd-HHmmss`，用于损坏 store.json 备份命名。
+    private nonisolated static func storeCorruptedTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: date)
+    }
+
     private func runInlineAppleScript(
         _ appleScript: String,
         label: String,
@@ -5383,7 +5480,6 @@ enum QuotaGuardLaunchAgent {
         }
 
         let candidates = [
-            "/Users/fucaixie/BC/Typeless/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard",
             FileManager.default.currentDirectoryPath + "/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard"
         ]
         for path in candidates where FileManager.default.isExecutableFile(atPath: path) {

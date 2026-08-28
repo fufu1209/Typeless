@@ -65,6 +65,11 @@ enum TypelessSwitchboardMain {
         if CommandLine.arguments.contains("--export-public-bundle") {
             runStandaloneBundleExportAndExit(sanitized: true)
         }
+        // 与导出配对：换机时 `git clone` 完一条命令就能把账号池恢复回来。
+        //   --import-bundle <文件路径>
+        if let path = value(of: "--import-bundle") {
+            runStandaloneBundleImportAndExit(path: path)
+        }
 
         let mode = SwitchboardStore.resolveRunMode()
         switch mode {
@@ -128,6 +133,36 @@ enum TypelessSwitchboardMain {
         } else {
             print("  导出失败：\(store.statusMessage)")
             exit(1)
+        }
+    }
+
+    /// 读取 `--flag 值` 形式的命令行参数。
+    private static func value(of flag: String) -> String? {
+        guard let index = CommandLine.arguments.firstIndex(of: flag),
+              CommandLine.arguments.indices.contains(index + 1) else { return nil }
+        let value = CommandLine.arguments[index + 1]
+        return value.isEmpty ? nil : value
+    }
+
+    /// 无界面导入配置包并退出。按邮箱去重，已有账号不会被重复添加。
+    @MainActor
+    private static func runStandaloneBundleImportAndExit(path: String) -> Never {
+        print("TypelessSwitchboard: importing bundle from \(path)")
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let store = SwitchboardStore(runMode: .daemonOnce)
+        let added = store.importFullBundle(from: url)
+        switch added {
+        case ..<0:
+            // statusMessage 里已经带了「导入失败：」前缀，别再叠一层。
+            print("  \(store.statusMessage)")
+            exit(1)
+        case 0:
+            print("  没有新增账号：\(store.statusMessage)")
+            exit(0)
+        default:
+            print("  已导入 \(added) 个账号：\(store.statusMessage)")
+            // 设置也一并生效，导入函数内部已 save()。
+            exit(0)
         }
     }
 

@@ -8,3 +8,6 @@ TypelessSwitchboard.app/
 *.log
 .env
 secrets.json
+
+# 内部工作记忆（含本机路径、账号池实况、工程决策过程）—— 绝不进公开仓库
+.workbuddy-ai/

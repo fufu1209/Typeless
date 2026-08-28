@@ -246,7 +246,7 @@ swift run OperationalFeatureChecks
 打包产物位于：
 
 ```text
-/Users/fucaixie/BC/Typeless/TypelessSwitchboard.app
+$HOME/Library/Caches/TypelessSwitchboard/TypelessSwitchboard.app
 ```
 
 `build-app.sh` 会在组装 `.app` 后执行本机 ad-hoc 签名，方便用 `codesign --verify --deep --strict TypelessSwitchboard.app` 做本地完整性校验。

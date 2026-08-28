@@ -18,6 +18,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
   <key>CFBundleExecutable</key>
   <string>TypelessSwitchboard</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>local.typeless.switchboard</string>
   <key>CFBundleName</key>
@@ -35,6 +37,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+# v2.3.0：复制 AppIcon.icns 到 .app（若 icns 不存在则现场生成）。
+ICON_SRC="Resources/AppIcon.icns"
+if [[ -f "$ICON_SRC" ]]; then
+    cp "$ICON_SRC" "$APP/Contents/Resources/AppIcon.icns"
+else
+    echo "WARN: $ICON_SRC not found, generating via scripts/generate-icon.sh"
+    ./scripts/generate-icon.sh
+    cp "$ICON_SRC" "$APP/Contents/Resources/AppIcon.icns"
+fi
 
 if command -v codesign >/dev/null 2>&1; then
   codesign --force --deep --sign - "$APP" >/dev/null

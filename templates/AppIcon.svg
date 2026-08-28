@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Typeless Switchboard — App Icon
+  语义：开关（切换账号）+ 麦克风（Typeless 语音输入）
+  造型为原创通用几何形状，不含任何第三方商标元素，授权干净。
+  由 scripts/generate-icon.sh 渲染为 Resources/AppIcon.icns。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#4F7FFF"/>
+      <stop offset="100%" stop-color="#7B5CFF"/>
+    </linearGradient>
+    <linearGradient id="bgGloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="55%" stop-color="#FFFFFF" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.10"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角方形底（macOS 风格 squircle 近似） -->
+  <rect x="32" y="32" width="960" height="960" rx="216" ry="216" fill="url(#bg)"/>
+  <rect x="32" y="32" width="960" height="960" rx="216" ry="216" fill="url(#bgGloss)"/>
+
+  <!-- 切换箭头：左下 → 右上 的循环，表达「换号」 -->
+  <g fill="none" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="32"
+     stroke-linecap="round" stroke-linejoin="round">
+    <!-- 上侧回环箭头 -->
+    <path d="M 300 410 A 200 200 0 0 1 724 410"/>
+    <path d="M 668 348 L 736 416 L 668 484"/>
+    <!-- 下侧回环箭头 -->
+    <path d="M 724 614 A 200 200 0 0 1 300 614"/>
+    <path d="M 356 676 L 288 608 L 356 540"/>
+  </g>
+
+  <!-- 麦克风：capsule 拾音头 + U 形支架 + 底座 -->
+  <g fill="#FFFFFF">
+    <!-- 拾音头 -->
+    <rect x="438" y="256" width="148" height="286" rx="74" ry="74"/>
+  </g>
+  <g fill="none" stroke="#FFFFFF" stroke-width="34" stroke-linecap="round">
+    <!-- U 形支架 -->
+    <path d="M 384 512 V 596 A 128 128 0 0 0 640 596 V 512"/>
+    <!-- 立柱 -->
+    <path d="M 512 724 V 792"/>
+    <!-- 底座 -->
+    <path d="M 424 792 H 600"/>
+  </g>
+</svg>

@@ -160,4 +160,150 @@ extension SwitchboardStore {
         }
         save()
     }
+
+    // MARK: - v2.5.2 完整配置包导入导出
+
+    /// 把"换 Mac 也能立刻用"所需的所有非隐私数据写到 ~/Downloads。
+    /// - 不导出 keychain 内容（API Key / 账号强密码 / 设备凭据）
+    /// - 不导出 token 摘要、浏览器快照
+    /// - 文件名带时间戳，格式 JSON，按 schemaVersion 校验
+    /// - 成功时返回写入的文件 URL，失败返回 nil 并设置 statusMessage
+    @discardableResult
+    func exportFullBundle() -> URL? {
+        let bundle = makeBundle(kind: .full)
+        return writeBundle(bundle)
+    }
+
+    /// 脱敏导出：邮箱变 `demo[N]@example.com`、notes 清空。
+    /// 适合发 GitHub / 分享给同事 / 备份后归档。
+    @discardableResult
+    func exportPublicBundle() -> URL? {
+        let sanitized = ConfigurationBundleIO.sanitize(makeBundle(kind: .full))
+        return writeBundle(sanitized)
+    }
+
+    /// 从 JSON 文件导入。返回新增的账号数（已存在的邮箱会被跳过）。
+    /// - 校验 schemaVersion，失败返回 -1
+    /// - 按邮箱去重（已有则不重复添加）
+    /// - 导入后自动 save()
+    @discardableResult
+    func importFullBundle(from url: URL) -> Int {
+        guard let data = try? Data(contentsOf: url) else {
+            statusMessage = "导入失败：无法读取文件"
+            return -1
+        }
+        guard let bundle = ConfigurationBundleIO.parse(data) else {
+            statusMessage = "导入失败：schema 不匹配（期望 v\(ConfigurationBundleIO.currentSchemaVersion)）"
+            return -1
+        }
+        var added = 0
+        var skipped = 0
+        let existingEmails = Set(state.accounts.map { $0.email.lowercased() })
+        for acc in bundle.accounts {
+            if existingEmails.contains(acc.email.lowercased()) {
+                skipped += 1
+                continue
+            }
+            // 注意：导入的账号 password 为空，需要在新设备上重新生成
+            // typelessUsername 也可能为空（公开版脱敏后）
+            var imported = Account.blank(settings: state.settings)
+            imported.name = acc.name
+            imported.email = acc.email
+            imported.domain = acc.domain.isEmpty ? accountDomain(of: acc.email) : acc.domain
+            imported.role = acc.role
+            imported.typelessUsername = acc.typelessUsername
+            imported.notes = acc.notes
+            imported.createdAt = acc.createdAt
+            imported.status = AccountStatus(rawValue: acc.status) ?? .available
+            state.accounts.append(imported)
+            added += 1
+        }
+        // 合并设置（不覆盖已有非默认值）
+        if bundle.settings.autoRotateRemainingThreshold != SmartSwitchPolicy.defaultRemainingThreshold {
+            state.settings.autoRotateRemainingThreshold = bundle.settings.autoRotateRemainingThreshold
+        }
+        if bundle.settings.autoRotateCheckIntervalMinutes != SmartSwitchPolicy.defaultCheckIntervalMinutes {
+            state.settings.autoRotateCheckIntervalMinutes = bundle.settings.autoRotateCheckIntervalMinutes
+        }
+        state.settings.hotSpareTargetCount = bundle.settings.hotSpareTarget
+        save()
+        statusMessage = "导入完成：新增 \(added) 个账号，跳过 \(skipped) 个重复"
+        return added
+    }
+
+    private func makeBundle(kind: ConfigurationBundle.Kind) -> ConfigurationBundle {
+        let accounts = state.accounts.map { acc in
+            ConfigurationBundleAccount(
+                name: acc.name,
+                email: acc.email,
+                domain: acc.domain,
+                role: acc.role,
+                typelessUsername: acc.typelessUsername,
+                notes: acc.notes,
+                createdAt: acc.createdAt,
+                status: acc.status.rawValue
+            )
+        }
+        let settings = BundleSettings(
+            autoRotateRemainingThreshold: state.settings.autoRotateRemainingThreshold,
+            autoRotateCheckIntervalMinutes: state.settings.autoRotateCheckIntervalMinutes,
+            keepRunningInBackground: state.settings.keepRunningInBackground,
+            hotSpareTarget: state.settings.hotSpareTargetCount,
+            moeMailBaseURL: state.settings.moeMailBaseURL,
+            allowFullAutomaticReplacement: state.settings.autoCreateWhenPoolEmpty
+        )
+        return ConfigurationBundle(
+            schemaVersion: ConfigurationBundleIO.currentSchemaVersion,
+            appVersion: appVersionString(),
+            exportedAt: Date(),
+            kind: kind,
+            accounts: accounts,
+            settings: settings
+        )
+    }
+
+    private func writeBundle(_ bundle: ConfigurationBundle) -> URL? {
+        let encoder = ConfigurationBundleIO.encoder
+        guard let data = try? encoder.encode(bundle) else {
+            statusMessage = "导出失败：编码错误"
+            return nil
+        }
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let kindLabel = bundle.kind == .full ? "full" : "public"
+        let stamp = isoTimestampForFilename()
+        let outURL = downloads.appendingPathComponent(
+            "TypelessSwitchboard-bundle-\(kindLabel)-\(stamp).json"
+        )
+        do {
+            try data.write(to: outURL, options: .atomic)
+            statusMessage = "已导出到 \(outURL.path)"
+            return outURL
+        } catch {
+            statusMessage = "导出失败：\(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    private func accountDomain(of email: String) -> String {
+        if let at = email.firstIndex(of: "@") {
+            return String(email[email.index(after: at)...])
+        }
+        return ""
+    }
+
+    private func isoTimestampForFilename() -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone.current
+        fmt.dateFormat = "yyyyMMdd-HHmmss"
+        return fmt.string(from: Date())
+    }
+
+    private func appVersionString() -> String {
+        if let s = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+            return s
+        }
+        return "2.0.0"
+    }
 }

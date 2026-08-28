@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import TypelessSwitchboardCore
 
 // MARK: - Tab 1：账号池
@@ -23,6 +24,7 @@ struct PoolTabView: View {
     @State private var listFilter: AccountListFilter = .all
     @State private var candidateCount = 5
     @State private var generatedDomain = ""
+    @State private var isShowingBundleImporter = false
 
     var body: some View {
         ScrollView {
@@ -282,6 +284,33 @@ struct PoolTabView: View {
             }
             .buttonStyle(.bordered)
 
+            // v2.5.2：完整配置包导入导出（换 Mac / 分享 / 备份）
+            HStack(spacing: 8) {
+                Button {
+                    _ = store.exportFullBundle()
+                } label: {
+                    Label("导出完整配置包", systemImage: "archivebox")
+                        .frame(maxWidth: .infinity)
+                }
+                .help("导出账号池 + 设置到 ~/Downloads（不含 keychain）")
+
+                Button {
+                    _ = store.exportPublicBundle()
+                } label: {
+                    Label("导出脱敏包（可分享）", systemImage: "archivebox.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .help("邮箱替换为占位、备注清空，可发 GitHub / 分享给同事")
+
+                Button {
+                    isShowingBundleImporter = true
+                } label: {
+                    Label("导入配置包", systemImage: "square.and.arrow.down.on.square")
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .buttonStyle(.bordered)
+
             if !store.statusMessage.isEmpty {
                 NoteLine(text: store.statusMessage, lineLimit: 4)
             }
@@ -289,6 +318,22 @@ struct PoolTabView: View {
         .onAppear {
             if generatedDomain.isEmpty {
                 generatedDomain = store.state.settings.domains.first ?? ""
+            }
+        }
+        .fileImporter(
+            isPresented: $isShowingBundleImporter,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                if let url = urls.first {
+                    let needsScope = url.startAccessingSecurityScopedResource()
+                    defer { if needsScope { url.stopAccessingSecurityScopedResource() } }
+                    _ = store.importFullBundle(from: url)
+                }
+            case .failure(let error):
+                store.statusMessage = "导入失败：\(error.localizedDescription)"
             }
         }
     }

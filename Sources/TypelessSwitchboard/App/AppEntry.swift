@@ -84,7 +84,9 @@ struct TypelessSwitchboardApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(store)
-                .frame(minWidth: 1180, minHeight: 760)
+                // v2.5.2：5 个 tab + 顶部右侧按钮，原来 1180 会把第 5 个 tab 标题
+                // 裁切（「自检排障」显示成「自检排�」）。提到 1280 给侧边栏+tab+按钮留够空间。
+                .frame(minWidth: 1280, minHeight: 760)
                 .onAppear {
                     appDelegate.bind(store: store)
                 }

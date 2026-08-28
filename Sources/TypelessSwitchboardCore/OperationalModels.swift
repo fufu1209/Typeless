@@ -1786,3 +1786,154 @@ private extension String {
         return trimmed.isEmpty ? nil : trimmed
     }
 }
+
+// MARK: - v2.5.2 完整配置包导入导出
+
+/// 完整配置包：账号 + 设置 + 统计。
+///
+/// **不包含**（在钥匙串或本地缓存里，跨设备带不走）：
+/// - MoeMail API Key（macOS Keychain）
+/// - 各账号强密码（macOS Keychain）
+/// - Typeless 设备凭据（macOS Keychain）
+/// - 浏览器登录态快照（local SQLite）
+///
+/// **目标场景**：
+/// - 换 Mac：新机装好 App，点导入即可拥有完整的账号池和个性化设置
+/// - 分享：脱敏后给同事、朋友，让他们了解这个工具的样例
+/// - 备份：定期导出，避免 store.json 损坏或误删
+///
+/// **隐私分级**：
+/// - `kind == .full`：自己用，含真实邮箱、备注、设置
+/// - `kind == .public`：分享用，把 `Account.email` 替换成 `user[N]@example.com`，
+///   把 `Account.notes` 清空，导出后再手动核查无 PII
+public struct ConfigurationBundle: Codable, Equatable, Sendable {
+    public enum Kind: String, Codable, Equatable, Sendable {
+        case full      // 私密版：原样导出真实数据
+        case publicEdition  // 公开版：脱敏后导出，可发 GitHub
+    }
+
+    public let schemaVersion: Int
+    public let appVersion: String
+    public let exportedAt: Date
+    public let kind: Kind
+    public let accounts: [ConfigurationBundleAccount]
+    public let settings: BundleSettings
+
+    public init(
+        schemaVersion: Int = 2,
+        appVersion: String,
+        exportedAt: Date = Date(),
+        kind: Kind,
+        accounts: [ConfigurationBundleAccount],
+        settings: BundleSettings
+    ) {
+        self.schemaVersion = schemaVersion
+        self.appVersion = appVersion
+        self.exportedAt = exportedAt
+        self.kind = kind
+        self.accounts = accounts
+        self.settings = settings
+    }
+}
+
+/// bundle 里的账号脱敏表示 —— 砍掉一切本地专属字段。
+public struct ConfigurationBundleAccount: Codable, Equatable, Sendable {
+    public let name: String
+    public let email: String
+    public let domain: String
+    public let role: String
+    public let typelessUsername: String?
+    public let notes: String
+    public let createdAt: Date
+    public let status: String  // 原始是 enum；导出时用 rawValue 字符串
+
+    public init(name: String, email: String, domain: String, role: String,
+                typelessUsername: String?, notes: String, createdAt: Date, status: String) {
+        self.name = name
+        self.email = email
+        self.domain = domain
+        self.role = role
+        self.typelessUsername = typelessUsername
+        self.notes = notes
+        self.createdAt = createdAt
+        self.status = status
+    }
+}
+
+/// bundle 里的设置快照（裁剪过的 PersistedState 子集）
+public struct BundleSettings: Codable, Equatable, Sendable {
+    public let autoRotateRemainingThreshold: Int
+    public let autoRotateCheckIntervalMinutes: Int
+    public let keepRunningInBackground: Bool
+    public let hotSpareTarget: Int
+    public let moeMailBaseURL: String
+    public let allowFullAutomaticReplacement: Bool
+
+    public init(autoRotateRemainingThreshold: Int, autoRotateCheckIntervalMinutes: Int,
+                keepRunningInBackground: Bool, hotSpareTarget: Int, moeMailBaseURL: String,
+                allowFullAutomaticReplacement: Bool) {
+        self.autoRotateRemainingThreshold = autoRotateRemainingThreshold
+        self.autoRotateCheckIntervalMinutes = autoRotateCheckIntervalMinutes
+        self.keepRunningInBackground = keepRunningInBackground
+        self.hotSpareTarget = hotSpareTarget
+        self.moeMailBaseURL = moeMailBaseURL
+        self.allowFullAutomaticReplacement = allowFullAutomaticReplacement
+    }
+
+    public enum CodingKeys: String, CodingKey, CaseIterable {
+        case autoRotateRemainingThreshold
+        case autoRotateCheckIntervalMinutes
+        case keepRunningInBackground
+        case hotSpareTarget
+        case moeMailBaseURL
+        case allowFullAutomaticReplacement
+    }
+}
+
+public enum ConfigurationBundleIO {
+    public static let currentSchemaVersion = 2
+
+    public static let encoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.prettyPrinted, .sortedKeys]
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }()
+
+    public static let decoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
+
+    /// 解析并做 schema 校验。失败返回 nil（调用方负责提示用户）。
+    public static func parse(_ data: Data) -> ConfigurationBundle? {
+        guard let bundle = try? decoder.decode(ConfigurationBundle.self, from: data) else { return nil }
+        guard bundle.schemaVersion == currentSchemaVersion else { return nil }
+        return bundle
+    }
+
+    /// 脱敏为 public 版：邮箱换成占位、notes 清空、保留其他结构性字段。
+    public static func sanitize(_ bundle: ConfigurationBundle) -> ConfigurationBundle {
+        let sanitizedAccounts: [ConfigurationBundleAccount] = bundle.accounts.enumerated().map { idx, acc in
+            ConfigurationBundleAccount(
+                name: "演示账号 \(idx + 1)",
+                email: "demo\(idx + 1)@example.com",
+                domain: "example.com",
+                role: acc.role,
+                typelessUsername: acc.typelessUsername,
+                notes: "",
+                createdAt: acc.createdAt,
+                status: acc.status
+            )
+        }
+        return ConfigurationBundle(
+            schemaVersion: bundle.schemaVersion,
+            appVersion: bundle.appVersion,
+            exportedAt: bundle.exportedAt,
+            kind: .publicEdition,
+            accounts: sanitizedAccounts,
+            settings: bundle.settings
+        )
+    }
+}

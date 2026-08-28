@@ -276,15 +276,51 @@ Sources/
 
 ## 10. 进度追踪
 
-- [x] §1 P0-1：删硬编码用户路径
-- [x] §1 P0-2：账号池解码失败备份
-- [x] §2 QuotaCycleEngine.swift：核心方法（daysUntilReset / shouldRevive / pickNext）
-- [ ] §2 接线到 SmartSwitchPolicy.decide
-- [ ] §2 UI 文案「本月」→「本周」+ 倒计时
-- [ ] §3 UI 5 tab 重构
-- [ ] §4 图标 .icns
-- [ ] §5 测试改革（删 125 条源串、加 ≥ 80 条真实断言）
-- [ ] §6 架构拆分（main.swift 7497 → 模块化）
+**全部 6 个阶段已完成（2026-08-28 21:0x GMT+7）。**
+
+- [x] §1 v2.0.0 数据安全 — P0-1 删硬编码用户路径；P0-2 账号池解码失败先备份再置空
+- [x] §2 v2.1.0 周度复活 — `QuotaCycleEngine.swift`（daysUntilReset / shouldRevive / pickNext）；
+      已在 `syncActiveAppSessionAndQuota` 入口接线，走原 `SmartSwitchPolicy.decide` 路径
+- [x] §3 v2.2.0 UI 5 tab 重构 — 账号池 / 智能换号 / 额度守护 / 注册与邮箱 / 自检排障
+- [x] §4 v2.3.0 图标 — 原创「开关 + 麦克风」SVG → 7 档 `.icns`（`ic12`）
+- [x] §5 v2.4.0 测试改革 — 删 108 条源串包含断言，加到 262 条真实行为断言
+- [x] §6 v2.5.0 架构拆分 — 单文件 7544 行 → 28 个职责文件
+
+### 10.1 对应 commit
+
+| 阶段 | commit | 说明 |
+|---|---|---|
+| v2.0.0 / v2.1.0 | `9abe890` | 数据安全 + 周度复活引擎并接线 |
+| v2.3.0 | `236f0b6` | 图标（SVG → 7 档 icns → 进 .app） |
+| v2.4.0 | `e746216` | 测试改革（262 条真实断言） |
+| v2.2.0 | `0e92dce` | UI 5 tab 重构 + 删 1088 行旧 UI |
+| v2.5.0 | `c6e88ef` | 架构拆分（7544 行 → 28 文件） |
+
+### 10.2 每阶段验证方式
+
+不是「代码写了」，而是「跑过了」：
+
+- `swift build` 零 error 零 warning
+- `swift run OperationalFeatureChecks`（262 条断言）
+- `swift run AutomationSmokeChecks`
+- `bash scripts/test-operational-features.sh`
+- `bash scripts/build-app.sh` 打包 + 签名
+- **真实 GUI 启动 6–7 秒**：进程存活、无崩溃、stderr 无输出
+
+### 10.3 重构期的功能等价性核对
+
+| 重构 | 核对方式 | 结果 |
+|---|---|---|
+| UI 5 tab | 旧实现调用 65 个 store 成员，比对新 UI 覆盖数 | 65 / 65，丢失 0 |
+| UI 5 tab | 旧版 41 个按钮/标签逐项归位 | 全部归位 |
+| 架构拆分 | 153 个方法名 / 155 条声明 vs 拆分前单文件基线 | 完全一致 |
+| 架构拆分 | 143 个唯一方法签名查重 | 重复 0 |
+
+### 10.4 遗留项（非阻塞）
+
+- `SwitchboardStore+Accounts.swift`（1677 行）与 `+LaunchAgent.swift`（1930 行）仍偏大，
+  可继续按「MoeMail 客户端 / 浏览器自动化 / 权限探测」再拆一轮。
+- UI 截图对照（§3.3 验收项）未做——需要人工在每个 tab 各截一张留档。
 
 ---
 

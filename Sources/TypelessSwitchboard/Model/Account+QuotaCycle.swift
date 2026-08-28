@@ -30,13 +30,30 @@ extension Account {
     }
 
     /// 「下次可用」文案。已可用显示「立即可用」，用尽显示到周一 00:00 的倒计时。
+    ///
+    /// 日历统一取自 `QuotaCycleClock`：与复活判定、看门狗排程共用同一个口径，
+    /// 否则用户在设置里改了时区后会出现「倒计时归零了但还没复活」。
     var nextAvailabilityText: String {
-        QuotaCycleEngine.nextAvailabilityText(for: quotaSnapshot)
+        QuotaCycleEngine.nextAvailabilityText(
+            for: quotaSnapshot,
+            calendar: QuotaCycleClock.shared.calendar
+        )
     }
 
-    /// 下次额度刷新的绝对时间点（周一 00:00 本地时区）。
+    /// 下次额度刷新的绝对时间点（周一 00:00，按设置里的时区）。
     var nextResetDate: Date? {
-        QuotaCycleEngine.nextResetDate(for: quotaSnapshot)
+        QuotaCycleEngine.nextResetDate(
+            for: quotaSnapshot,
+            calendar: QuotaCycleClock.shared.calendar
+        )
+    }
+
+    /// 周期摘要，例如「本周已用 6133/8000 · 还剩 1,867 · 距离刷新还有 3 天（周一 00:00）」。
+    var quotaCycleSummary: String {
+        QuotaCycleEngine.summary(
+            for: quotaSnapshot,
+            calendar: QuotaCycleClock.shared.calendar
+        )
     }
 
     /// 剩余额度是否低于阈值（口径与自动轮换完全一致，避免 UI 与守护进程判定不一致）。

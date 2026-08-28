@@ -23,6 +23,12 @@ struct AppSettings: Codable, Equatable, Sendable {
     var hotSpareTargetCount: Int
     /// 关主窗口时是否继续后台守护（菜单栏常驻）。
     var keepRunningInBackground: Bool
+    /// 周额度刷新所用时区的标识符。**空串 = 跟随系统**。
+    ///
+    /// Typeless 的额度按「周一 00:00」刷新，这个 00:00 是相对某个时区的。
+    /// 系统时区与本人所在时区不一致时（例如系统停在 +0700、人在深圳 +0800），
+    /// 倒计时与自动复活会整体偏移。填 `Asia/Shanghai` 可锁定为北京时间。
+    var quotaCycleTimeZoneIdentifier: String
 
     static let defaults = AppSettings(
         typelessLoginURL: typelessDefaultLoginURL,
@@ -41,7 +47,8 @@ struct AppSettings: Codable, Equatable, Sendable {
         autoRotateRemainingThreshold: SmartSwitchPolicy.defaultRemainingThreshold,
         autoCreateWhenPoolEmpty: true,
         hotSpareTargetCount: SmartSwitchPolicy.defaultHotSpareTarget,
-        keepRunningInBackground: false
+        keepRunningInBackground: false,
+        quotaCycleTimeZoneIdentifier: ""
     )
 
     enum CodingKeys: String, CodingKey {
@@ -55,6 +62,7 @@ struct AppSettings: Codable, Equatable, Sendable {
         case autoCreateWhenPoolEmpty
         case hotSpareTargetCount
         case keepRunningInBackground
+        case quotaCycleTimeZoneIdentifier
     }
 
     init(
@@ -67,7 +75,8 @@ struct AppSettings: Codable, Equatable, Sendable {
         autoRotateRemainingThreshold: Int,
         autoCreateWhenPoolEmpty: Bool,
         hotSpareTargetCount: Int,
-        keepRunningInBackground: Bool
+        keepRunningInBackground: Bool,
+        quotaCycleTimeZoneIdentifier: String
     ) {
         self.typelessLoginURL = typelessLoginURL
         self.moeMailBaseURL = moeMailBaseURL
@@ -79,6 +88,13 @@ struct AppSettings: Codable, Equatable, Sendable {
         self.autoCreateWhenPoolEmpty = autoCreateWhenPoolEmpty
         self.hotSpareTargetCount = hotSpareTargetCount
         self.keepRunningInBackground = keepRunningInBackground
+        self.quotaCycleTimeZoneIdentifier = quotaCycleTimeZoneIdentifier
+    }
+
+    /// 周额度周期时区。空串（跟随系统）时返回 nil，由调用方回落到 `TimeZone.current`。
+    var quotaCycleTimeZone: TimeZone? {
+        guard !quotaCycleTimeZoneIdentifier.isEmpty else { return nil }
+        return TimeZone(identifier: quotaCycleTimeZoneIdentifier)
     }
 
     init(from decoder: Decoder) throws {
@@ -107,6 +123,9 @@ struct AppSettings: Codable, Equatable, Sendable {
         )
         keepRunningInBackground = try container.decodeIfPresent(Bool.self, forKey: .keepRunningInBackground)
             ?? fallback.keepRunningInBackground
+        // 空串 = 跟随系统，与 v2.5.5 之前「一律用系统时区」的行为一致，老 store.json 无需迁移。
+        quotaCycleTimeZoneIdentifier = try container.decodeIfPresent(String.self, forKey: .quotaCycleTimeZoneIdentifier)
+            ?? fallback.quotaCycleTimeZoneIdentifier
     }
 }
 

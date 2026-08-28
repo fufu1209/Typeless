@@ -36,6 +36,11 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
         installStatusItemIfNeeded()
         installWakeObserverIfNeeded()
 
+        // v2.5.5：把设置里的周期时区灌进全局时钟。必须在看门狗之前，
+        // 否则看门狗会先按系统时区算出错误的休眠时长。
+        store.applyQuotaCycleTimeZone()
+        // v2.5.5：顺手裁一次守护日志（实测堆到过 24MB，launchd 那两个本进程管不着写入）。
+        store.rotateQuotaGuardLogsIfNeeded()
         // v2.5.4：启动即复活 + 周界看门狗。与「无感守护」开关解耦，
         // 关掉守护、或整个周末没开 App，周一打开也能立刻把额度恢复回来。
         store.startQuotaCycleWatchdogIfNeeded()
@@ -43,6 +48,8 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
         if !store.autoHealDesktopOnboardingIfSafe() {
             store.refreshDesktopOnboardingState()
         }
+        // v2.5.5：常驻巡检。覆盖「App 连开好几天，期间 Typeless 升级把引导标记重置了」。
+        store.startOnboardingGuardIfNeeded()
         statusCancellable = store.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -166,6 +173,7 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
     @objc private func quitApp() {
         store?.stopRotateMonitor()
         store?.stopQuotaCycleWatchdog()
+        store?.stopOnboardingGuard()
         NSApp.terminate(nil)
     }
 }

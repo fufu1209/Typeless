@@ -7,13 +7,31 @@
 - 工程历史 commit 模式：feat/fix/docs 三类，无 refactor / chore 提交
 
 ## v2 全面升级（2026-08-28 起）
-完整计划在 `docs/v2-upgrade-plan.md`，6 阶段 + 多 worktree 并行：
-1. **v2.0.0 数据安全** ✅ 已 commit 9abe890
-2. **v2.1.0 周度复活** ✅ 已 commit 9abe890
-3. v2.2.0 UI 重构（5 tab）
-4. v2.3.0 图标（CC0 / MIT 选一个，做 .icns）
-5. v2.4.0 测试改革（删 125 条源串包含 + 加 ≥80 条真实断言）
-6. v2.5.0 架构拆分（main.swift 7497 → 模块化）
+完整计划在 `docs/v2-upgrade-plan.md`
+1. v2.0.0 数据安全 ✅ 9abe890
+2. v2.1.0 周度复活 ✅ 9abe890
+3. v2.2.0 UI 重构（5 tab）✅
+4. v2.3.0 图标 ✅
+5. v2.4.0 测试改革（删源串包含 + 加真实断言）✅
+6. v2.5.0 架构拆分（main.swift 7497 → 模块化）✅
+7. **v2.5.3** 新手引导回归修复 + 下次可用接线 + 单实例锁 ✅ aa89300
+8. **v2.5.4** 周期看门狗 + 启动自愈引导 + 旧副本清理 ✅ **07f7f54（当前版本）**
+
+### v2.5.4 关键代码定位
+- `Store/SwitchboardStore+SmartSwitch.swift`
+  - `startQuotaCycleWatchdogIfNeeded()` / `stopQuotaCycleWatchdog()`
+    周期看门狗：与 `isAutoRotateEnabled` 解耦，纯本地算 `secondsUntilReset`
+    后精确休眠（clamp 到 [60s, 一周]），跨周一自动复活
+  - `performWeeklyRevivalIfNeeded(reason:)` 统一复活入口，
+    额度同步 / 启动 / 看门狗 / 手动四处都走它，记 lastWeeklyRevivalAt
+- `Store/SwitchboardStore+OnboardingPatch.swift`
+  - `autoHealDesktopOnboardingIfSafe()` **只在 Typeless 未运行时**静默写盘
+    （它运行时写了也会被退出时 flush 内存态覆盖）
+  - `refreshDesktopOnboardingState()` / `desktopOnboardingIsIncomplete()`
+  - `appendOnboardingPatchLog()` 写 Logs/onboarding-patch.log
+- `App/AppDelegate.swift` bind() 里接看门狗 + 自愈；quitApp() 里停看门狗
+- `Model/Account+QuotaCycle.swift` Account↔快照唯一桥接点（v2.5.3）
+- `App/AppEntry.swift` `SingleInstanceGuard`（flock LOCK_EX\|LOCK_NB）
 
 ## v2.0.0 / v2.1.0 关键代码定位
 - `Sources/TypelessSwitchboardCore/QuotaCycleEngine.swift`：纯函数引擎
@@ -58,9 +76,17 @@
 - 平台枚举 4 → 7：ios/android/macos/windows/**linux**/**harmony**/**webpage**
   macos 节点另带 app_version / completed_at
   → 补丁用「文件已有键 ∪ 官方枚举」，未来加平台自动兼容
-- 补丁入口：账号详情按钮 / CLI `--skip-onboarding` / 换号自动
+- 补丁入口（v2.5.4 共 5 个）：账号详情按钮 / 顶部横幅 / 排障页常驻卡片 /
+  CLI `--skip-onboarding` / 无感换号自动 / App 启动自愈
 - 日志：`~/Library/Application Support/TypelessSwitchboard/Logs/onboarding-patch.log`
 - 完整实测时间线见 `docs/onboarding-patch-truth.md`
+
+## 账号池实况（2026-08-28）
+- 18 个账号，全部 `available` + `approved`
+- 16/18 带 `rawUserDataPayload`（静默会话缓存），2 个从未登录所以没有
+- store.json 里 `monthlyLimit` 是历史字段名，**值 8000 = 每周额度**
+- `rawUserDataPayload` 是 optional 字段，统计时必须遍历所有账号取并集，
+  只看 accounts[0] 会漏判
 
 ## 工程铁律（踩过的坑）
 - **验证必须跨越被测对象的重启**：补丁后立刻读文件 = 假阳性，
@@ -71,3 +97,15 @@
   否则用户会看到「好几个一样的 app」
 - 本工程测试是可执行 target 的 main.swift，不是 XCTest
   → `swift test` 报 no tests found，必须 `swift run OperationalFeatureChecks`
+- **清理旧 app 后必须用 `mdfind` 复核，不能只 `find`**：
+  find 只看文件系统实时状态，Spotlight 索引有延迟/缓存，
+  用户看到的「好几个一样的 app」来自索引
+  复核命令：`mdfind "kMDItemCFBundleIdentifier == 'local.typeless.switchboard'"`
+- **不要轻信用户的「好像只有一个了」**：v2.5.4 时用户这么判断，
+  实测 `~/BC/Typeless/TypelessSwitchboard.app` 仍是 1.1.0 旧副本且被索引。
+  必须自己跑一遍再回答
+- **周期性任务不能只挂在业务回调上**：周额度复活原先只挂在额度同步里，
+  守护关掉 / 周末不开 App 就漏跑。凡是「到点必须发生」的逻辑
+  都要有独立的看门狗 + 统一的记录入口
+- **本机时区是 +0700，用户在深圳（+0800）**：引擎用 `.current` calendar，
+  倒计时会差 1 小时。待用户确认是否需要按 +0800 固定

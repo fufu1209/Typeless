@@ -470,19 +470,20 @@ extension SwitchboardStore {
 
     func appendDaemonLog(remaining: Int?, email: String, reason: String, resultID: UUID?) {
         let dir = fileURL.deletingLastPathComponent().appendingPathComponent("Logs", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let logURL = dir.appendingPathComponent("quota-guard-daemon.log")
         let stamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(stamp)] remaining=\(remaining.map(String.init) ?? "-") email=\(email.ifEmpty("-")) result=\(resultID?.uuidString ?? "-") \(reason)\n"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logURL.path),
-               let handle = try? FileHandle(forWritingTo: logURL) {
-                defer { try? handle.close() }
-                _ = try? handle.seekToEnd()
-                try? handle.write(contentsOf: data)
-            } else {
-                try? data.write(to: logURL, options: .atomic)
-            }
+        LogFileRotator.append(
+            line: "[\(stamp)] remaining=\(remaining.map(String.init) ?? "-") email=\(email.ifEmpty("-")) result=\(resultID?.uuidString ?? "-") \(reason)",
+            to: logURL
+        )
+    }
+
+    /// v2.5.5：守护日志的轮转。launchd 的 stdout / stderr 由 launchd 自己持有 fd，
+    /// 本进程管不着写入，但可以在 App 启动时顺手裁一次 —— 实测这两个文件曾堆到 15MB。
+    func rotateQuotaGuardLogsIfNeeded() {
+        let dir = fileURL.deletingLastPathComponent().appendingPathComponent("Logs", isDirectory: true)
+        for name in ["quota-guard-daemon.log", "quota-guard-launchd.out.log", "quota-guard-launchd.err.log"] {
+            LogFileRotator.rotateIfNeeded(dir.appendingPathComponent(name))
         }
     }
 }

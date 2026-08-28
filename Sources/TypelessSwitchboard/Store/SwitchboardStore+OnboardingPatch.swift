@@ -150,7 +150,10 @@ extension SwitchboardStore {
         do {
             try writeTypelessStorageOnboardingCompletion(to: storageURL, expectedEmail: expectedEmail)
             let who = expectedEmail ?? "当前登录账号"
-            log.append("已把 \(who) 标记为非新用户（is_new_user=false，全平台 onboarding 已完成）")
+            // 口径必须诚实：userData 是服务端真值，联网后会被同步覆盖，
+            // 实测 7 个平台里只有 macos 站得住，其余 6 个会被打回 false。
+            // 真正决定「弹不弹引导」的是 app-onboarding.json，那才是持久的。
+            log.append("已把 \(who) 标记为非新用户（is_new_user=false）；注意该字段联网后会被服务端同步覆盖，真正持久的是 app-onboarding.json")
         } catch {
             log.append("写入 app-storage.json 失败：\(error.localizedDescription)")
         }
@@ -187,19 +190,49 @@ extension SwitchboardStore {
         return log
     }
 
-    // MARK: - 启动自检与自愈（v2.5.4）
+    // MARK: - 启动自检与自愈（v2.5.4，v2.5.5 补强）
 
-    /// 桌面端引导是否仍未完成。文件不存在时返回 false —— Typeless 还没生成过这个文件，
-    /// 不代表需要修，避免在没装 Typeless 的机器上误报警。
-    func desktopOnboardingIsIncomplete() -> Bool {
+    /// 引导巡检间隔（秒）。每轮只读一个几百字节的 JSON，开销可忽略。
+    static let onboardingGuardIntervalSeconds: TimeInterval = 300
+
+    /// 桌面端引导状态。
+    ///
+    /// v2.5.4 把「读不到文件」一律当成「已完成」，这是个真缺口：
+    /// Typeless 升级 / 重装把 `app-onboarding.json` 删掉之后补丁永远不触发，
+    /// 而它下次冷启动会按默认值重建这个文件 —— 又变回未完成，白等一整轮。
+    enum DesktopOnboardingState: Equatable {
+        /// 明确写了完成标记。
+        case complete
+        /// 文件在，但还没走完引导。
+        case incomplete
+        /// 文件不存在或读不出来。装了 Typeless 就该主动补写。
+        case missing
+    }
+
+    /// 读取桌面端引导状态。只看 `app-onboarding.json` —— 它才是决定「弹不弹引导」的持久开关，
+    /// `app-storage.json` 里的 `is_new_user` 是服务端真值，联网就会被同步覆盖。
+    func desktopOnboardingState() -> DesktopOnboardingState {
         guard let data = try? Data(contentsOf: typelessOnboardingURL()),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return false
+            return .missing
         }
-        if let done = object["isCompleted"] as? Bool { return !done }
+        if let done = object["isCompleted"] as? Bool { return done ? .complete : .incomplete }
         // 没有 isCompleted 字段时用 step 兜底。
-        if let step = object["step"] as? Int { return step < 99 }
-        return true
+        if let step = object["step"] as? Int { return step >= 99 ? .complete : .incomplete }
+        // 文件在但两个字段都没有：按未完成处理，补写一遍没有副作用。
+        return .incomplete
+    }
+
+    /// 桌面端引导是否仍未完成。
+    ///
+    /// 「文件缺失」只有在 **Typeless 已安装** 时才算需要处理 —— 没装 Typeless 的机器上
+    /// 根本没有这个文件，不该天天误报警。
+    func desktopOnboardingIsIncomplete() -> Bool {
+        switch desktopOnboardingState() {
+        case .complete: return false
+        case .incomplete: return true
+        case .missing: return typelessAppPath() != nil
+        }
     }
 
     /// 刷新 `desktopOnboardingNeedsPatch`。App 启动时调一次，UI 据此显示一键修复横幅。
@@ -213,30 +246,92 @@ extension SwitchboardStore {
         return needs
     }
 
+    /// 桌面端 Typeless 是否正在运行。
+    func typelessDesktopIsRunning() -> Bool {
+        NSWorkspace.shared.runningApplications.contains { app in
+            app.bundleIdentifier == "now.typeless.desktop" ||
+                app.localizedName == "Typeless" ||
+                app.bundleURL?.path == typelessAppPath()
+        }
+    }
+
     /// 启动自愈：只在「Typeless 没在跑」时静默写引导标记，完全不打扰用户。
     ///
     /// Typeless 正在跑时**不写** —— 它内存里持有 isCompleted=false，
     /// 退出时会把我们写的值覆盖回去，白写还可能造成状态打架。
     /// 那种情况改由顶部横幅提示用户点一下，走完整的「退出 → 写盘 → 重启」流程。
+    ///
+    /// v2.5.5 补了三件事：写前留一份原始备份、写完回读校验、顺带补 `app-storage.json`。
     @discardableResult
     func autoHealDesktopOnboardingIfSafe() -> Bool {
         guard desktopOnboardingIsIncomplete() else { return false }
-        let running = NSWorkspace.shared.runningApplications.contains { app in
-            app.bundleIdentifier == "now.typeless.desktop" ||
-                app.localizedName == "Typeless" ||
-                app.bundleURL?.path == typelessAppPath()
-        }
-        guard !running else { return false }
+        guard !typelessDesktopIsRunning() else { return false }
+
+        let onboardingURL = typelessOnboardingURL()
+        backupDesktopOnboardingFileIfNeeded(onboardingURL)
 
         do {
-            try writeTypelessOnboardingCompletion(to: typelessOnboardingURL())
-            appendOnboardingPatchLog("启动自愈：Typeless 未运行，已静默写入引导完成标记")
-            desktopOnboardingNeedsPatch = desktopOnboardingIsIncomplete()
-            return true
+            try writeTypelessOnboardingCompletion(to: onboardingURL)
         } catch {
-            appendOnboardingPatchLog("启动自愈失败：\(error.localizedDescription)")
+            appendOnboardingPatchLog("自愈失败（app-onboarding.json）：\(error.localizedDescription)")
             return false
         }
+
+        // 回读校验：写成功不等于生效。磁盘满、权限、Typeless 退出时 flush 都可能让写入落空。
+        guard !desktopOnboardingIsIncomplete() else {
+            appendOnboardingPatchLog("自愈校验失败：写入后读回仍不是完成态，请检查 ~/Library/Application Support/Typeless 目录权限")
+            return false
+        }
+
+        // app-storage.json 是 best-effort：is_new_user 是服务端真值、联网会被覆盖，
+        // 但 Typeless 没在跑时补写，能让它冷启动第一次读盘就判定为非新用户。
+        // 从未登录（没有 userData）时直接跳过，不算失败。
+        do {
+            try writeTypelessStorageOnboardingCompletion(to: typelessStorageURL(), expectedEmail: nil)
+            appendOnboardingPatchLog("自愈完成：Typeless 未运行，已静默写入引导完成标记（app-onboarding.json + app-storage.json）")
+        } catch {
+            appendOnboardingPatchLog("自愈完成：已写入 app-onboarding.json；app-storage.json 跳过（\(error.localizedDescription)）")
+        }
+
+        desktopOnboardingNeedsPatch = desktopOnboardingIsIncomplete()
+        return true
+    }
+
+    /// 首次改写前留一份原文件，万一补丁把状态写坏了能手动还原。
+    /// 只留第一份 —— 每次巡检都覆盖的话，备份本身就失去意义了。
+    func backupDesktopOnboardingFileIfNeeded(_ url: URL) {
+        let backupURL = url.deletingPathExtension()
+            .appendingPathExtension("json.switchboard-orig.bak")
+        guard !FileManager.default.fileExists(atPath: backupURL.path),
+              FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.copyItem(at: url, to: backupURL)
+    }
+
+    // MARK: - 常驻巡检（v2.5.5）
+
+    /// 引导巡检：启动自愈只在 App 冷启动时跑一次，覆盖不到
+    /// 「App 连开好几天，期间 Typeless 升级 / 重装把引导标记重置了」这种情况。
+    ///
+    /// 这里起一个 5 分钟一轮的轻量循环：只读一个小 JSON，Typeless 没在跑
+    /// 且标记被重置（或文件被删）时才写一次。开销可以忽略，但能让标记始终保持在完成态。
+    func startOnboardingGuardIfNeeded() {
+        guard onboardingGuardTask == nil else { return }
+        let interval = Self.onboardingGuardIntervalSeconds
+        onboardingGuardTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                guard let self, !Task.isCancelled else { break }
+                await MainActor.run {
+                    _ = self.autoHealDesktopOnboardingIfSafe()
+                    self.desktopOnboardingNeedsPatch = self.desktopOnboardingIsIncomplete()
+                }
+            }
+        }
+    }
+
+    func stopOnboardingGuard() {
+        onboardingGuardTask?.cancel()
+        onboardingGuardTask = nil
     }
 
     // MARK: - 文件写入
@@ -403,17 +498,11 @@ extension SwitchboardStore {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TypelessSwitchboard", isDirectory: true)
             .appendingPathComponent("Logs", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let fileURL = directory.appendingPathComponent("onboarding-patch.log")
         let stamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(stamp)] \(line)\n"
-        if let handle = try? FileHandle(forWritingTo: fileURL) {
-            handle.seekToEndOfFile()
-            handle.write(Data(line.utf8))
-            try? handle.close()
-        } else {
-            try? line.write(to: fileURL, atomically: true, encoding: .utf8)
-        }
+        LogFileRotator.append(
+            line: "[\(stamp)] \(line)",
+            to: directory.appendingPathComponent("onboarding-patch.log")
+        )
     }
 
     // MARK: - 探测

@@ -189,7 +189,49 @@ struct QuotaGuardTabView: View {
             }
             .buttonStyle(.bordered)
             .disabled(store.isSyncingSession)
+
+            Divider()
+
+            // v2.5.5：额度按「周一 00:00」刷新，这个 00:00 相对哪个时区决定复活时刻。
+            // 系统时区与本人实际所在时区不一致时（系统 +0700 / 人在深圳 +0800）
+            // 倒计时会整体偏移一小时，这里允许显式锁定。
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("刷新时区")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("", selection: Binding(
+                    get: { store.state.settings.quotaCycleTimeZoneIdentifier },
+                    set: { store.setQuotaCycleTimeZoneIdentifier($0) }
+                )) {
+                    Text("跟随系统（\(TimeZone.current.identifier)）").tag("")
+                    Text("中国标准时间 UTC+8").tag("Asia/Shanghai")
+                    Text("印度支那 UTC+7").tag("Asia/Bangkok")
+                    Text("协调世界时 UTC").tag("UTC")
+                }
+                .labelsHidden()
+                .controlSize(.small)
+                .frame(maxWidth: 240)
+                Spacer()
+            }
+
+            NoteLine(text: quotaCycleFootnote, color: .secondary, lineLimit: 3)
         }
+    }
+
+    /// 下次刷新的绝对时刻 + 到点会发生什么。用户最关心的就是「多久能回到 8000」。
+    private var quotaCycleFootnote: String {
+        let calendar = QuotaCycleClock.shared.calendar
+        guard let reset = QuotaCycleEngine.nextCalendarWeekReset(calendar: calendar) else {
+            return "下次刷新时间计算失败"
+        }
+        let formatter = DateFormatter()
+        formatter.timeZone = QuotaCycleClock.shared.timeZone
+        formatter.locale = Locale(identifier: "zh_Hans_CN")
+        formatter.dateFormat = "M月d日 EEEE HH:mm z"
+        let countdown = QuotaCycleEngine.countdownText(to: reset)
+        let count = store.state.accounts.count
+        let poolNote = count > 0 ? "，池内 \(count) 个账号同时回到各 8000 字" : ""
+        return "下次刷新 \(formatter.string(from: reset))（还有 \(countdown)）\(poolNote)。到点不需要开着本 App，看门狗会按同一时刻自动复活。"
     }
 
     private func settingsBinding<Value>(_ keyPath: WritableKeyPath<AppSettings, Value>) -> Binding<Value> {

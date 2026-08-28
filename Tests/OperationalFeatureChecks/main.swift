@@ -412,8 +412,157 @@ struct OperationalFeatureChecks {
         // MARK: - v2.5.4：周额度完整生命周期（用尽 → 倒计时 → 周一复活 → 回到 8000）
         runWeeklyQuotaLifecycleChecks()
 
+        // MARK: - v2.5.5：周期时区可配置 + 引导补丁自愈补强
+        runQuotaCycleClockChecks()
+        runOnboardingSelfHealChecks()
+
         print("Operational feature checks passed")
     }
+
+    // MARK: - v2.5.5 周期时钟（QuotaCycleClock）
+    //
+    // 背景：本机系统时区停在 Asia/Bangkok(+0700)，用户实际在深圳(+0800)。
+    // 「周一 00:00」相对哪个时区决定了复活时刻，差一小时就会出现
+    // 「倒计时归零了但还没复活」。这里把时钟的单一事实来源钉死。
+
+    private static func runQuotaCycleClockChecks() {
+        // 1) 默认跟随系统：与改造前行为一致，老 store.json 无需迁移
+        QuotaCycleClock.shared.setTimeZone(nil)
+        check(QuotaCycleClock.shared.timeZone.identifier == TimeZone.current.identifier,
+              "QuotaCycleClock：默认跟随系统时区")
+
+        // 2) 覆盖成 UTC+8 后，倒计时与复活判定必须用同一个日历
+        guard let shanghai = TimeZone(identifier: "Asia/Shanghai") else {
+            check(false, "QuotaCycleClock：Asia/Shanghai 时区应可解析")
+            return
+        }
+        QuotaCycleClock.shared.setTimeZone(shanghai)
+        check(QuotaCycleClock.shared.timeZone.identifier == "Asia/Shanghai",
+              "QuotaCycleClock：可按 TimeZone 覆盖")
+        check(QuotaCycleClock.shared.calendar.timeZone.identifier == "Asia/Shanghai",
+              "QuotaCycleClock：calendar 必须带上覆盖时区（否则 UI 与判定分叉）")
+        check(QuotaCycleClock.shared.calendar.firstWeekday == 2,
+              "QuotaCycleClock：一周之始必须是周一（ISO 8601）")
+
+        // 3) 同一时刻在 +0700 与 +0800 下，下次周界相差整 1 小时 —— 这正是要修的偏移
+        var bangkok = Calendar(identifier: .iso8601)
+        bangkok.timeZone = TimeZone(identifier: "Asia/Bangkok") ?? .current
+        var shanghaiCal = Calendar(identifier: .iso8601)
+        shanghaiCal.timeZone = shanghai
+        let moment = Date(timeIntervalSince1970: 1_785_447_800)
+        let bkkReset = QuotaCycleEngine.nextCalendarWeekReset(now: moment, calendar: bangkok)
+        let shaReset = QuotaCycleEngine.nextCalendarWeekReset(now: moment, calendar: shanghaiCal)
+        if let bkkReset, let shaReset {
+            let drift = abs(bkkReset.timeIntervalSince(shaReset))
+            check(abs(drift - 3600) < 1,
+                  "QuotaCycleClock：+0700 与 +0800 的周界相差正好 1 小时（实测 \(drift) 秒）")
+        } else {
+            check(false, "QuotaCycleClock：两个时区都应算出下次周界")
+        }
+
+        // 4) 按标识符设置；非法标识符返回 false 且不改变现状
+        let before = QuotaCycleClock.shared.timeZone.identifier
+        check(!QuotaCycleClock.shared.setTimeZone(identifier: "Not/AZone"),
+              "QuotaCycleClock：非法时区标识符返回 false")
+        check(QuotaCycleClock.shared.timeZone.identifier == before,
+              "QuotaCycleClock：非法时区标识符不改变现状")
+        check(QuotaCycleClock.shared.setTimeZone(identifier: ""),
+              "QuotaCycleClock：空标识符 = 跟随系统，返回 true")
+        check(QuotaCycleClock.shared.timeZone.identifier == TimeZone.current.identifier,
+              "QuotaCycleClock：空标识符后回到系统时区")
+
+        // 5) 恢复默认，避免污染后续用例
+        QuotaCycleClock.shared.setTimeZone(nil)
+    }
+
+    // MARK: - v2.5.5 引导补丁自愈补强
+    //
+    // v2.5.4 的缺口：把「读不到 app-onboarding.json」一律当成「已完成」，
+    // 于是 Typeless 升级删掉这个文件后补丁永不触发，而它冷启动又会按默认值重建
+    // —— 变回未完成，白等一整轮。这里把「缺失 + 已安装 = 需要补写」钉死。
+
+    private static func runOnboardingSelfHealChecks() {
+        // 1) 状态判定：三种状态必须能区分开，不能把 missing 当成 complete
+        let complete: [String: Any] = ["isCompleted": true, "step": 99]
+        let incompleteByFlag: [String: Any] = ["isCompleted": false, "step": 0]
+        let incompleteByStep: [String: Any] = ["step": 3]
+        let noFields: [String: Any] = ["somethingElse": true]
+
+        check(Self.onboardingIsIncomplete(complete, appInstalled: true) == false,
+              "引导状态：isCompleted=true → 已完成")
+        check(Self.onboardingIsIncomplete(incompleteByFlag, appInstalled: true),
+              "引导状态：isCompleted=false → 未完成")
+        check(Self.onboardingIsIncomplete(incompleteByStep, appInstalled: true),
+              "引导状态：step<99 → 未完成")
+        check(Self.onboardingIsIncomplete(noFields, appInstalled: true),
+              "引导状态：文件在但无完成字段 → 按未完成处理（补写无副作用）")
+
+        // 2) 文件缺失：装了 Typeless 才算需要处理，没装不该误报警
+        check(Self.onboardingIsIncomplete(nil, appInstalled: true),
+              "引导状态：文件缺失 + 已安装 → 需要补写（v2.5.4 在这里漏判）")
+        check(Self.onboardingIsIncomplete(nil, appInstalled: false) == false,
+              "引导状态：文件缺失 + 未安装 → 不误报警")
+
+        // 3) 日志轮转：直接打真实实现（LogFileRotator），不另抄一份逻辑
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("switchboard-log-rotate-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let logURL = dir.appendingPathComponent("rotate-test.log")
+        try? (0..<1000).map { "line-\($0)" }.joined(separator: "\n")
+            .write(to: logURL, atomically: true, encoding: .utf8)
+        check(LogFileRotator.rotate(logURL), "LogFileRotator：1000 行文件应该裁得动")
+        let afterFirst = (try? String(contentsOf: logURL, encoding: .utf8))?
+            .split(separator: "\n", omittingEmptySubsequences: false).count ?? -1
+        check(afterFirst == 500, "LogFileRotator：1000 行裁到 500 行（实测 \(afterFirst)）")
+        check(((try? String(contentsOf: logURL, encoding: .utf8))?.contains("line-999") ?? false),
+              "LogFileRotator：保留的是最近的半截（含 line-999）")
+        check(!((try? String(contentsOf: logURL, encoding: .utf8))?.contains("line-0\n") ?? true),
+              "LogFileRotator：最早的半截已被裁掉")
+
+        // 行数不足保底值（500）时完全不动文件，避免在小日志上反复抖动
+        try? (0..<400).map { "x-\($0)" }.joined(separator: "\n")
+            .write(to: logURL, atomically: true, encoding: .utf8)
+        check(!LogFileRotator.rotate(logURL),
+              "LogFileRotator：400 行 < 保底 500 行，不裁")
+
+        // 4) 超限判定：只有超过 maxBytes 才轮转
+        let small = dir.appendingPathComponent("small.log")
+        try? "tiny".write(to: small, atomically: true, encoding: .utf8)
+        check(!LogFileRotator.rotateIfNeeded(small),
+              "LogFileRotator：小文件不触发轮转")
+
+        // 5) 大文件必须一次调用就砍到上限以下，而不是每次启动只砍一半
+        let huge = dir.appendingPathComponent("huge.log")
+        let payload = (0..<20_000).map { "heavy-log-line-\($0)-padding-padding-padding" }.joined(separator: "\n")
+        try? payload.write(to: huge, atomically: true, encoding: .utf8)
+        let limit: UInt64 = 100 * 1024
+        let hugeBefore = (try? FileManager.default.attributesOfItem(atPath: huge.path)[.size] as? UInt64) ?? 0
+        check(hugeBefore > limit, "LogFileRotator：测试样本本身要超过上限（\(hugeBefore) 字节）")
+        check(LogFileRotator.rotateIfNeeded(huge, maxBytes: limit), "LogFileRotator：超限文件触发轮转")
+        let hugeAfter = (try? FileManager.default.attributesOfItem(atPath: huge.path)[.size] as? UInt64) ?? 0
+        check(hugeAfter <= limit,
+              "LogFileRotator：一次调用就砍到上限以内（\(hugeBefore) → \(hugeAfter) 字节，上限 \(limit)）")
+
+        // 5) 追加写入：自动建目录 + 自动补换行
+        let appended = dir.appendingPathComponent("nested/\(UUID().uuidString)/appended.log")
+        LogFileRotator.append(line: "first", to: appended)
+        LogFileRotator.append(line: "second", to: appended)
+        let appendedText = (try? String(contentsOf: appended, encoding: .utf8)) ?? ""
+        check(appendedText == "first\nsecond\n",
+              "LogFileRotator：append 自动建目录并补换行（得到 \(appendedText.debugDescription)）")
+    }
+
+    /// 与 `SwitchboardStore.desktopOnboardingIsIncomplete()` 同构的判定。
+    /// 单独抄一份是为了能在不开 App 的前提下断言规则；实现改了这里也要跟着改。
+    private static func onboardingIsIncomplete(_ object: [String: Any]?, appInstalled: Bool) -> Bool {
+        guard let object else { return appInstalled }
+        if let done = object["isCompleted"] as? Bool { return !done }
+        if let step = object["step"] as? Int { return step < 99 }
+        return true
+    }
+
 
     // MARK: - v2.5.4 周额度完整生命周期
     //

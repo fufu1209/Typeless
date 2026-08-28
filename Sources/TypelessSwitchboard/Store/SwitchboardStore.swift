@@ -49,6 +49,8 @@ final class SwitchboardStore: ObservableObject {
     // 看门狗与守护开关解耦：不管 isAutoRotateEnabled 开不开都会跑，
     // 且只在本地纯计算，不请求网络、不依赖 node。
     var quotaCycleWatchdogTask: Task<Void, Never>?
+    /// 引导巡检循环（v2.5.5）：5 分钟一轮，Typeless 未运行且引导标记被重置时静默补写。
+    var onboardingGuardTask: Task<Void, Never>?
     /// 最近一次自动复活的时间点（UI 展示用）。
     @Published var lastWeeklyRevivalAt: Date?
     /// 最近一次自动复活了哪些账号（UI 展示用）。

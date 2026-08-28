@@ -12,7 +12,8 @@ extension SwitchboardStore {
 
     func reviveExpiredAccountsIfNeeded(now: Date = Date()) -> [String] {
         let mode = QuotaCycleMode.calendarWeek
-        let calendar = Calendar.current
+        // 与 UI 倒计时、看门狗排程共用同一个日历，避免「倒计时归零但不复活」。
+        let calendar = QuotaCycleClock.shared.calendar
         var revivedEmails: [String] = []
         let now = now
         for index in state.accounts.indices {
@@ -30,6 +31,24 @@ extension SwitchboardStore {
             save()
         }
         return revivedEmails
+    }
+
+    // MARK: - 周期时区（v2.5.5）
+
+    /// 把设置里的时区灌进全局周期时钟。
+    ///
+    /// Typeless 的额度按「周一 00:00」刷新，这个 00:00 相对哪个时区决定了复活时刻。
+    /// 系统时区与本人实际所在时区不一致时会整体偏移，所以允许用户显式指定。
+    /// 设置一改就立刻生效，不必重启 App。
+    func applyQuotaCycleTimeZone() {
+        QuotaCycleClock.shared.setTimeZone(state.settings.quotaCycleTimeZone)
+    }
+
+    /// 改周期时区并落盘。UI 的唯一入口，避免有人改了设置却忘了同步时钟。
+    func setQuotaCycleTimeZoneIdentifier(_ identifier: String) {
+        state.settings.quotaCycleTimeZoneIdentifier = identifier
+        applyQuotaCycleTimeZone()
+        save()
     }
 
     // MARK: - v2.5.4 周额度周期看门狗
@@ -50,13 +69,13 @@ extension SwitchboardStore {
             while !Task.isCancelled {
                 guard let self else { break }
 
-                await MainActor.run { self.performWeeklyRevivalIfNeeded(reason: "周期看门狗") }
+                await MainActor.run { _ = self.performWeeklyRevivalIfNeeded(reason: "周期看门狗") }
 
                 // 睡到下一个周一 00:00（+2 秒余量避开边界抖动），上限 7 天防呆。
                 let waitSeconds = QuotaCycleEngine.secondsUntilReset(
                     now: Date(),
                     mode: .calendarWeek,
-                    calendar: .current
+                    calendar: QuotaCycleClock.shared.calendar
                 )
                 let clamped = min(max(waitSeconds + 2, 60), QuotaCycleEngine.weekSeconds)
                 do {

@@ -19,8 +19,16 @@ APP="TypelessSwitchboard.app"
 STAGE_ROOT="${TYPELESS_SWITCHBOARD_BUILD_ROOT:-$HOME/Library/Caches/TypelessSwitchboard}"
 STAGE="$STAGE_ROOT/$APP"
 
-VERSION_SHORT="2.5.6"
-VERSION_BUILD="8"
+# 版本号从 Core 的单一事实来源解析，避免与代码里的回落值漂移。
+# 以前两处各写一份；裸二进制（CLI 导出配置包 / daemon 巡检）读不到 Info.plist，
+# 会用到代码里的回落值，一旦忘记同步，导出的配置包就带着假版本号。
+APP_VERSION_FILE="Sources/TypelessSwitchboardCore/AppVersion.swift"
+VERSION_SHORT="$(sed -n 's/.*static let short = "\(.*\)".*/\1/p' "$APP_VERSION_FILE" | head -1)"
+VERSION_BUILD="$(sed -n 's/.*static let build = "\(.*\)".*/\1/p' "$APP_VERSION_FILE" | head -1)"
+if [[ -z "$VERSION_SHORT" || -z "$VERSION_BUILD" ]]; then
+  echo "ERROR: 无法从 $APP_VERSION_FILE 解析版本号" >&2
+  exit 1
+fi
 
 swift build -c release
 

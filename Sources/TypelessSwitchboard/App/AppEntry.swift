@@ -55,6 +55,16 @@ enum TypelessSwitchboardMain {
         if CommandLine.arguments.contains("--skip-onboarding") {
             runStandaloneOnboardingPatchAndExit()
         }
+        // v2.5.6：无界面导出配置包，供脚本化备份 / 换机迁移使用。
+        //   --export-full-bundle    真实邮箱 + 完整设置（自用，别外传）
+        //   --export-public-bundle  脱敏版（可分享 / 发 GitHub）
+        // 可选 `--out <目录>`，默认 ~/Downloads。
+        if CommandLine.arguments.contains("--export-full-bundle") {
+            runStandaloneBundleExportAndExit(sanitized: false)
+        }
+        if CommandLine.arguments.contains("--export-public-bundle") {
+            runStandaloneBundleExportAndExit(sanitized: true)
+        }
 
         let mode = SwitchboardStore.resolveRunMode()
         switch mode {
@@ -93,6 +103,32 @@ enum TypelessSwitchboardMain {
         // 让 Task 有机会执行完：交给 runloop。
         RunLoop.main.run()
         exit(0)
+    }
+
+    /// 无界面导出配置包并退出。
+    ///
+    /// 为什么要单独做：换 Mac 迁移、定时备份这类场景应当能脚本化，
+    /// 不能每次都开窗口点按钮。导出物**不含** Keychain 里的密码 / API Key，
+    /// 也不含账号的桌面会话缓存（那东西与设备身份绑定，搬到新机器反而会触发
+    /// 「设备登录用户数超限」）。
+    @MainActor
+    private static func runStandaloneBundleExportAndExit(sanitized: Bool) -> Never {
+        let label = sanitized ? "脱敏配置包" : "完整配置包"
+        print("TypelessSwitchboard: exporting \(label)…")
+        let store = SwitchboardStore(runMode: .daemonOnce)
+        let url = sanitized ? store.exportPublicBundle() : store.exportFullBundle()
+        if let url {
+            print("  已导出：\(url.path)")
+            if sanitized {
+                print("  邮箱已替换为 demo[N]@example.com，notes 已清空，可安全分享")
+            } else {
+                print("  含真实邮箱与完整设置；不含密码 / API Key / 会话缓存")
+            }
+            exit(0)
+        } else {
+            print("  导出失败：\(store.statusMessage)")
+            exit(1)
+        }
     }
 
     @MainActor

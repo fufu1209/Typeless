@@ -301,9 +301,13 @@ extension SwitchboardStore {
     }
 
     private func appVersionString() -> String {
-        if let s = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+        // 打进 .app 时以 Info.plist 为准（它会带上构建号）；
+        // 裸二进制（CLI 导出 / daemon 巡检）读不到 Info.plist，
+        // 回落到 Core 的 AppVersion —— 不再有第二处硬编码跟着漂移。
+        if let s = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+           !s.isEmpty {
             return s
         }
-        return "2.0.0"
+        return AppVersion.short
     }
 }

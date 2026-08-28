@@ -2097,6 +2097,16 @@ struct OperationalFeatureChecks {
     /// 用户原问：「换一台 Mac 装好程序直接导入就能用」+「公开版与私密版」。
     /// 验证 ConfigurationBundle 的序列化、脱敏、schema 校验。
     private static func runConfigurationBundleChecks() {
+        // 0) 版本号必须是单一事实来源且格式合法。
+        //    build-app.sh 从这里解析版本号写进 Info.plist，代码读不到 Info.plist 时
+        //    也回落到这里 —— 写错格式会让两边同时失效。
+        let versionParts = AppVersion.short.split(separator: ".").map(String.init)
+        check(versionParts.count == 3, "版本号：必须是 主.次.修 三段（实测 \(AppVersion.short)）")
+        check(versionParts.allSatisfy { Int($0) != nil }, "版本号：每段都要是数字（\(AppVersion.short)）")
+        check(Int(AppVersion.build) != nil, "构建号：必须是数字（\(AppVersion.build)）")
+        check(AppVersion.full.contains(AppVersion.short) && AppVersion.full.contains(AppVersion.build),
+              "版本号：完整串要含版本与构建号（\(AppVersion.full)）")
+
         // 1) 完整包往返：encode → decode 必须无损
         let originalAccounts = [
             ConfigurationBundleAccount(

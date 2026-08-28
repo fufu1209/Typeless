@@ -16,7 +16,21 @@
 6. v2.5.0 架构拆分（main.swift 7497 → 模块化）✅
 7. **v2.5.3** 新手引导回归修复 + 下次可用接线 + 单实例锁 ✅ aa89300
 8. **v2.5.4** 周期看门狗 + 启动自愈引导 + 旧副本清理 ✅ 07f7f54
-9. **v2.5.5** 引导补丁补强 + 周期时区可配 + 日志轮转 ✅ **205f5c6（当前版本）**
+9. **v2.5.5** 引导补丁补强 + 周期时区可配 + 日志轮转 ✅ 205f5c6
+10. **v2.5.6** 补丁收成单一入口 + 改时区不用重启 ✅ **7f11893（当前版本）**
+
+### v2.5.6 关键代码定位
+- `Store/SwitchboardStore+OnboardingPatch.swift`
+  **`ensureOnboardingCompleted(reason:mode:)` 是全工程唯一该被调用的入口**，
+  模式 `.silent`（Typeless 在跑就不写，只点亮横幅）/ `.interactive`（可退出重启）。
+  `autoHealDesktopOnboardingIfSafe` / `skipTypelessDesktopOnboardingNow` /
+  `completeTypelessDesktopOnboardingIfPresent` 都只是它的包装。
+  `writeTypelessDesktopOnboardingFiles` 是低级原语，**只**给无感换号
+  （拉起 Typeless 之前必须同步写盘）用，其余场景一律走统一入口
+- `QuotaCycleEngine.watchdogSleepSeconds(...)` 休眠上限 **1 小时**（不是睡到周一），
+  每轮重新校准周界 → 改时区 / 出差 / 夏令时 / NTP 校时都能 1 小时内自纠
+- 周期时区在 **`Store.init`** 里生效（`applyQuotaCycleTimeZone`），
+  不在 AppDelegate —— LaunchAgent 守护是独立进程，也必须带上设置
 
 ### v2.5.5 关键代码定位
 - `Sources/TypelessSwitchboardCore/QuotaCycleClock.swift`（新）
@@ -142,3 +156,13 @@
   引导补丁只在「Typeless 没在运行」时才允许写盘，而 Typeless 基本常开
   → 写盘路径测试覆盖率为零，每次改动只能靠读日志猜。
   判断标准：函数里混了「读外部状态」和「算/写结果」，就把后半段抽成注入式纯函数
+- **「补丁」思维要警惕：同一件事有多个入口各自实现一遍，就是补丁堆积的根源**。
+  引导补丁曾有 3 套并行 API 各写各的写盘逻辑，备份/校验/补 storage 复制三份，
+  改一处漏一处。收敛办法：定义唯一入口 + 用枚举区分模式（silent/interactive），
+  旧 API 降级为包装，低级原语只留给真正需要绕过的场景（如拉起前必须同步写盘）
+- **周期性任务的休眠时长不能算一次就睡到底**：睡到「下周一」看着精确，
+  但中途任何改变周界的事件（改时区 / 跨时区出差 / 夏令时 / NTP 校时）
+  都要等到下一轮才生效，而下一轮可能是一周后。要设休眠上限，让排程定期自校准
+- **多会话共改同一 worktree 时，动手前先 `git status` + `git diff`**：
+  v2.5.6 接手时工作区已有并发会话的半成品（含一个编译错误），
+  没先看就改会覆盖别人的工作；先看清楚再补完，比另起炉灶强

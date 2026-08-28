@@ -804,12 +804,65 @@ struct OperationalFeatureChecks {
             "生命周期：跨年后新一周应复活（ISO 周复合 key 正确）"
         )
 
-        // 10) 看门狗排程：等待时长必须落在合理区间
+        // 10) 看门狗排程：直接打真实函数（QuotaCycleEngine.watchdogSleepSeconds）
         let wait = QuotaCycleEngine.secondsUntilReset(now: tuesday, mode: .calendarWeek, calendar: cal)
         check(wait > 0, "看门狗：等待时长必须为正")
         check(wait <= QuotaCycleEngine.weekSeconds, "看门狗：等待时长不超过 7 天")
-        let clamped = min(max(wait + 2, 60), QuotaCycleEngine.weekSeconds)
-        check(clamped >= 60, "看门狗：最小间隔 60 秒，避免边界抖动时空转")
+
+        let sleep = QuotaCycleEngine.watchdogSleepSeconds(now: tuesday, mode: .calendarWeek, calendar: cal)
+        check(sleep >= QuotaCycleEngine.watchdogMinSleepSeconds,
+              "看门狗：休眠不低于下限 60 秒（实测 \(sleep)）")
+        // v2.5.6：上限从「一路睡到周一」压到 1 小时。睡太久的话，
+        // 中途改时区 / 跨时区出差 / 夏令时切换都要等到下一轮才生效，而下一轮可能是一周后。
+        check(sleep <= QuotaCycleEngine.watchdogMaxSleepSeconds,
+              "看门狗：休眠不超过上限 1 小时（实测 \(sleep)）")
+        check(QuotaCycleEngine.watchdogMaxSleepSeconds == 3_600,
+              "看门狗：上限必须是 1 小时（否则时区切换无法及时生效）")
+
+        // 边界：恰好踩在周一 00:00 时也要落进合法区间，不能算出 0 或负数
+        let mondayReset = cal.date(from: DateComponents(year: 2026, month: 8, day: 31, hour: 0, minute: 0, second: 0))!
+        let atBoundary = QuotaCycleEngine.watchdogSleepSeconds(now: mondayReset, mode: .calendarWeek, calendar: cal)
+        check(atBoundary >= QuotaCycleEngine.watchdogMinSleepSeconds,
+              "看门狗：踩在周界上也不会空转（实测 \(atBoundary)）")
+
+        // 临近周界时，时区必须真的影响排程（这时上限还没生效，差异看得见）。
+        // 取「距离下周一 00:00 +0800 还有 30 分钟」这一刻：
+        // +0800 只需再睡 30 分钟；+0700 要睡 90 分钟，被上限夹到 60 分钟。
+        // 这正是用户担心的「时间节点有很大影响」—— 选错时区就晚整整一小时。
+        var shanghaiCal2 = Calendar(identifier: .iso8601)
+        shanghaiCal2.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        var bangkokCal2 = Calendar(identifier: .iso8601)
+        bangkokCal2.timeZone = TimeZone(identifier: "Asia/Bangkok") ?? .current
+        let nearBoundary = shanghaiCal2.date(
+            from: DateComponents(year: 2026, month: 8, day: 30, hour: 23, minute: 30)
+        )!
+        let sleepSH = QuotaCycleEngine.watchdogSleepSeconds(now: nearBoundary, mode: .calendarWeek, calendar: shanghaiCal2)
+        let sleepBK = QuotaCycleEngine.watchdogSleepSeconds(now: nearBoundary, mode: .calendarWeek, calendar: bangkokCal2)
+        check(abs(sleepSH - 1_802) < 1,
+              "看门狗：+0800 距周界 30 分钟就睡 30 分钟（实测 \(sleepSH)）")
+        check(abs(sleepBK - QuotaCycleEngine.watchdogMaxSleepSeconds) < 1,
+              "看门狗：+0700 距周界 90 分钟，被上限夹到 1 小时（实测 \(sleepBK)）")
+        check(sleepSH < sleepBK,
+              "看门狗：选对时区能更早醒（+0800 \(sleepSH)s < +0700 \(sleepBK)s）")
+
+        // v2.5.6：改时区必须**不用重启 App**。三件事都得当场生效，少一件就会出现
+        // 「UI 显示变了但复活时刻没变」——用户明确问过这个点。
+        // 1) 全局时钟立刻换掉（倒计时 / 复活判定读的就是它）；
+        QuotaCycleClock.shared.setTimeZone(TimeZone(identifier: "Asia/Shanghai"))
+        check(QuotaCycleClock.shared.calendar.timeZone.identifier == "Asia/Shanghai",
+              "切时区：全局时钟当场更换，倒计时无需重启")
+        // 2) 同一时刻的倒计时口径确实变了；
+        let beforeCountdown = QuotaCycleEngine.secondsUntilReset(now: nearBoundary, calendar: bangkokCal2)
+        let afterCountdown = QuotaCycleEngine.secondsUntilReset(now: nearBoundary, calendar: QuotaCycleClock.shared.calendar)
+        check(abs(beforeCountdown - afterCountdown - 3_600) < 1,
+              "切时区：倒计时当场偏移 1 小时（\(beforeCountdown) → \(afterCountdown) 秒）")
+        // 3) 看门狗重排：休眠上限 1 小时保证任何排程偏差最多 1 小时就被纠正，
+        //    不会像旧实现那样一路睡到周一、改了设置要等一周。
+        check(QuotaCycleEngine.watchdogMaxSleepSeconds <= 3_600,
+              "切时区：看门狗休眠上限 ≤1 小时，排程偏差最多 1 小时自动纠正")
+        QuotaCycleClock.shared.setTimeZone(nil)
+        check(QuotaCycleClock.shared.timeZone.identifier == TimeZone.current.identifier,
+              "切时区：传 nil 回到跟随系统")
     }
 
     // MARK: - v2.5.3 「下次可用」文案

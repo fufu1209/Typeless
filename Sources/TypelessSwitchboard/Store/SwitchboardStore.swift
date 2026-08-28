@@ -90,6 +90,10 @@ final class SwitchboardStore: ObservableObject {
             state = .empty
         }
         migrateDefaultsIfNeeded()
+        // v2.5.5：周期时区必须在**所有运行模式**下生效，不能只挂在 GUI 的 AppDelegate 上。
+        // LaunchAgent 守护（--daemon-check）是独立进程，它也要按同一个时区算周界，
+        // 否则会出现「App 里显示该复活了，插件巡检却认为还没到点」。
+        applyQuotaCycleTimeZone()
         ensureExtractScript()
         refreshLaunchAgentStatus()
 

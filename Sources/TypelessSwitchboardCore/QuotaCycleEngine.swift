@@ -88,6 +88,32 @@ public enum QuotaCycleEngine {
     public static let defaultWeeklyLimit = 8000
     public static let weekSeconds: TimeInterval = 7 * 24 * 60 * 60
 
+    // MARK: - 看门狗排程
+
+    /// 单轮休眠上限（秒）。
+    ///
+    /// 到点会重新计算下一次周界，所以设成 1 小时**不等于**「每小时复活一次」，
+    /// 只是每小时重新校准一次排程 —— 没跨周时复活逻辑什么都不会做。
+    ///
+    /// 这么设是为了让下面这些情况都能自愈，而不是卡到下一周：
+    /// 用户在设置里切换周期时区、笔记本跨时区出差、夏令时切换、系统时钟被 NTP 校正。
+    /// 曾经是一路睡到周一，结果改了时区要等整整一周才生效。
+    public static let watchdogMaxSleepSeconds: TimeInterval = 3_600
+    /// 单轮休眠下限（秒），避免边界抖动时空转打满 CPU。
+    public static let watchdogMinSleepSeconds: TimeInterval = 60
+
+    /// 看门狗这一轮该睡多久：睡到下个周界，再夹到 [下限, 上限]。
+    /// +2 秒余量是为了避开「刚好卡在 00:00:00」的边界抖动。
+    public static func watchdogSleepSeconds(
+        now: Date = Date(),
+        mode: QuotaCycleMode = .calendarWeek,
+        lastResetAt: Date? = nil,
+        calendar: Calendar = .current
+    ) -> TimeInterval {
+        let wait = secondsUntilReset(now: now, mode: mode, lastResetAt: lastResetAt, calendar: calendar)
+        return min(max(wait + 2, watchdogMinSleepSeconds), watchdogMaxSleepSeconds)
+    }
+
     // MARK: - 距离下次刷新
 
     /// 距离下一个额度刷新还有几天（向上取整，最小 0）。

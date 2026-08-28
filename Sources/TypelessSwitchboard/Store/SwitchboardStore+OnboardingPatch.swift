@@ -56,43 +56,72 @@ extension SwitchboardStore {
         return raw.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - 主入口（fail-safe）
+    // MARK: - 统一入口（v2.5.6）
+    //
+    // 以前有三套并行 API：`autoHealDesktopOnboardingIfSafe`（启动自愈）、
+    // `skipTypelessDesktopOnboardingNow`（手动跳过）、
+    // `completeTypelessDesktopOnboardingIfPresent`（换号后补写），
+    // 各自判断状态、各自决定能不能写、各自记日志 —— 行为容易分叉，
+    // 而且 8 个调用点里每新增一条代码路径，都要记得挑一个来调，漏一处用户就看到引导。
+    //
+    // 现在收成一个入口：调用方只声明「我要确保引导完成」+「允不允许重启 Typeless」，
+    // 剩下的（要不要写、能不能写、写完验不验、记什么日志）全在这里决定。
+    // 加上 5 分钟一轮的巡检，即便某条新路径忘了调用，状态也会被拉回来。
 
-    /// 跳过 / 完成 Typeless 桌面端新手引导。
-    ///
-    /// 与旧实现的关键差别：**不再因为邮箱不匹配而整段放弃**。
-    /// - `app-onboarding.json`（App 级）无条件写；
-    /// - `app-storage.json`（账号级）按「桌面端当前实际登录的邮箱」写；
-    /// - 若 `expectedEmail` 与实际的确有出入，只记一条提示日志，补丁照打。
+    /// 触发方式。
+    enum OnboardingEnforcement {
+        /// 静默：Typeless 正在跑就一个字都不写，只把横幅点亮等用户点。
+        /// 用于启动自愈和巡检 —— 绝不打扰。
+        case silent
+        /// 交互：允许「退出 Typeless → 写盘 → 重启」。用户主动点的按钮 / CLI 走这条。
+        case interactive
+    }
+
+    /// 确保 Typeless 桌面端的新手引导处于完成态。**这是全工程唯一该被调用的入口。**
     ///
     /// - Parameters:
-    ///   - expectedEmail: 期望桌面端登录的账号；传 nil 表示「不管是谁，跳过引导即可」。
-    ///   - timeoutSeconds: 等待桌面端落到某个登录态的超时。
-    ///   - stopAndRelaunch: 是否先退出 Typeless 再重启。写盘前必须退出，
-    ///     否则 Electron 退出时会用内存态覆盖掉我们刚写的文件。
+    ///   - reason: 只进日志，例如「启动自愈」「手动跳过」「无感换号」。
+    ///   - mode: `.silent` 遇到 Typeless 在跑会直接放弃；`.interactive` 会退出再重启。
+    ///   - expectedEmail: 期望登录的账号。传 nil = 不管是谁，跳过引导即可（fail-safe）。
+    ///     即便传了值，与实际登录的不一致时也**照打不误**，只多记一条提示 ——
+    ///     `app-onboarding.json` 是 App 级配置，与账号无关，不存在串号风险。
+    ///   - waitForLoginSeconds: 传了 `expectedEmail` 时，等待桌面端落到该登录态的超时。
+    /// - Returns: 给 UI 展示的日志行。
     @discardableResult
-    func patchTypelessDesktopOnboarding(
-        expectedEmail: String?,
-        timeoutSeconds: TimeInterval = 60,
-        stopAndRelaunch: Bool = true
+    func ensureOnboardingCompleted(
+        reason: String,
+        mode: OnboardingEnforcement,
+        expectedEmail: String? = nil,
+        waitForLoginSeconds: TimeInterval = 60
     ) async -> [String] {
         let storageURL = typelessStorageURL()
         let onboardingURL = typelessOnboardingURL()
         var log: [String] = []
 
-        // 1) 先退 Typeless。它退出时会把内存态 flush 回磁盘，
-        //    所以必须退出**之后**再写文件，否则写的内容会被覆盖。
-        if stopAndRelaunch {
+        // 1) 已经完成就直接返回。这是绝大多数情况下的路径，必须便宜。
+        guard desktopOnboardingIsIncomplete() else {
+            desktopOnboardingNeedsPatch = false
+            return []
+        }
+
+        // 2) Typeless 在跑时**不能写**：它内存里持有未完成状态，
+        //    退出时会把我们写的值 flush 覆盖回去，白写还可能造成状态打架。
+        if typelessDesktopIsRunning() {
+            guard mode == .interactive else {
+                desktopOnboardingNeedsPatch = true
+                appendOnboardingPatchLog("\(reason)：Typeless 正在运行，静默模式不写盘，等待用户处理")
+                return []
+            }
             log.append(await terminateInstalledTypelessApp())
             try? await Task.sleep(nanoseconds: 1_500_000_000)
         }
 
-        // 2) 等桌面端落到某个登录态（已退出时直接读盘，通常首轮就命中）。
+        // 3) 等桌面端落到某个登录态（已退出时直接读盘，通常首轮就命中）。
         let readiness = await waitForTypelessDesktopStorage(
             storageURL: storageURL,
             onboardingURL: onboardingURL,
             expectedEmail: expectedEmail ?? "",
-            timeoutSeconds: expectedEmail == nil ? 2 : timeoutSeconds
+            timeoutSeconds: expectedEmail == nil ? 2 : waitForLoginSeconds
         )
         let actualEmail = readiness.email ?? readTypelessDesktopEmail(from: storageURL)
 
@@ -102,16 +131,17 @@ extension SwitchboardStore {
             log.append("提示：桌面端当前登录的是 \(actual)，与预期的 \(expected) 不一致；按当前实际登录账号跳过新手引导")
         }
 
-        // 3) 写两个文件。失败不再静默，逐条记日志。
-        log.append(contentsOf: writeTypelessDesktopOnboardingFiles(
+        // 4) 真正写盘（备份 → 写 → 回读校验 → 补 storage 的 is_new_user）。
+        log.append(contentsOf: performOnboardingWrite(
             storageURL: storageURL,
             onboardingURL: onboardingURL,
-            expectedEmail: actualEmail
+            expectedEmail: actualEmail,
+            reason: reason
         ))
 
-        // 4) 重启 + 重试加固。Typeless 冷启动会按 is_new_user 重新初始化 onboarding 片段，
-        //    所以启动后再补写若干轮，确保最终态稳定。
-        if stopAndRelaunch {
+        // 5) 交互模式重启并复核若干轮 —— Typeless 冷启动会按 is_new_user
+        //    重新初始化 onboarding 片段，只写一次可能被它改回去。
+        if mode == .interactive {
             if let path = typelessAppPath() {
                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 await enforceTypelessDesktopOnboardingPatchAfterRelaunch(
@@ -125,68 +155,100 @@ extension SwitchboardStore {
             }
         }
 
+        // 6) 复查，让 UI 横幅立刻反映真实状态。
+        desktopOnboardingNeedsPatch = desktopOnboardingIsIncomplete()
+        log.append(desktopOnboardingNeedsPatch
+                   ? "复查：仍未生效，可关闭 Typeless 后再点一次"
+                   : "复查：引导已完成标记已生效")
+        return log
+    }
+
+    /// 写盘本体：备份 → 写 → 回读校验 → 补 `app-storage.json`。
+    /// 只在确认「现在写是安全的」之后调用，判断逻辑不在这里。
+    @discardableResult
+    func performOnboardingWrite(
+        storageURL: URL,
+        onboardingURL: URL,
+        expectedEmail: String?,
+        reason: String
+    ) -> [String] {
+        var log: [String] = ["已写入桌面端新手引导完成标记（app-onboarding.json）"]
+        backupDesktopOnboardingFileIfNeeded(onboardingURL)
+
+        do {
+            try writeTypelessOnboardingCompletion(to: onboardingURL)
+        } catch {
+            log.append("写入 app-onboarding.json 失败：\(error.localizedDescription)")
+            appendOnboardingPatchLog("\(reason)：写 app-onboarding.json 失败 — \(error.localizedDescription)")
+            return log
+        }
+
+        // 回读校验：写成功不等于生效。磁盘满、权限、Typeless 退出 flush 都可能让写入落空。
+        guard !desktopOnboardingIsIncomplete() else {
+            log.append("回读校验失败：写入后仍不是完成态，请检查 Typeless 数据目录权限")
+            appendOnboardingPatchLog("\(reason)：回读校验失败，请检查 ~/Library/Application Support/Typeless 权限")
+            return log
+        }
+
+        // app-storage.json 是 best-effort：is_new_user 是服务端真值、联网会被覆盖，
+        // 但 Typeless 没在跑时补写，能让它冷启动第一次读盘就判定为非新用户。
+        do {
+            try writeTypelessStorageOnboardingCompletion(to: storageURL, expectedEmail: expectedEmail)
+            // 口径必须诚实：实测 7 个平台里只有 macos 站得住，其余会被服务端打回。
+            // 真正决定「弹不弹引导」的是 app-onboarding.json，那才是持久的。
+            log.append("已标记非新用户（is_new_user=false）；该字段联网后会被服务端覆盖，持久的是 app-onboarding.json")
+        } catch {
+            log.append("app-storage.json 跳过（\(error.localizedDescription)）")
+        }
+
+        appendOnboardingPatchLog("\(reason)：已确保引导完成")
         return log
     }
 
     /// 只写文件、不做任何进程控制。
     ///
-    /// 无感换号在「写入会话缓存之后、拉起 Typeless 之前」调用它，
-    /// 让 Typeless 冷启动第一次读盘就是「非新用户」，从而完全不出现新手引导。
+    /// 这是**低级原语**，只给「必须在拉起 Typeless 之前同步写盘」的场景用
+    /// （无感换号：写入会话缓存之后、拉起之前）。其余场景一律走
+    /// `ensureOnboardingCompleted(reason:mode:)`，它会替你判断能不能写。
     @discardableResult
     func writeTypelessDesktopOnboardingFiles(
         storageURL: URL,
         onboardingURL: URL,
         expectedEmail: String?
     ) -> [String] {
-        var log: [String] = []
-
+        backupDesktopOnboardingFileIfNeeded(onboardingURL)
         do {
             try writeTypelessOnboardingCompletion(to: onboardingURL)
-            log.append("已写入桌面端新手引导完成标记（app-onboarding.json）")
         } catch {
-            log.append("写入 app-onboarding.json 失败：\(error.localizedDescription)")
+            return ["写入 app-onboarding.json 失败：\(error.localizedDescription)"]
         }
-
         do {
             try writeTypelessStorageOnboardingCompletion(to: storageURL, expectedEmail: expectedEmail)
-            let who = expectedEmail ?? "当前登录账号"
-            // 口径必须诚实：userData 是服务端真值，联网后会被同步覆盖，
-            // 实测 7 个平台里只有 macos 站得住，其余 6 个会被打回 false。
-            // 真正决定「弹不弹引导」的是 app-onboarding.json，那才是持久的。
-            log.append("已把 \(who) 标记为非新用户（is_new_user=false）；注意该字段联网后会被服务端同步覆盖，真正持久的是 app-onboarding.json")
         } catch {
-            log.append("写入 app-storage.json 失败：\(error.localizedDescription)")
+            // best-effort：缺 userData（从未登录）不算失败。
         }
-
-        return log
+        return ["已写入桌面端引导完成标记（app-onboarding.json + app-storage.json）"]
     }
 
-    /// 一键换号流程的向后兼容入口（AutomaticReplacement.swift 调用）。
-    /// 行为等价于新的 fail-safe 实现。
+    /// 全自动换号流程入口。换号后新号是全新用户，必须把引导走完。
     func completeTypelessDesktopOnboardingIfPresent(expectedEmail: String, timeoutSeconds: TimeInterval = 60) async -> [String] {
-        await patchTypelessDesktopOnboarding(
+        await ensureOnboardingCompleted(
+            reason: "全自动换号",
+            mode: .interactive,
             expectedEmail: expectedEmail,
-            timeoutSeconds: timeoutSeconds,
-            stopAndRelaunch: true
+            waitForLoginSeconds: timeoutSeconds
         )
     }
 
     /// 独立入口：不管当前登录的是哪个号，直接跳过新手引导。
-    /// 供「自检排障 / 换号」页的一键按钮使用，不依赖换号流程。
+    /// 供顶部横幅 / 账号详情 / 自检排障三个按钮使用，不依赖换号流程。
     @discardableResult
     func skipTypelessDesktopOnboardingNow() async -> [String] {
         var log = ["开始跳过 Typeless 桌面端新手引导…"]
-        log.append(contentsOf: await patchTypelessDesktopOnboarding(
-            expectedEmail: nil,
-            timeoutSeconds: 2,
-            stopAndRelaunch: true
+        log.append(contentsOf: await ensureOnboardingCompleted(
+            reason: "手动跳过",
+            mode: .interactive
         ))
-        // 打完立刻复查，让 UI 横幅能马上消失。
-        let stillNeeded = desktopOnboardingIsIncomplete()
-        await MainActor.run { desktopOnboardingNeedsPatch = stillNeeded }
-        log.append(stillNeeded
-                   ? "复查：仍未生效，可关闭 Typeless 后再点一次"
-                   : "复查：引导已完成标记已生效")
         return log
     }
 
@@ -252,46 +314,25 @@ extension SwitchboardStore {
         }
     }
 
-    /// 启动自愈：只在「Typeless 没在跑」时静默写引导标记，完全不打扰用户。
+    /// 启动自愈 / 巡检：只在「Typeless 没在跑」时静默写引导标记，完全不打扰用户。
     ///
     /// Typeless 正在跑时**不写** —— 它内存里持有 isCompleted=false，
     /// 退出时会把我们写的值覆盖回去，白写还可能造成状态打架。
     /// 那种情况改由顶部横幅提示用户点一下，走完整的「退出 → 写盘 → 重启」流程。
     ///
-    /// v2.5.5 补了三件事：写前留一份原始备份、写完回读校验、顺带补 `app-storage.json`。
+    /// v2.5.6：这里不再自带一套写盘逻辑，改为走统一入口的 `.silent` 模式。
+    /// 以前静默路径和手动路径各写各的（备份 / 校验 / 补 storage 三件事复制了两份），
+    /// 改一处容易漏另一处 —— 那正是用户说的「补丁越打越多」的根源。
+    /// - Returns: 是否真的写了盘。
     @discardableResult
-    func autoHealDesktopOnboardingIfSafe() -> Bool {
-        guard desktopOnboardingIsIncomplete() else { return false }
-        guard !typelessDesktopIsRunning() else { return false }
-
-        let onboardingURL = typelessOnboardingURL()
-        backupDesktopOnboardingFileIfNeeded(onboardingURL)
-
-        do {
-            try writeTypelessOnboardingCompletion(to: onboardingURL)
-        } catch {
-            appendOnboardingPatchLog("自愈失败（app-onboarding.json）：\(error.localizedDescription)")
+    func autoHealDesktopOnboardingIfSafe() async -> Bool {
+        guard desktopOnboardingIsIncomplete() else {
+            desktopOnboardingNeedsPatch = false
             return false
         }
-
-        // 回读校验：写成功不等于生效。磁盘满、权限、Typeless 退出时 flush 都可能让写入落空。
-        guard !desktopOnboardingIsIncomplete() else {
-            appendOnboardingPatchLog("自愈校验失败：写入后读回仍不是完成态，请检查 ~/Library/Application Support/Typeless 目录权限")
-            return false
-        }
-
-        // app-storage.json 是 best-effort：is_new_user 是服务端真值、联网会被覆盖，
-        // 但 Typeless 没在跑时补写，能让它冷启动第一次读盘就判定为非新用户。
-        // 从未登录（没有 userData）时直接跳过，不算失败。
-        do {
-            try writeTypelessStorageOnboardingCompletion(to: typelessStorageURL(), expectedEmail: nil)
-            appendOnboardingPatchLog("自愈完成：Typeless 未运行，已静默写入引导完成标记（app-onboarding.json + app-storage.json）")
-        } catch {
-            appendOnboardingPatchLog("自愈完成：已写入 app-onboarding.json；app-storage.json 跳过（\(error.localizedDescription)）")
-        }
-
-        desktopOnboardingNeedsPatch = desktopOnboardingIsIncomplete()
-        return true
+        await ensureOnboardingCompleted(reason: "静默自愈", mode: .silent)
+        // ensureOnboardingCompleted 已经把 desktopOnboardingNeedsPatch 刷新过了。
+        return !desktopOnboardingNeedsPatch
     }
 
     /// 首次改写前留一份原文件，万一补丁把状态写坏了能手动还原。
@@ -310,14 +351,13 @@ extension SwitchboardStore {
     func startOnboardingGuardIfNeeded() {
         guard onboardingGuardTask == nil else { return }
         let interval = Self.onboardingGuardIntervalSeconds
-        onboardingGuardTask = Task { [weak self] in
+        // 显式 @MainActor：Store 是 MainActor 隔离的，标明之后循环体里可以直接 await，
+        // 不用再套 MainActor.run（它的闭包是同步的，塞不进 async 调用）。
+        onboardingGuardTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 guard let self, !Task.isCancelled else { break }
-                await MainActor.run {
-                    _ = self.autoHealDesktopOnboardingIfSafe()
-                    self.desktopOnboardingNeedsPatch = self.desktopOnboardingIsIncomplete()
-                }
+                _ = await self.autoHealDesktopOnboardingIfSafe()
             }
         }
     }

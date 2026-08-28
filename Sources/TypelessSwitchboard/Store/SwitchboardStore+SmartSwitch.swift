@@ -45,9 +45,16 @@ extension SwitchboardStore {
     }
 
     /// 改周期时区并落盘。UI 的唯一入口，避免有人改了设置却忘了同步时钟。
+    ///
+    /// 三条必须一起做，少一条就会出现「UI 变了但实际没变」：
+    /// 1. 灌进全局时钟（倒计时 / 复活判定的口径）；
+    /// 2. 重启看门狗（它睡的是上一轮算好的旧时长）；
+    /// 3. 落盘。
+    /// 全程不需要重启 App。
     func setQuotaCycleTimeZoneIdentifier(_ identifier: String) {
         state.settings.quotaCycleTimeZoneIdentifier = identifier
         applyQuotaCycleTimeZone()
+        restartQuotaCycleWatchdogIfRunning()
         save()
     }
 
@@ -62,7 +69,11 @@ extension SwitchboardStore {
     ///
     /// 看门狗做两件事：
     /// 1. 启动立刻复活一次（覆盖「周末没开 App」）；
-    /// 2. 精确睡到下一个周一 00:00 再复活，然后重新排程（覆盖「App 一直开着跨过周界」）。
+    /// 2. 睡到下一个周一 00:00 再复活，然后重新排程（覆盖「App 一直开着跨过周界」）。
+    ///
+    /// 休眠**上限 1 小时**而不是一路睡到周一，原因见 `watchdogMaxSleepSeconds`：
+    /// 睡太久的话，中途任何让「周一 00:00」发生变化的事件（改时区、跨时区出差、
+    /// 夏令时切换、系统时钟被 NTP 校正）都要等到下一轮才生效，而下一轮可能是一周后。
     func startQuotaCycleWatchdogIfNeeded() {
         guard quotaCycleWatchdogTask == nil else { return }
         quotaCycleWatchdogTask = Task { [weak self] in
@@ -71,15 +82,14 @@ extension SwitchboardStore {
 
                 await MainActor.run { _ = self.performWeeklyRevivalIfNeeded(reason: "周期看门狗") }
 
-                // 睡到下一个周一 00:00（+2 秒余量避开边界抖动），上限 7 天防呆。
-                let waitSeconds = QuotaCycleEngine.secondsUntilReset(
+                // 睡到下一个周一 00:00，但上限 1 小时 —— 见 watchdogSleepSeconds 的说明。
+                let sleepSeconds = QuotaCycleEngine.watchdogSleepSeconds(
                     now: Date(),
                     mode: .calendarWeek,
                     calendar: QuotaCycleClock.shared.calendar
                 )
-                let clamped = min(max(waitSeconds + 2, 60), QuotaCycleEngine.weekSeconds)
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(clamped * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
                 } catch {
                     break
                 }
@@ -90,6 +100,17 @@ extension SwitchboardStore {
     func stopQuotaCycleWatchdog() {
         quotaCycleWatchdogTask?.cancel()
         quotaCycleWatchdogTask = nil
+    }
+
+    /// 改了周期口径（目前只有时区）之后重新排程。
+    ///
+    /// 看门狗的休眠时长是**上一轮算好的**，改时区后不重排，它会继续睡到
+    /// 旧时区的周一 00:00 —— 从 +0700 切到 +0800 就是整整晚一小时。
+    /// 重启后循环体第一件事就是按新日历复活一次，等于立刻生效。
+    func restartQuotaCycleWatchdogIfRunning() {
+        guard quotaCycleWatchdogTask != nil else { return }
+        stopQuotaCycleWatchdog()
+        startQuotaCycleWatchdogIfNeeded()
     }
 
     /// 复活并把结果同步到 UI 状态。所有入口（启动 / 看门狗 / 同步 / 手动）都走这里，

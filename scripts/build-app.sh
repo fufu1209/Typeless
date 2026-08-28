@@ -19,8 +19,8 @@ APP="TypelessSwitchboard.app"
 STAGE_ROOT="${TYPELESS_SWITCHBOARD_BUILD_ROOT:-$HOME/Library/Caches/TypelessSwitchboard}"
 STAGE="$STAGE_ROOT/$APP"
 
-VERSION_SHORT="2.5.5"
-VERSION_BUILD="6"
+VERSION_SHORT="2.5.6"
+VERSION_BUILD="7"
 
 swift build -c release
 

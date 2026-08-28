@@ -418,29 +418,13 @@ final class SwitchboardStore: ObservableObject {
         let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
         self.fileURL = folder.appendingPathComponent("store.json")
 
-        do {
-            let data = try Data(contentsOf: fileURL)
-            state = try JSONDecoder.appDecoder.decode(PersistedState.self, from: data)
-        } catch {
-            // P0-2：解码失败不能静默吞错 + 落盘成空 state，否则 Keychain 里的密码永久找不到。
-            // 先把损坏文件备份到 store.json.corrupted-<时间戳>，再置空，让用户从 UI 看到错误。
-            let timestamp = Self.storeCorruptedTimestamp(Date())
-            let backupURL = fileURL.deletingLastPathComponent()
-                .appendingPathComponent("store.json.corrupted-\(timestamp)")
-            let backupError: Error?
-            do {
-                if FileManager.default.fileExists(atPath: backupURL.path) {
-                    try FileManager.default.removeItem(at: backupURL)
-                }
-                try FileManager.default.moveItem(at: fileURL, to: backupURL)
-                backupError = nil
-            } catch let moveError {
-                backupError = moveError
-            }
-            let backupNote = backupError == nil
-                ? "已备份为 \(backupURL.lastPathComponent)"
-                : "备份损坏文件失败：\(backupError!.localizedDescription)"
-            accountLoadError = "无法读取账号池（\(backupNote)）：\(error.localizedDescription)"
+        // P0-2：解码失败不能静默吞错 + 落盘成空 state，否则 Keychain 里的密码永久找不到。
+        // 先把损坏文件备份到 store.json.corrupted-<时间戳>，再置空，让用户从 UI 看到错误。
+        switch StoreRecovery.load(from: fileURL, decode: { try JSONDecoder.appDecoder.decode(PersistedState.self, from: $0) }) {
+        case .success(let loaded):
+            state = loaded
+        case .failure(let recovery):
+            accountLoadError = recovery.message
             state = .empty
         }
         migrateDefaultsIfNeeded()
@@ -4494,15 +4478,6 @@ writeActiveSession(inputJson);
             .replacingOccurrences(of: ".", with: "-")
     }
 
-    /// 文件名安全的时间戳后缀：`yyyyMMdd-HHmmss`，用于损坏 store.json 备份命名。
-    private nonisolated static func storeCorruptedTimestamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: date)
-    }
-
     private func runInlineAppleScript(
         _ appleScript: String,
         label: String,
@@ -5419,7 +5394,7 @@ struct TypelessSwitchboardApp: App {
 
 /// macOS LaunchAgent：开机登录后按间隔执行 `--daemon-check`，不常驻 GUI。
 enum QuotaGuardLaunchAgent {
-    static let label = "local.typeless.switchboard.quota-guard"
+    static let label = QuotaGuardLaunchAgentPlanner.label
     static var plistURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/\(label).plist")
@@ -5443,30 +5418,22 @@ enum QuotaGuardLaunchAgent {
 
     /// 读取当前 plist 里的 StartInterval（秒）。
     static func currentStartIntervalSeconds() -> Int? {
-        guard let data = try? Data(contentsOf: plistURL),
-              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
-              let seconds = object["StartInterval"] as? Int else {
-            return nil
-        }
-        return seconds
+        guard let data = try? Data(contentsOf: plistURL) else { return nil }
+        return QuotaGuardLaunchAgentPlanner.startIntervalSeconds(inPlistData: data)
     }
 
     /// daemon 根据本周剩余额度动态调整巡检间隔：接近阈值 → 约 20 秒；否则恢复用户设定分钟数。
     static func reconcileIntervalSecondsIfNeeded(_ desiredSeconds: Int) {
-        let clamped = max(20, min(desiredSeconds, 120 * 60))
+        let clamped = QuotaGuardLaunchAgentPlanner.reconciledIntervalSeconds(desiredSeconds)
         guard isInstalled else { return }
         if currentStartIntervalSeconds() == clamped { return }
         guard let data = try? Data(contentsOf: plistURL),
-              var text = String(data: data, encoding: .utf8) else {
+              let text = String(data: data, encoding: .utf8),
+              let updated = QuotaGuardLaunchAgentPlanner.replacingStartInterval(inPlistText: text, seconds: clamped) else {
             return
         }
         // 替换 <key>StartInterval</key> 后的 integer。
-        if let range = text.range(of: #"<key>StartInterval</key>\s*<integer>\d+</integer>"#, options: .regularExpression) {
-            text.replaceSubrange(range, with: "<key>StartInterval</key>\n  <integer>\(clamped)</integer>")
-        } else {
-            return
-        }
-        try? text.write(to: plistURL, atomically: true, encoding: .utf8)
+        try? updated.write(to: plistURL, atomically: true, encoding: .utf8)
         _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
         _ = runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
     }
@@ -5502,41 +5469,15 @@ enum QuotaGuardLaunchAgent {
     }
 
     static func install(programPath: String, intervalMinutes: Int) throws {
-        let minutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(intervalMinutes)
-        let seconds = minutes * 60
         let logDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/TypelessSwitchboard/Logs", isDirectory: true)
         try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
-        let stdout = logDir.appendingPathComponent("quota-guard-launchd.out.log").path
-        let stderr = logDir.appendingPathComponent("quota-guard-launchd.err.log").path
 
-        let plist = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-          <key>Label</key>
-          <string>\(label)</string>
-          <key>ProgramArguments</key>
-          <array>
-            <string>\(programPath)</string>
-            <string>--daemon-check</string>
-          </array>
-          <key>RunAtLoad</key>
-          <true/>
-          <key>StartInterval</key>
-          <integer>\(seconds)</integer>
-          <key>StandardOutPath</key>
-          <string>\(stdout)</string>
-          <key>StandardErrorPath</key>
-          <string>\(stderr)</string>
-          <key>ProcessType</key>
-          <string>Background</string>
-          <key>Nice</key>
-          <integer>10</integer>
-        </dict>
-        </plist>
-        """
+        let plist = QuotaGuardLaunchAgentPlanner.plistDocument(
+            programPath: programPath,
+            intervalMinutes: intervalMinutes,
+            logDirectory: logDir.path
+        )
 
         let agentsDir = plistURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: agentsDir, withIntermediateDirectories: true)

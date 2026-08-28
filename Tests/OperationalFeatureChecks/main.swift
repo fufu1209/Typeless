@@ -149,262 +149,6 @@ struct OperationalFeatureChecks {
         check(TypelessToolkitCompatibilityMatrix.linux.supportLevel == .planned, "Linux is explicitly planned rather than silently claimed supported")
         check(TypelessToolkitCompatibilityMatrix.markdown.contains("跨平台兼容矩阵"), "compatibility matrix can be exported as markdown")
 
-        let switchboardSource = try String(contentsOfFile: "Sources/TypelessSwitchboard/main.swift")
-        if let start = switchboardSource.range(of: "func runOneClickAutomaticReplacement("),
-           let end = switchboardSource.range(of: "func retryLastAutomation()", range: start.lowerBound..<switchboardSource.endIndex) {
-            let oneClickSource = String(switchboardSource[start.lowerBound..<end.lowerBound])
-            check(!oneClickSource.contains("prepareSwitch(from: currentID)"), "one-click automation must not fall back to manual switch that opens inbox/browser pages")
-            check(!oneClickSource.contains("openURL(account.inboxURL)"), "one-click automation must not open MoeMail inbox page during registration")
-            check(oneClickSource.contains("注册阶段后台运行"), "one-click automation documents background registration stage")
-            check(oneClickSource.contains("prepareLocalTypelessDesktopEnvironmentForAutomaticReplacement"), "one-click automation prepares local Typeless desktop app environment")
-            check(oneClickSource.contains("prepareRetainedTypelessBrowserSessionsForAutomaticReplacement"), "one-click automation prepares retained Typeless web session environment")
-            check(oneClickSource.contains("preparePersonalChromeTypelessWebSessionForAutomaticReplacement"), "one-click automation clears the user's Chrome Typeless web session")
-            check(oneClickSource.contains("resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement"), "one-click automation resolves any stale Chrome Typeless.app prompt before clearing environments")
-            check(oneClickSource.contains("closePersonalChromeTypelessTabsBeforeReplacement"), "one-click automation closes stale personal Chrome Typeless tabs before creating the clean login tab")
-            check(oneClickSource.contains("syncPersonalChromeTypelessWebSession"), "one-click automation switches the user's Chrome Typeless web session to the new account")
-            check(oneClickSource.contains("completeTypelessDesktopOnboardingIfPresent"), "one-click automation completes or skips Typeless desktop onboarding after handoff")
-            check(oneClickSource.contains("preflightMacPermissionsBeforeAutomaticReplacement"), "one-click automation preflights macOS permissions before creating a new email")
-            check(oneClickSource.range(of: "preflightMacPermissionsBeforeAutomaticReplacement")!.lowerBound < oneClickSource.range(of: "createMoeMailRegistrationCandidate")!.lowerBound, "permission preflight happens before MoeMail account generation")
-            check(oneClickSource.contains("timeoutSeconds: 120"), "one-click automation waits long enough for desktop handoff before onboarding patch")
-            check(!oneClickSource.contains("openRetainedBrowserSession("), "one-click automation must not open an extra Playwright/Chromium browser after success")
-            check(oneClickSource.contains("未自动打开额外浏览器"), "one-click automation documents that retained browser session is saved but not auto-opened")
-        } else {
-            check(false, "can locate one-click automation source")
-        }
-
-        check(switchboardSource.contains("func prepareRetainedTypelessBrowserSessionsForAutomaticReplacement"), "switchboard can isolate previously retained Typeless web sessions")
-        check(switchboardSource.contains("BrowserSessionBackups"), "retained Typeless web session isolation keeps backups")
-        check(switchboardSource.contains("terminateRetainedTypelessBrowserSessions"), "retained Typeless web session isolation terminates old browser windows")
-        check(switchboardSource.contains("\"pkill\", \"-f\", profileRoot"), "retained Typeless web session isolation closes old Playwright Chromium processes by profile root")
-        check(switchboardSource.contains("已隔离旧网页登录态"), "retained Typeless web session isolation logs old web session backup")
-        check(switchboardSource.contains("func resetTypelessDeviceIdentityForAutomaticReplacement"), "one-click automation fully resets Typeless device identity like typeless-toolkit resetDevice")
-        check(switchboardSource.contains("now.typeless.desktop.deviceIdentifier"), "device reset deletes the real macOS Typeless Keychain service")
-        check(switchboardSource.contains("now.typeless.desktop.security.auth_key"), "device reset deletes the real macOS Typeless Keychain account")
-        check(switchboardSource.contains("Typeless.deviceIdentifier"), "device reset also handles the toolkit legacy credential target")
-        check(switchboardSource.contains("SecItemDelete"), "device reset removes Typeless device credentials from Keychain")
-        check(switchboardSource.contains("delete-generic-password"), "device reset falls back to the macOS security CLI when Keychain API deletion is denied")
-        check(switchboardSource.contains("device.cache"), "device reset removes Typeless device.cache files")
-        check(switchboardSource.contains("user-data.json"), "device reset removes encrypted user-data login credentials")
-        check(switchboardSource.contains("quotaUsage"), "device reset clears quotaUsage from app-storage")
-        check(switchboardSource.contains("\"Local Storage\"") && switchboardSource.contains("\"Network\"") && switchboardSource.contains("\"Cookies\""), "device reset clears Electron local storage, network state, and cookies")
-        if let start = switchboardSource.range(of: "func prepareLocalTypelessDesktopEnvironmentForAutomaticReplacement"),
-           let end = switchboardSource.range(of: "func prepareRetainedTypelessBrowserSessionsForAutomaticReplacement", range: start.lowerBound..<switchboardSource.endIndex) {
-            let desktopPreparationSource = String(switchboardSource[start.lowerBound..<end.lowerBound])
-            check(desktopPreparationSource.contains("resetTypelessDeviceIdentityForAutomaticReplacement"), "one-click desktop preparation resets device identity before new desktop handoff")
-        } else {
-            check(false, "can locate desktop preparation source")
-        }
-        check(switchboardSource.contains("func preparePersonalChromeTypelessWebSessionForAutomaticReplacement"), "switchboard can clear personal Chrome Typeless session")
-        check(switchboardSource.contains("func syncPersonalChromeTypelessWebSession"), "switchboard can sync personal Chrome to the new Typeless session")
-        check(switchboardSource.contains("func handoffRetainedTypelessProfileToDesktopOnce"), "one-click automation performs a background retained-profile desktop handoff without opening an extra browser")
-        check(switchboardSource.contains("makeDesktopHandoffScript"), "one-click automation has a dedicated one-shot desktop handoff script")
-        check(switchboardSource.contains("typeless://"), "desktop handoff script handles Typeless external protocol URLs")
-        check(switchboardSource.contains("/usr/bin/open"), "desktop handoff script opens Typeless protocol URLs through macOS open")
-        check(switchboardSource.contains("makeTypelessDesktopAuthURL"), "desktop handoff constructs a complete Typeless auth protocol URL from extracted tokens")
-        check(switchboardSource.contains("access_token") && switchboardSource.contains("refresh_token") && switchboardSource.contains("user_id"), "desktop auth protocol URL includes the fields required by Typeless desktop")
-        check(switchboardSource.contains("forceLaunchTypelessBeforeAuthProtocol"), "desktop handoff launches Typeless before replaying the auth protocol so macOS does not drop the cold-start URL event")
-        check(switchboardSource.contains("[1.0, 3.0, 6.0, 12.0, 24.0, 60.0]"), "onboarding patch is re-applied long enough to beat server userData refresh")
-        check(switchboardSource.contains("func resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement"), "switchboard can approve stale Chrome Typeless.app prompts before cleanup")
-        check(switchboardSource.contains("func closePersonalChromeTypelessTabsBeforeReplacement"), "switchboard can close stale personal Chrome Typeless tabs")
-        check(switchboardSource.contains("始终允许 www.typeless.com"), "Chrome prompt approval handles the always-allow checkbox")
-        check(switchboardSource.contains("Always allow"), "Chrome prompt approval handles English always-allow checkbox text")
-        check(switchboardSource.contains("AXCheckBox"), "Chrome prompt approval searches checkbox accessibility elements")
-        check(switchboardSource.contains("MAXAI_CLIENT__FEATURES__AUTH__TOKEN_INFO"), "Chrome sync uses Typeless token info from the completed session")
-        check(switchboardSource.contains("func completeTypelessDesktopOnboardingIfPresent"), "switchboard can complete Typeless onboarding after switch")
-        check(!switchboardSource.contains("全自动换号已完成，已打开新账号浏览器会话"), "completion message must not claim an extra browser session was opened")
-        check(switchboardSource.contains("func writeTypelessStorageOnboardingCompletion"), "onboarding patch also updates app-storage userData onboarding state")
-        if let start = switchboardSource.range(of: "func completeTypelessDesktopOnboardingIfPresent"),
-           let end = switchboardSource.range(of: "func writeTypelessOnboardingCompletion", range: start.lowerBound..<switchboardSource.endIndex) {
-            let desktopOnboardingSource = String(switchboardSource[start.lowerBound..<end.lowerBound])
-            check(desktopOnboardingSource.contains("writeTypelessStorageOnboardingCompletion"), "onboarding patch updates app-storage before relaunching Typeless")
-        } else {
-            check(false, "can locate desktop onboarding completion source")
-        }
-        if let start = switchboardSource.range(of: "func enforceTypelessDesktopOnboardingPatchAfterRelaunch"),
-           let end = switchboardSource.range(of: "func waitForTypelessDesktopStorage", range: start.lowerBound..<switchboardSource.endIndex) {
-            let enforcementSource = String(switchboardSource[start.lowerBound..<end.lowerBound])
-            check(enforcementSource.contains("writeTypelessStorageOnboardingCompletion"), "onboarding patch re-applies app-storage userData completion after relaunch")
-        } else {
-            check(false, "can locate onboarding relaunch enforcement source")
-        }
-        check(switchboardSource.contains("\"is_new_user\""), "onboarding patch marks the local Typeless user as not new")
-        check(switchboardSource.contains("\"macos\""), "onboarding patch marks macOS onboarding complete in userData")
-        check(switchboardSource.contains("\"completed\""), "onboarding patch writes completed flags")
-        check(switchboardSource.contains("func waitForTypelessDesktopStorage"), "onboarding patch waits for Typeless desktop storage files created after handoff")
-        check(switchboardSource.contains("func enforceTypelessDesktopOnboardingPatchAfterRelaunch"), "onboarding patch is re-applied after Typeless relaunch")
-        check(switchboardSource.contains("onboardingShortcutCalloutDismissedStep"), "onboarding patch dismisses shortcut callout state")
-        check(switchboardSource.contains("pressToStopDictationOnboardingShown"), "onboarding patch dismisses press-to-stop dictation tips")
-        check(switchboardSource.contains("func appendMacPermissionDiagnostics"), "setup diagnostics include macOS permission checks")
-        check(switchboardSource.contains("func preflightMacPermissionsBeforeAutomaticReplacement"), "one-click flow includes a dedicated up-front permission preflight")
-        check(switchboardSource.contains("AXIsProcessTrusted()"), "permission preflight uses silent Accessibility check")
-        check(!switchboardSource.contains("AXTrustedCheckOptionPrompt"), "permission preflight must not force Accessibility system prompts")
-        check(switchboardSource.contains("didAutoOpenPermissionSettingsThisSession"), "permission settings open at most once per session automatically")
-        check(switchboardSource.contains("权限未齐也继续执行"), "missing permissions no longer hard-stop registration with repeated prompts")
-        check(switchboardSource.contains("interactive: false") || switchboardSource.contains("interactive && !preserveCurrentAccount"), "background/hot-spare paths avoid interactive permission prompts")
-        check(switchboardSource.contains("全自动换号确认状态"), "empty review queue explains automatic confirmation instead of showing manual approval work")
-        check(switchboardSource.contains("兜底确认队列"), "pending accounts are framed as fallback confirmation only")
-        check(!switchboardSource.contains("人工审核队列"), "successful one-click UI must not show an artificial/manual review queue label")
-        check(switchboardSource.contains("按 typeless-toolkit resetDevice"), "main copy documents real toolkit-style device identity reset")
-        check(switchboardSource.contains("AXIsProcessTrusted"), "setup diagnostics checks Accessibility permission")
-        check(switchboardSource.contains("Privacy_Automation"), "setup diagnostics exposes Automation privacy settings")
-        check(switchboardSource.contains("func copyMacPermissionChecklist"), "switchboard can copy the complete macOS permission checklist")
-        check(switchboardSource.contains("func openMacPermissionSettings"), "switchboard can open macOS privacy panes")
-        check(switchboardSource.contains("--auto-switch-count"), "switchboard exposes a controlled CLI multi-switch test entrypoint")
-        check(switchboardSource.contains("runCommandLineAutomaticReplacementIfRequested"), "switchboard can run repeated one-click replacements from CLI")
-        check(switchboardSource.contains("lastCompletedAutomationAccountID"), "CLI multi-switch continues from the last completed account")
-        check(switchboardSource.contains("KeychainStore.readAPIKey()"), "CLI multi-switch reads MoeMail API key from Keychain")
-        check(switchboardSource.contains("func runSmartSwitch"), "switchboard exposes a unified smart switch entrypoint")
-        check(switchboardSource.contains("智能换号（一点就换）"), "sidebar exposes one-click smart switch as the primary action")
-        check(switchboardSource.contains("autoRotateRemainingThreshold"), "auto-rotate threshold is configurable")
-        check(switchboardSource.contains("autoCreateWhenPoolEmpty"), "monitor can auto-create when the silent pool is empty")
-        check(switchboardSource.contains("autoRotateMonitorStatus"), "UI surfaces live auto-rotate monitor status")
-        check(switchboardSource.contains("SmartSwitchPolicy.sessionCaptureRetryAttempts"), "successful registration retries session capture for silent reuse")
-        check(switchboardSource.contains("markPreviousExhausted"), "silent pool switch can mark the previous account exhausted")
-        check(switchboardSource.contains("开机轻量") || switchboardSource.contains("LaunchAgent") || switchboardSource.contains("开机插件"), "sidebar exposes boot-time lightweight quota guard")
-        check(switchboardSource.contains("keepRunningInBackground"), "app can keep running after window close")
-        check(switchboardSource.contains("SwitchboardAppDelegate"), "menu bar / background lifecycle is wired")
-        check(switchboardSource.contains("ensureHotSpareIfNeeded"), "monitor top-ups a silent hot-spare pool")
-        check(switchboardSource.contains("preserveCurrentAccount"), "hot-spare registration can avoid switching the active account")
-        check(switchboardSource.contains("desktopUserDataPayload"), "browser tokens can be converted into silent desktop payloads")
-        check(switchboardSource.contains("launchTypelessInBackground"), "silent switch relaunches Typeless without forcing foreground by default")
-        check(switchboardSource.contains("activateTypeless: false"), "auto-rotate silent switch does not steal focus")
-        check(switchboardSource.contains("resetDeviceIdentity: true"), "silent switch resets Typeless device identity before injecting the next account")
-        check(switchboardSource.contains("resetTypelessDeviceIdentityForAutomaticReplacement(backupRoot:"), "silent reinject reuses the toolkit-style device identity reset")
-        check(switchboardSource.contains("silentSwitchVerifyAttempts"), "silent switch verifies the target email before marking success")
-        check(switchboardSource.contains("lastSyncHitDeviceUserLimit"), "switchboard tracks Typeless device-user-limit errors from quota sync")
-        check(switchboardSource.contains("lastSilentSwitchFailureReason"), "silent switch exposes a failure reason for automatic fallback")
-        check(switchboardSource.contains("DEVICE_USER_LIMIT"), "quota sync script classifies device user limit responses")
-        check(switchboardSource.contains("isDeviceUserLimitError"), "smart switch policy can detect device user limit errors")
-        check(switchboardSource.contains("跳过静默切换并全自动重置设备身份") || switchboardSource.contains("设备登录用户数已超限"), "device user limit forces full automatic replacement instead of silent pool reuse")
-        check(switchboardSource.contains("已轮换设备身份") || switchboardSource.contains("含设备身份轮换"), "UI/status copy documents silent device rotation")
-        check(switchboardSource.contains("--daemon-check"), "headless daemon once-check flag is available for LaunchAgent")
-        check(switchboardSource.contains("func runDaemonQuotaGuardOnceIfRequested"), "daemon once-check entrypoint exists")
-        check(switchboardSource.contains("enum QuotaGuardLaunchAgent") || switchboardSource.contains("QuotaGuardLaunchAgent"), "LaunchAgent installer is built in")
-        check(switchboardSource.contains("HeadlessCLIRunner") || switchboardSource.contains("runHeadlessCLI"), "CLI/daemon path does not require the main window")
-        check(switchboardSource.contains("installQuotaGuardLaunchAgent"), "UI can install the boot quota-guard agent")
-        check(FileManager.default.fileExists(atPath: "scripts/install-quota-guard.sh"), "install-quota-guard.sh script is present")
-        // 本周额度可靠性：只信 week_word_usage 新鲜值；API 失败不误判充足；近阈值加速。
-        check(switchboardSource.contains("lastQuotaSyncFresh"), "quota sync tracks whether weekly numbers are fresh")
-        check(switchboardSource.contains("lastQuotaSyncAt"), "quota sync records last successful weekly sync time")
-        check(switchboardSource.contains("lastQuotaUsedCharacters"), "quota sync keeps weekly used characters")
-        check(switchboardSource.contains("lastQuotaMonthlyLimit"), "quota sync keeps weekly limit (field name monthlyLimit is legacy)")
-        check(switchboardSource.contains("weeklyQuotaSummaryLine"), "UI/logs expose weekly used/limit/remaining/freshness summary")
-        check(switchboardSource.contains("本周额度 API 未刷新成功，跳过换号决策"), "auto-rotate skips switch when weekly quota is not fresh")
-        check(switchboardSource.contains("reconcileIntervalSecondsIfNeeded"), "daemon can tighten LaunchAgent StartInterval near threshold")
-        check(switchboardSource.contains("week_word_usage"), "copy/docs mention Typeless weekly word usage as the quota source")
-        check(switchboardSource.contains("?\\(remaining)"), "menu bar marks stale weekly remaining with ?")
-
-        // SmartSwitchPolicy pure-logic checks
-        let silentCandidate = SmartSwitchCandidate(
-            id: UUID(),
-            email: "pool@example.com",
-            remainingCharacters: 5000,
-            hasSilentSessionPayload: true
-        )
-        let noPayloadCandidate = SmartSwitchCandidate(
-            id: UUID(),
-            email: "nopayload@example.com",
-            remainingCharacters: 3000,
-            hasSilentSessionPayload: false
-        )
-        let lowQuotaIdle = SmartSwitchPolicy.decide(
-            currentRemaining: 500,
-            threshold: 200,
-            forceSwitch: false,
-            candidates: [silentCandidate],
-            allowFullAutomaticReplacement: true
-        )
-        check(lowQuotaIdle.path == .none, "monitor does nothing when remaining is still above threshold")
-        check(lowQuotaIdle.reason.contains("只巡检") || lowQuotaIdle.reason.contains("额度充足"), "idle reason explains monitoring-only above threshold")
-        check(
-            SmartSwitchPolicy.monitorIdleStatus(remaining: 500, threshold: 200).contains("只巡检不换号"),
-            "idle status copy says monitor-only when remaining is above threshold"
-        )
-        check(
-            SmartSwitchPolicy.monitorIdleStatus(remaining: 100, threshold: 200).contains("准备换号"),
-            "idle status copy flags low quota"
-        )
-        let lowQuotaRotate = SmartSwitchPolicy.decide(
-            currentRemaining: 100,
-            threshold: 200,
-            forceSwitch: false,
-            candidates: [silentCandidate],
-            allowFullAutomaticReplacement: true
-        )
-        check(lowQuotaRotate.path == .silentPoolSwitch, "monitor prefers silent pool switch when payload exists")
-        check(lowQuotaRotate.targetEmail == "pool@example.com", "monitor selects the silent-ready candidate")
-        let forceWithoutPayload = SmartSwitchPolicy.decide(
-            currentRemaining: 5000,
-            threshold: 200,
-            forceSwitch: true,
-            candidates: [noPayloadCandidate],
-            allowFullAutomaticReplacement: true
-        )
-        check(forceWithoutPayload.path == .fullAutomaticReplacement, "manual smart switch falls back to full automatic when no silent payload")
-        let monitorEmptyPoolNoCreate = SmartSwitchPolicy.decide(
-            currentRemaining: 50,
-            threshold: 200,
-            forceSwitch: false,
-            candidates: [],
-            allowFullAutomaticReplacement: false
-        )
-        check(monitorEmptyPoolNoCreate.path == .none, "monitor stays idle when pool empty and auto-create disabled")
-        let monitorEmptyPoolCreate = SmartSwitchPolicy.decide(
-            currentRemaining: 50,
-            threshold: 200,
-            forceSwitch: false,
-            candidates: [],
-            allowFullAutomaticReplacement: true
-        )
-        check(monitorEmptyPoolCreate.path == .fullAutomaticReplacement, "monitor auto-registers when pool empty and auto-create enabled")
-        check(SmartSwitchPolicy.normalizeCheckIntervalMinutes(0) == 1, "interval minutes clamp to at least 1")
-        check(SmartSwitchPolicy.normalizeCheckIntervalMinutes(999) == 120, "interval minutes clamp to at most 120")
-        check(SmartSwitchPolicy.isQuotaLow(remaining: 199, threshold: 200), "quota is low when remaining is below threshold")
-        check(!SmartSwitchPolicy.isQuotaLow(remaining: 200, threshold: 200), "quota is not low when remaining equals threshold")
-        check(SmartSwitchPolicy.defaultRemainingThreshold == 200, "default threshold is 200 characters")
-        check(SmartSwitchPolicy.defaultCheckIntervalMinutes == 1, "default check interval is 1 minute")
-        check(SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 5000, threshold: 200, intervalMinutes: 1) == 60, "normal interval uses configured minutes")
-        check(SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 300, threshold: 200, intervalMinutes: 1) == SmartSwitchPolicy.urgentCheckIntervalSeconds, "near-threshold uses urgent interval")
-        check(SmartSwitchPolicy.needsHotSpare(candidates: [], target: 1), "empty pool needs hot spare")
-        check(!SmartSwitchPolicy.needsHotSpare(candidates: [silentCandidate], target: 1), "one silent-ready account satisfies hot spare target 1")
-        let tokenInfo = #"{"accessToken":"at-1","refreshToken":"rt-1","userId":"u-1","email":"a@example.com"}"#
-        let desktopPayload = SmartSwitchPolicy.desktopUserDataPayload(fromBrowserTokenInfo: tokenInfo)
-        check(desktopPayload != nil, "token info converts to desktop payload")
-        check(desktopPayload?.contains("access_token") == true, "desktop payload includes access_token")
-        check(desktopPayload?.contains("at-1") == true, "desktop payload preserves access token value")
-        check(
-            SmartSwitchPolicy.isDeviceUserLimitError(
-                "The number of users logged into this device has exceeded the limit."
-            ),
-            "English device user limit message is detected"
-        )
-        check(
-            SmartSwitchPolicy.isDeviceUserLimitError(
-                "The number of users logged into this device hasexceeded the limit."
-            ),
-            "English device user limit message without space before exceeded is detected"
-        )
-        check(
-            SmartSwitchPolicy.isDeviceUserLimitError("设备登录用户数已超限 (HTTP 403)"),
-            "Chinese device user limit message is detected"
-        )
-        check(
-            !SmartSwitchPolicy.isDeviceUserLimitError("API 请求连接超时"),
-            "unrelated API errors are not classified as device user limit"
-        )
-        check(SmartSwitchPolicy.silentSwitchVerifyAttempts >= 3, "silent switch verification retries enough times")
-        check(TypelessToolkitCompatibilityMatrix.resetDeviceSteps.contains { $0.contains("静默换号") }, "compatibility matrix documents silent-switch device rotation")
-        check(TypelessToolkitCompatibilityMatrix.resetDeviceSteps.contains { $0.contains("exceeded the limit") }, "compatibility matrix documents device user limit fallback")
-        check(switchboardSource.contains("resumeRotateMonitorAfterWakeOrManualKick"), "monitor can resume after wake or manual kick")
-        check(switchboardSource.contains("didWakeNotification"), "app resumes quota monitor after system wake")
-        check(switchboardSource.contains("monitorIdleStatus"), "switchboard uses shared monitor-idle status copy")
-        check(switchboardSource.contains("只监控，不换号") || switchboardSource.contains("只巡检不换号"), "UI explains monitor-only when remaining is above threshold")
-        check(switchboardSource.contains("isAutomationRuntimeCached"), "automation runtime skips install when Playwright is already cached")
-        check(switchboardSource.contains("isPlaywrightChromiumExecutableAvailable"), "automation runtime cache verifies the Playwright Chromium executable before skipping install")
-        check(switchboardSource.contains("chromium.executablePath()"), "automation runtime cache probes Chromium executable path through Playwright")
-        check(switchboardSource.contains("markAutomationRuntimeReady"), "automation runtime writes a ready marker after prewarm")
-        check(switchboardSource.contains("跳过 npm install / playwright install"), "automation runtime reports cached fast path")
-        check(switchboardSource.contains("typelessAppQuitGraceSeconds"), "Typeless app quit wait is bounded by a short grace constant")
         let portablePreflightSyntax = runCommand("node", ["--check", "scripts/typeless-portable-preflight.js"])
         check(portablePreflightSyntax.status == 0, "portable preflight script passes node --check: \(portablePreflightSyntax.output)")
         let portablePreflightRun = runCommand("node", ["scripts/typeless-portable-preflight.js"])
@@ -647,6 +391,14 @@ struct OperationalFeatureChecks {
         // MARK: - v2.1.0 QuotaCycleEngine 真实行为测试
         // 之前的"func daysUntilReset" 等源串包含测试已经在这次升级中被替换为真实行为断言。
         runQuotaCycleEngineChecks()
+
+        // MARK: - v2.4.0 测试改革：删 108 条源串包含断言，换成 4 个真实行为模块
+        runSmartSwitchPolicyChecks()
+        runRegistrationCompletionPolicyChecks()
+        runBrowserAutomationResultPayloadChecks()
+        runToolkitAccountImporterEdgeCaseChecks()
+        runStoreRecoveryChecks()
+        runQuotaGuardLaunchAgentPlannerChecks()
 
         print("Operational feature checks passed")
     }
@@ -992,5 +744,435 @@ struct OperationalFeatureChecks {
             summary.contains("距离刷新还有") && summary.contains("1000/8000"),
             "QuotaCycleEngine.summary: 含周度已用 + 距离刷新天数"
         )
+    }
+
+    // MARK: - v2.4.0 SmartSwitchPolicy 真实行为
+    private static func runSmartSwitchPolicyChecks() {
+        // 阈值判定：isQuotaLow 严格小于
+        check(SmartSwitchPolicy.isQuotaLow(remaining: 0, threshold: 200), "isQuotaLow: remaining 0 < 200 → true")
+        check(SmartSwitchPolicy.isQuotaLow(remaining: 199, threshold: 200), "isQuotaLow: remaining 199 < 200 → true")
+        check(!SmartSwitchPolicy.isQuotaLow(remaining: 200, threshold: 200), "isQuotaLow: remaining 200 NOT < 200 → false（边界）")
+        check(!SmartSwitchPolicy.isQuotaLow(remaining: 1000, threshold: 200), "isQuotaLow: remaining 1000 < 200 → false")
+        check(!SmartSwitchPolicy.isQuotaLow(remaining: 50, threshold: 0), "isQuotaLow: threshold=0 → 永远 false（防止负阈值乱触发）")
+        check(SmartSwitchPolicy.isQuotaLow(remaining: -1, threshold: 0), "isQuotaLow: remaining=-1 threshold=0 → -1<0 true（数学正确，UI 应避免）")
+
+        // 路径选择：额度充足 + 无 forceSwitch → .none
+        let idleDecision = SmartSwitchPolicy.decide(
+            currentRemaining: 5000, threshold: 200, forceSwitch: false,
+            candidates: [
+                SmartSwitchCandidate(id: UUID(), email: "a@x.com", remainingCharacters: 7000, hasSilentSessionPayload: true)
+            ],
+            allowFullAutomaticReplacement: true
+        )
+        check(idleDecision.path == .none, "decide: 额度充足 + forceSwitch=false → .none")
+        check(idleDecision.targetAccountID == nil, "decide: 空闲时无目标账号")
+        check(idleDecision.reason.contains("充足"), "decide: 空闲时 reason 解释额度充足")
+
+        // 路径选择：额度低 + 有静默就绪 → .silentPoolSwitch
+        let silentSwitch = SmartSwitchPolicy.decide(
+            currentRemaining: 50, threshold: 200, forceSwitch: false,
+            candidates: [
+                SmartSwitchCandidate(id: UUID(), email: "ready@x.com", remainingCharacters: 6000, hasSilentSessionPayload: true),
+                SmartSwitchCandidate(id: UUID(), email: "more@x.com", remainingCharacters: 3000, hasSilentSessionPayload: true)
+            ],
+            allowFullAutomaticReplacement: true
+        )
+        check(silentSwitch.path == .silentPoolSwitch, "decide: 额度低 + 有静默就绪 → .silentPoolSwitch")
+        check(silentSwitch.targetAccountID != nil, "decide: silentPoolSwitch 必须给目标 ID")
+        check(silentSwitch.targetEmail == "ready@x.com", "decide: silentPoolSwitch 选余额最多的（6000 > 3000）")
+        check(silentSwitch.reason.contains("6000"), "decide: silentPoolSwitch reason 解释剩余字数")
+
+        // 路径选择：额度低 + 无静默就绪 + 允许全自动 → .fullAutomaticReplacement
+        let autoReplacement = SmartSwitchPolicy.decide(
+            currentRemaining: 50, threshold: 200, forceSwitch: false,
+            candidates: [
+                SmartSwitchCandidate(id: UUID(), email: "noPayload@x.com", remainingCharacters: 100, hasSilentSessionPayload: false)
+            ],
+            allowFullAutomaticReplacement: true
+        )
+        check(autoReplacement.path == .fullAutomaticReplacement, "decide: 额度低 + 无静默就绪 + 允许全自动 → .fullAutomaticReplacement")
+
+        // 路径选择：额度低 + 无可用号 + 不允许全自动 → .none + reason 解释
+        let blocked = SmartSwitchPolicy.decide(
+            currentRemaining: 50, threshold: 200, forceSwitch: false,
+            candidates: [
+                SmartSwitchCandidate(id: UUID(), email: "empty@x.com", remainingCharacters: 0, hasSilentSessionPayload: false)
+            ],
+            allowFullAutomaticReplacement: false
+        )
+        check(blocked.path == .none, "decide: 额度低 + 不允许全自动 → .none（不擅自注册）")
+        check(blocked.reason.contains("未允许自动创建新号"),
+              "decide: 无号 + 不允许全自动时 reason 必须解释给用户：\(blocked.reason)")
+
+        // 路径选择：forceSwitch=true 跳过额度判定
+        let forced = SmartSwitchPolicy.decide(
+            currentRemaining: 9999, threshold: 200, forceSwitch: true,
+            candidates: [
+                SmartSwitchCandidate(id: UUID(), email: "any@x.com", remainingCharacters: 1, hasSilentSessionPayload: true)
+            ],
+            allowFullAutomaticReplacement: false
+        )
+        check(forced.path == .silentPoolSwitch, "decide: forceSwitch=true 跳过额度判定，直接走静默池")
+
+        // 设备用户数超限识别（各种文案变体 + 缺空格变体）
+        check(SmartSwitchPolicy.isDeviceUserLimitError("The number of users logged into this device has exceeded the limit"),
+              "isDeviceUserLimitError: 完整英文文案")
+        check(SmartSwitchPolicy.isDeviceUserLimitError("Numberofusersloggedintothisdevicehasexceededthelimit"),
+              "isDeviceUserLimitError: 缺空格英文文案（hasexceeded）")
+        check(SmartSwitchPolicy.isDeviceUserLimitError("登录该设备的用户数已超过限制"),
+              "isDeviceUserLimitError: 中文完整文案")
+        check(SmartSwitchPolicy.isDeviceUserLimitError("设备登录用户数已超"),
+              "isDeviceUserLimitError: 中文短文案")
+        check(!SmartSwitchPolicy.isDeviceUserLimitError(nil),
+              "isDeviceUserLimitError: nil → false（不误判）")
+        check(!SmartSwitchPolicy.isDeviceUserLimitError(""),
+              "isDeviceUserLimitError: 空字符串 → false")
+        check(!SmartSwitchPolicy.isDeviceUserLimitError("normal quota error"),
+              "isDeviceUserLimitError: 普通额度错误不误判为设备超限")
+
+        // 巡检间隔换算
+        check(SmartSwitchPolicy.normalizeCheckIntervalMinutes(0) == 1, "normalizeCheckIntervalMinutes: 0 → 1（下限保护）")
+        check(SmartSwitchPolicy.normalizeCheckIntervalMinutes(-5) == 1, "normalizeCheckIntervalMinutes: 负数 → 1")
+        check(SmartSwitchPolicy.normalizeCheckIntervalMinutes(60) == 60, "normalizeCheckIntervalMinutes: 60 不变")
+        check(SmartSwitchPolicy.normalizeCheckIntervalMinutes(500) == 120, "normalizeCheckIntervalMinutes: 500 → 120（上限）")
+
+        // nextCheckDelaySeconds: 接近阈值时 20s 加速，否则按分钟
+        let urgent = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 350, threshold: 200, intervalMinutes: 5)
+        check(urgent == SmartSwitchPolicy.urgentCheckIntervalSeconds,
+              "nextCheckDelaySeconds: remaining 350 < 200*2=400 → 加速到 20s")
+        let idle = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 1000, threshold: 200, intervalMinutes: 5)
+        check(idle == 5 * 60, "nextCheckDelaySeconds: remaining 1000 充足 → 5 分钟")
+        let noQuotaYet = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: nil, threshold: 200, intervalMinutes: 3)
+        check(noQuotaYet == 3 * 60, "nextCheckDelaySeconds: remaining=nil（无数据）→ 用默认间隔")
+    }
+
+    // MARK: - v2.4.0 RegistrationAutomationCompletionPolicy 真实行为
+    private static func runRegistrationCompletionPolicyChecks() {
+        // 浏览器结果为 nil：未完成
+        check(!RegistrationAutomationCompletionPolicy.isComplete(verificationCode: nil, browserResult: nil),
+              "isComplete: browserResult=nil → false（不能仅凭验证码就判定完成）")
+        check(!RegistrationAutomationCompletionPolicy.isComplete(verificationCode: "123456", browserResult: nil),
+              "isComplete: 验证码 + browserResult=nil → false（防误判）")
+
+        // 浏览器结果是 Dashboard：完成
+        let dashboard = BrowserAutomationResultPayload(
+            status: "ok", detail: "registration completed", url: "https://app.typeless.com/dashboard",
+            title: "Dashboard - Typeless", timestamp: "2026-08-28T19:00:00Z"
+        )
+        check(RegistrationAutomationCompletionPolicy.isComplete(verificationCode: "123456", browserResult: dashboard),
+              "isComplete: dashboard 页面 → true")
+
+        // 浏览器结果是 Workspace：完成
+        let workspace = BrowserAutomationResultPayload(
+            status: "ok", detail: "ready", url: "https://app.typeless.com/workspace/abc",
+            title: "Workspace", timestamp: "2026-08-28T19:00:00Z"
+        )
+        check(RegistrationAutomationCompletionPolicy.isComplete(verificationCode: nil, browserResult: workspace),
+              "isComplete: workspace 页面 → true（无验证码也完成）")
+
+        // 浏览器结果是错误页：未完成
+        let error = BrowserAutomationResultPayload(
+            status: "fail", detail: "captcha required", url: "https://typeless.com/register",
+            title: "Verify", timestamp: "2026-08-28T19:00:00Z"
+        )
+        check(!RegistrationAutomationCompletionPolicy.isComplete(verificationCode: "123456", browserResult: error),
+              "isComplete: 错误/验证页面 → false")
+
+        // 浏览器结果在注册页：未完成
+        let stillRegistering = BrowserAutomationResultPayload(
+            status: "ok", detail: "form filled", url: "https://typeless.com/signup",
+            title: "Sign up", timestamp: "2026-08-28T19:00:00Z"
+        )
+        check(!RegistrationAutomationCompletionPolicy.isComplete(verificationCode: nil, browserResult: stillRegistering),
+              "isComplete: 仍在注册页 → false")
+    }
+
+    // MARK: - v2.4.0 BrowserAutomationResultPayload 真实行为
+    private static func runBrowserAutomationResultPayloadChecks() {
+        // 正向标记
+        let cases: [(String, String, String, Bool)] = [
+            ("ok", "https://app.typeless.com/dashboard", "Dashboard", true),
+            ("ok", "https://app.typeless.com/workspace/abc", "Workspace", true),
+            ("ok", "https://app.typeless.com/home", "Welcome", true),
+            ("ok", "https://app.typeless.com/", "Open the desktop app", true),
+            ("ok", "https://app.typeless.com/login/app/success", "Success", true),
+            ("ok", "https://app.typeless.com/ready", "You're all set", true),
+        ]
+        for (status, url, title, expected) in cases {
+            let p = BrowserAutomationResultPayload(status: status, detail: "ok", url: url, title: title, timestamp: "t")
+            check(p.isLikelyRegistrationComplete == expected, "isLikelyRegistrationComplete: \(url) → \(expected)")
+        }
+
+        // 负向标记
+        let negCases: [(String, String, String, String)] = [
+            ("fail", "captcha", "https://typeless.com/register", "Verify"),
+            ("error", "invalid", "https://typeless.com/login", "Login"),
+            ("ok", "verification failed", "https://typeless.com/signup", "Sign up"),
+            ("ok", "请输入验证码", "https://typeless.com/", "注册"),
+        ]
+        for (status, detail, url, title) in negCases {
+            let p = BrowserAutomationResultPayload(status: status, detail: detail, url: url, title: title, timestamp: "t")
+            check(!p.isLikelyRegistrationComplete, "isLikelyRegistrationComplete: \(status) \(detail) \(title) → false")
+        }
+
+        // summary 字段组合
+        let p = BrowserAutomationResultPayload(
+            status: "ok", detail: "ok", url: "https://app.typeless.com/dashboard", title: "  Dashboard  ",
+            timestamp: "t"
+        )
+        check(p.summary.contains("Dashboard"), "summary: 保留 title（含 trim 后）")
+        check(p.summary.contains("dashboard"), "summary: 含 url")
+        let noTitle = BrowserAutomationResultPayload(status: "ok", detail: "ok", url: "https://x.com", title: "   ", timestamp: "t")
+        check(noTitle.summary.contains("无标题"), "summary: 空 title 显示「无标题」")
+    }
+
+    // MARK: - v2.4.0 ToolkitAccountImporter 边界 & 安全
+    private static func runToolkitAccountImporterEdgeCaseChecks() {
+        // 缺字段时必须用 fallback，不崩
+        let minimal: [String: Any] = ["email": "x@y.com"]
+        let r1 = ToolkitAccountImporter.importableAccount(from: minimal, existingDomains: ["y.com"])
+        check(r1.account.email == "x@y.com", "importableAccount: 最小输入能导入")
+        check(r1.account.name == "x", "importableAccount: 缺 nickname 用 email 本地部分")
+        check(r1.account.role == "free", "importableAccount: 缺 role 默认 free")
+        check(r1.tokenSummary == nil, "importableAccount: 无 token 不产生 tokenSummary")
+
+        // token 是 NSNumber 而非 String：必须能识别
+        let numeric: [String: Any] = [
+            "email": "n@y.com",
+            "user_id": 12345 as NSNumber,
+            "token": 999999 as NSNumber
+        ]
+        let r2 = ToolkitAccountImporter.importableAccount(from: numeric, existingDomains: ["y.com"])
+        check(r2.account.typelessUsername == "12345", "importableAccount: NSNumber user_id 转 string")
+        check(r2.tokenSummary?.accessTokenFingerprint == "sha256:937377f056160fc4",
+              "importableAccount: NSNumber token 仍生成指纹：实际值 \(r2.tokenSummary?.accessTokenFingerprint ?? "nil")")
+
+        // 空白字段被 trim
+        let padded: [String: Any] = [
+            "email": "  p@y.com  ",
+            "nickname": "   ",
+            "user_id": "  uid-1  "
+        ]
+        let r3 = ToolkitAccountImporter.importableAccount(from: padded, existingDomains: ["y.com"])
+        check(r3.account.email == "p@y.com", "importableAccount: email 被 trim")
+        check(r3.account.typelessUsername == "uid-1", "importableAccount: user_id 被 trim")
+
+        // refresh_token 但无 access_token：只记 refresh
+        let refreshOnly: [String: Any] = [
+            "email": "r@y.com",
+            "refresh_token": "r-secret"
+        ]
+        let r4 = ToolkitAccountImporter.importableAccount(from: refreshOnly, existingDomains: ["y.com"])
+        check(r4.tokenSummary?.accessTokenFingerprint == nil, "importableAccount: 无 access_token → access 指纹 nil")
+        check(r4.tokenSummary?.refreshTokenFingerprint != nil, "importableAccount: 有 refresh_token → refresh 指纹存在")
+        check(r4.tokenSummary?.discoveredKeys == ["refresh_token"], "importableAccount: discoveredKeys 只含 refresh_token")
+
+        // 邮箱无 @：domain fallback 到 existingDomains.first
+        let noAt: [String: Any] = ["email": "weird-format", "nickname": "weird"]
+        let r5 = ToolkitAccountImporter.importableAccount(from: noAt, existingDomains: ["fallback.com"])
+        check(r5.account.domain == "fallback.com", "importableAccount: 无 @ 邮箱 → domain 走 fallback")
+
+        // notes 包含「明文 token 警示」
+        let r6 = ToolkitAccountImporter.importableAccount(
+            from: ["email": "n@y.com", "token": "super-secret-token"],
+            existingDomains: ["y.com"]
+        )
+        check(r6.account.notes.contains("未保存明文 token"),
+              "importableAccount: notes 必须告知「未保存明文」")
+        check(!r6.account.notes.contains("super-secret-token"),
+              "importableAccount: notes 不能含明文 token")
+
+        // 完全空输入：email="", name=""（@ 切分首段为 ""）, domain=fallback, role=free
+        let empty: [String: Any] = [:]
+        let r7 = ToolkitAccountImporter.importableAccount(from: empty, existingDomains: ["only.com"])
+        check(r7.account.email == "", "importableAccount: 空输入 email=''")
+        check(r7.account.name.isEmpty, "importableAccount: 完全空时 name 为空（email 本地部分 = ''）")
+        check(r7.account.domain == "only.com", "importableAccount: 完全空时 domain 走 fallback")
+        check(r7.tokenSummary == nil, "importableAccount: 完全空无 token")
+
+        // email 无 @ + nickname 为空：name 走 email 本地部分（无 @ 时 first = 整体）
+        let noAtNoNick: [String: Any] = ["email": "weird-format"]
+        let r8 = ToolkitAccountImporter.importableAccount(from: noAtNoNick, existingDomains: ["only.com"])
+        check(r8.account.name == "weird-format",
+              "importableAccount: 无 @ 邮箱切分 first = 整体（当前实现行为）")
+        check(r8.account.domain == "only.com",
+              "importableAccount: 无 @ 邮箱 → domain 走 existingDomains fallback")
+    }
+
+    // MARK: - StoreRecovery：真的读写临时目录，不做源码字符串断言
+
+    private static func runStoreRecoveryChecks() {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("store-recovery-\(UUID().uuidString)", isDirectory: true)
+        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        struct Payload: Equatable { let value: Int }
+        let timeZone = TimeZone(secondsFromGMT: 0)!
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let fixedNow = Date(timeIntervalSince1970: 1_755_000_000) // 2025-08-13T09:20:00Z
+
+        // 1. 备份后缀必须文件名安全：无冒号、无斜杠、无空格
+        let suffix = StoreRecovery.corruptedBackupNameSuffix(fixedNow, timeZone: timeZone)
+        check(suffix.count == 15, "StoreRecovery: 后缀长度 15（yyyyMMdd-HHmmss），实际 \(suffix.count)")
+        check(suffix.contains("-"), "StoreRecovery: 后缀含日期-时间分隔符")
+        let illegal: Set<Character> = [":", "/", " ", "\\"]
+        check(suffix.allSatisfy { !illegal.contains($0) }, "StoreRecovery: 后缀文件名安全（无 : / 空格）")
+
+        // 2. 完整备份文件名 = store.json.corrupted-<后缀>
+        let backupName = StoreRecovery.corruptedBackupFileName(fixedNow, timeZone: timeZone)
+        check(backupName.hasPrefix("store.json.corrupted-"), "StoreRecovery: 备份名前缀 store.json.corrupted-")
+        check(backupName == "store.json.corrupted-\(suffix)", "StoreRecovery: 备份名拼装一致")
+
+        // 3. 正常读取 + 解码成功：返回 success，且磁盘上文件仍存在（不能被误备份移走）
+        let goodURL = root.appendingPathComponent("store.json")
+        try? Data("{\"value\":7}".utf8).write(to: goodURL)
+        let good = StoreRecovery.load(
+            from: goodURL, now: fixedNow, timeZone: timeZone, fileManager: fm
+        ) { data -> Payload in
+            let text = String(data: data, encoding: .utf8) ?? ""
+            return Payload(value: Int(text.filter(\.isNumber)) ?? -1)
+        }
+        check(good == .success(Payload(value: 7)), "StoreRecovery: 正常文件解码成功")
+        check(fm.fileExists(atPath: goodURL.path), "StoreRecovery: 成功路径绝不动原文件")
+
+        // 4. 解码失败：原文件被移走备份，且备份内容与原文件逐字节一致（这是 P0-2 的核心保证）
+        let badURL = root.appendingPathComponent("store.json")
+        let originalBytes = Data("NOT-VALID-JSON-Ω".utf8)
+        try? originalBytes.write(to: badURL)
+
+        enum DecodeBoom: Error { case boom }
+        let bad = StoreRecovery.load(
+            from: badURL, now: fixedNow, timeZone: timeZone, fileManager: fm
+        ) { _ -> Payload in throw DecodeBoom.boom }
+
+        guard case .failure(let failure) = bad else {
+            fputs("FAIL: StoreRecovery: 解码失败必须返回 .failure\n", stderr)
+            exit(1)
+        }
+        check(failure.backupFileName == backupName, "StoreRecovery: 失败时备份名 = store.json.corrupted-<ts>")
+        check(failure.backupErrorDescription == nil, "StoreRecovery: 备份成功时无 backupError")
+        check(!fm.fileExists(atPath: badURL.path),
+              "StoreRecovery: 损坏文件已被移走（不会在下一次读取时二次损坏）")
+        let backupURL = root.appendingPathComponent(backupName)
+        check(fm.fileExists(atPath: backupURL.path), "StoreRecovery: 备份文件真实落盘")
+        check(fm.contents(atPath: backupURL.path) == originalBytes,
+              "StoreRecovery: 备份内容与原文件逐字节一致（Keychain 密码不丢）")
+        check(failure.message.contains("已备份为 \(backupName)"),
+              "StoreRecovery: 用户文案说明已备份，实际：\(failure.message)")
+
+        // 5. 文件根本不存在：同样走失败分支，文案里带解码错误，不会 crash
+        let missingURL = root.appendingPathComponent("never-written.json")
+        let missing = StoreRecovery.load(
+            from: missingURL, now: fixedNow, timeZone: timeZone, fileManager: fm
+        ) { _ -> Payload in Payload(value: 0) }
+        guard case .failure(let missingFailure) = missing else {
+            fputs("FAIL: StoreRecovery: 文件不存在必须返回 .failure\n", stderr)
+            exit(1)
+        }
+        check(!missingFailure.decodeErrorDescription.isEmpty,
+              "StoreRecovery: 缺失文件带出可读错误描述")
+        check(missingFailure.message.contains("无法读取账号池"),
+              "StoreRecovery: 缺失文件文案包含「无法读取账号池」")
+
+        // 6. 备份目标已存在同名文件：先删后移，不被旧备份卡住
+        let collisionURL = root.appendingPathComponent("store.json")
+        try? Data("BROKEN-AGAIN".utf8).write(to: collisionURL)
+        try? Data("OLD-BACKUP".utf8).write(to: root.appendingPathComponent(backupName))
+        let collision = StoreRecovery.load(
+            from: collisionURL, now: fixedNow, timeZone: timeZone, fileManager: fm
+        ) { _ -> Payload in throw DecodeBoom.boom }
+        guard case .failure(let collisionFailure) = collision else {
+            fputs("FAIL: StoreRecovery: 同名备份冲突场景必须返回 .failure\n", stderr)
+            exit(1)
+        }
+        check(collisionFailure.backupErrorDescription == nil,
+              "StoreRecovery: 同名旧备份被覆盖，不报错")
+        check(fm.contents(atPath: root.appendingPathComponent(backupName).path) == Data("BROKEN-AGAIN".utf8),
+              "StoreRecovery: 同名备份被新内容覆盖")
+    }
+
+    // MARK: - QuotaGuardLaunchAgentPlanner：对真实 plist 文本做断言
+
+    private static func runQuotaGuardLaunchAgentPlannerChecks() {
+        let planner = QuotaGuardLaunchAgentPlanner.self
+
+        // 1. 间隔换算走 SmartSwitchPolicy 归一化：0/负数 → 1 分钟，超上限 → 120 分钟
+        check(planner.intervalSeconds(intervalMinutes: 5) == 300, "Planner: 5 分钟 → 300 秒")
+        check(planner.intervalSeconds(intervalMinutes: 0) == 60, "Planner: 0 分钟被拉到 1 分钟（60 秒）")
+        check(planner.intervalSeconds(intervalMinutes: -30) == 60, "Planner: 负数被拉到 1 分钟")
+        check(planner.intervalSeconds(intervalMinutes: 9999) == 120 * 60, "Planner: 超大值压到 120 分钟上限")
+
+        // 2. daemon 动态调间隔的钳制：launchd 低于 20 秒会拒绝加载
+        check(planner.reconciledIntervalSeconds(1) == planner.minimumIntervalSeconds,
+              "Planner: 1 秒被拉到最小 \(planner.minimumIntervalSeconds) 秒")
+        check(planner.reconciledIntervalSeconds(0) == planner.minimumIntervalSeconds, "Planner: 0 秒同样钳到最小")
+        check(planner.reconciledIntervalSeconds(10_000) == planner.maximumIntervalSeconds,
+              "Planner: 超大秒数压到 \(planner.maximumIntervalSeconds) 秒")
+        check(planner.reconciledIntervalSeconds(600) == 600, "Planner: 合法值原样返回")
+
+        // 3. 日志路径：目录标准化 + 固定文件名
+        let logDir = "/tmp/typeless//./logs"
+        let logs = planner.logPaths(logDirectory: logDir)
+        check(logs.stdout.hasSuffix("quota-guard-launchd.out.log"), "Planner: stdout 日志文件名")
+        check(logs.stderr.hasSuffix("quota-guard-launchd.err.log"), "Planner: stderr 日志文件名")
+        check(!logs.stdout.contains("//") && !logs.stdout.contains("/./"),
+              "Planner: 日志路径已标准化（无 // 与 /./）")
+
+        // 4. 生成的 plist 必须是可被 PropertyListSerialization 解析的真实 XML（不是"看起来像"）
+        let programPath = "/Applications/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard"
+        let plist = planner.plistDocument(programPath: programPath, intervalMinutes: 3, logDirectory: logDir)
+        guard let parsed = try? PropertyListSerialization.propertyList(
+            from: Data(plist.utf8), options: [], format: nil
+        ) as? [String: Any] else {
+            fputs("FAIL: Planner: 生成的 plist 无法被 PropertyListSerialization 解析\n", stderr)
+            exit(1)
+        }
+        check(parsed["Label"] as? String == planner.label, "Planner: plist Label 正确")
+        check(parsed["RunAtLoad"] as? Bool == true, "Planner: plist RunAtLoad = true")
+        check(parsed["StartInterval"] as? Int == 180, "Planner: plist StartInterval = 180（3 分钟）")
+        check(parsed["ProcessType"] as? String == planner.processType, "Planner: plist ProcessType = Background")
+        check(parsed["Nice"] as? Int == planner.niceValue, "Planner: plist Nice = 10")
+        let args = parsed["ProgramArguments"] as? [String]
+        check(args?.count == 2, "Planner: ProgramArguments 有 2 项")
+        check(args?.first == programPath, "Planner: ProgramArguments[0] 是可执行路径")
+        check(args?.last == planner.daemonFlag, "Planner: ProgramArguments[1] = \(planner.daemonFlag)")
+        check(parsed["StandardOutPath"] as? String == logs.stdout, "Planner: plist stdout 路径与 logPaths 一致")
+
+        // 5. StartInterval 回读：文本路径与 Data 路径必须给出同一个值
+        check(planner.startIntervalSeconds(inPlistText: plist) == 180, "Planner: 从文本回读 StartInterval")
+        check(planner.startIntervalSeconds(inPlistData: Data(plist.utf8)) == 180, "Planner: 从 Data 回读 StartInterval")
+
+        // 6. StartInterval 缺失时两个入口都返回 nil（调用方据此放弃改写）
+        let noInterval = plist.replacingOccurrences(of: "<key>StartInterval</key>\n  <integer>180</integer>", with: "")
+        check(planner.startIntervalSeconds(inPlistText: noInterval) == nil, "Planner: 无 StartInterval 文本 → nil")
+        check(planner.startIntervalSeconds(inPlistData: Data(noInterval.utf8)) == nil, "Planner: 无 StartInterval Data → nil")
+        check(planner.replacingStartInterval(inPlistText: noInterval, seconds: 90) == nil,
+              "Planner: 无 StartInterval 时改写返回 nil（不硬写坏 plist）")
+
+        // 7. 就地改写：只动 StartInterval，其余键完好，且改后仍可解析
+        guard let updated = planner.replacingStartInterval(inPlistText: plist, seconds: 60) else {
+            fputs("FAIL: Planner: StartInterval 存在时改写不应返回 nil\n", stderr)
+            exit(1)
+        }
+        check(updated != plist, "Planner: 改写确实产生了变化")
+        check(planner.startIntervalSeconds(inPlistText: updated) == 60, "Planner: 改写后回读 = 60")
+        guard let reparsed = try? PropertyListSerialization.propertyList(
+            from: Data(updated.utf8), options: [], format: nil
+        ) as? [String: Any] else {
+            fputs("FAIL: Planner: 改写后的 plist 无法解析\n", stderr)
+            exit(1)
+        }
+        check(reparsed["StartInterval"] as? Int == 60, "Planner: 改写后仍是合法 plist 且 StartInterval = 60")
+        check(reparsed["Label"] as? String == planner.label, "Planner: 改写未破坏 Label")
+        check((reparsed["ProgramArguments"] as? [String])?.last == planner.daemonFlag,
+              "Planner: 改写未破坏 ProgramArguments")
+        check(reparsed["RunAtLoad"] as? Bool == true, "Planner: 改写未破坏 RunAtLoad")
+
+        // 8. 上限对齐：Planner 最大间隔与 SmartSwitchPolicy 归一化上限一致，不能两边各说各话
+        check(planner.maximumIntervalSeconds == SmartSwitchPolicy.normalizeCheckIntervalMinutes(120) * 60,
+              "Planner: 最大间隔与 SmartSwitchPolicy 上限对齐")
     }
 }

@@ -15,7 +15,23 @@
 5. v2.4.0 测试改革（删源串包含 + 加真实断言）✅
 6. v2.5.0 架构拆分（main.swift 7497 → 模块化）✅
 7. **v2.5.3** 新手引导回归修复 + 下次可用接线 + 单实例锁 ✅ aa89300
-8. **v2.5.4** 周期看门狗 + 启动自愈引导 + 旧副本清理 ✅ **07f7f54（当前版本）**
+8. **v2.5.4** 周期看门狗 + 启动自愈引导 + 旧副本清理 ✅ 07f7f54
+9. **v2.5.5** 引导补丁补强 + 周期时区可配 + 日志轮转 ✅ **205f5c6（当前版本）**
+
+### v2.5.5 关键代码定位
+- `Sources/TypelessSwitchboardCore/QuotaCycleClock.swift`（新）
+  周期日历**唯一来源**，NSLock 保护，`.iso8601` 日历天然周一为首日。
+  UI 倒计时 / 复活判定 / 看门狗排程三处都取 `QuotaCycleClock.shared.calendar`，
+  不再各拿 `Calendar.current`（本机 +0700、用户 +0800 会差 1 小时）
+- `Sources/TypelessSwitchboardCore/LogFileRotator.swift`（新）
+  **必须原地截断**（seek+write+truncateFile），绝不能 `write(to:atomically:)` 换 inode
+  —— launchd 的 stdout 重定向持有老 fd，换文件会让它往已删除的 inode 写
+- `Store/SwitchboardStore+OnboardingPatch.swift`
+  `desktopOnboardingState()` 三态 `complete/incomplete/missing`；
+  `backupDesktopOnboardingFileIfNeeded()` 只留第一份备份；
+  自愈写完回读校验；`startOnboardingGuardIfNeeded()` 5 分钟巡检
+- `Model/AppSettings.swift` `quotaCycleTimeZoneIdentifier`（空串=跟随系统，老 JSON 无需迁移）
+  UI 在 `QuotaGuardTabView` 底部；改完调 `setQuotaCycleTimeZoneIdentifier` 立即生效
 
 ### v2.5.4 关键代码定位
 - `Store/SwitchboardStore+SmartSwitch.swift`
@@ -107,5 +123,12 @@
 - **周期性任务不能只挂在业务回调上**：周额度复活原先只挂在额度同步里，
   守护关掉 / 周末不开 App 就漏跑。凡是「到点必须发生」的逻辑
   都要有独立的看门狗 + 统一的记录入口
-- **本机时区是 +0700，用户在深圳（+0800）**：引擎用 `.current` calendar，
-  倒计时会差 1 小时。待用户确认是否需要按 +0800 固定
+- **本机时区是 Asia/Bangkok(+0700)，用户在深圳（+0800）**：
+  `readlink /etc/localtime` 实测，不是猜的。v2.5.5 起周期日历统一走
+  `QuotaCycleClock`，settings 可锁 UTC+8；**当前仍是空串（跟随系统），待用户决定**。
+  倒计时口径是「到下周一 00:00」，不是「用尽后 7 天」，实际等待 0–7 天不等
+- **「读不到文件」不能一刀切当「没问题」**：v2.5.4 因此漏掉
+  「装了 Typeless 但 app-onboarding.json 被升级删掉」这种情况。
+  凡是「文件缺失」类的判定，都要区分「本来就不该有」和「本该有却没了」
+- **日志必须轮转，且轮转要原地截断**：守护 60 秒一行，实测堆到 24MB。
+  另外只砍一半不够，要循环砍到上限以内（15MB 砍一次还剩 7.5MB）

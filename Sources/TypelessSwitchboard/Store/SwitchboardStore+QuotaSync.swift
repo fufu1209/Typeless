@@ -287,6 +287,12 @@ extension SwitchboardStore {
         quotaObservedResets.append(
             QuotaCycleEngine.ObservedReset(at: now, from: previous, to: usedCharacters)
         )
+        // 同时落盘：观测要跨周才攒得够（判定口径至少要看两三次重置），
+        // 只放内存的话 App 一重启就清零，永远攒不到样本。
+        let record = QuotaCycleObservationStore.Record(
+            at: now, from: previous, to: usedCharacters, email: email
+        )
+        quotaObservationRecords = QuotaCycleObservationStore.append(record, to: quotaObservationFileURL())
         let stamp = ISO8601DateFormatter().string(from: now)
         let calendar = QuotaCycleClock.shared.calendar
         let distance = QuotaCycleEngine.secondsFromWeeklyBoundary(now, calendar: calendar)
@@ -296,6 +302,22 @@ extension SwitchboardStore {
             + (onBoundary ? "落在周界上（支持自然周口径）" : "不在周界上（支持滚动 7 天口径）")
         // 同时进守护日志和引导日志所在目录，方便一处翻。
         appendDaemonLog(remaining: nil, email: email, reason: line, resultID: nil)
+    }
+
+    /// 观测记录落盘位置。与 store.json 同目录，备份/迁移时一起带走。
+    func quotaObservationFileURL() -> URL {
+        fileURL.deletingLastPathComponent()
+            .appendingPathComponent("quota-cycle-observations.json")
+    }
+
+    /// 启动时把历史观测读回来。
+    ///
+    /// 顺序很重要：必须先读盘再开始采样，否则本轮同步会拿到「上一笔 = 无」
+    /// 而漏判一次重置 —— 恰好跨周重启的用户就少了最关键的那条证据。
+    func loadQuotaCycleObservations() {
+        let records = QuotaCycleObservationStore.load(from: quotaObservationFileURL())
+        quotaObservationRecords = records
+        quotaObservedResets = QuotaCycleObservationStore.resets(from: records)
     }
 
     /// 当前已观测到的重置次数（UI 用来显示「口径待确认 / 已确认」）。

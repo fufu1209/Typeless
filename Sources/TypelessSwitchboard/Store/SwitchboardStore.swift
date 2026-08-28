@@ -56,7 +56,11 @@ final class SwitchboardStore: ObservableObject {
     /// 这是实测周期口径（自然周 vs 滚动 7 天）的唯一办法。仅内存态，不做持久化。
     var quotaUsageSamples: [UUID: Int] = [:]
     /// 观测到的额度重置时刻（v2.5.6）。攒够样本后自动给出口径结论，不再靠猜。
+    /// **跨重启累积**：启动时从 `quota-cycle-observations.json` 读回，
+    /// 否则用户每天开关机的话永远攒不够样本（判定口径至少要看两三次重置 = 两三周）。
     var quotaObservedResets: [QuotaCycleEngine.ObservedReset] = []
+    /// 落盘版观测记录（含邮箱，便于事后人工核对）。
+    var quotaObservationRecords: [QuotaCycleObservationStore.Record] = []
     /// 最近一次自动复活的时间点（UI 展示用）。
     @Published var lastWeeklyRevivalAt: Date?
     /// 最近一次自动复活了哪些账号（UI 展示用）。
@@ -100,6 +104,8 @@ final class SwitchboardStore: ObservableObject {
         // LaunchAgent 守护（--daemon-check）是独立进程，它也要按同一个时区算周界，
         // 否则会出现「App 里显示该复活了，插件巡检却认为还没到点」。
         applyQuotaCycleTimeZone()
+        // 必须在任何同步之前把历史观测读回来，否则恰好跨周重启会漏掉最关键的那条证据。
+        loadQuotaCycleObservations()
         ensureExtractScript()
         refreshLaunchAgentStatus()
 

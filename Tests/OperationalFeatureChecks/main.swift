@@ -418,6 +418,7 @@ struct OperationalFeatureChecks {
 
         // MARK: - v2.5.6：周期口径改为实测观测，不再靠猜
         runQuotaCycleObservationChecks()
+        runQuotaCycleObservationStoreChecks()
 
         print("Operational feature checks passed")
     }
@@ -486,6 +487,75 @@ struct OperationalFeatureChecks {
     // 老实说：官方 /user/usage_stats **不返回重置时间戳**，免费账号的
     // current_period_end 也是 null —— 这件事服务端没告诉我们，之前是推断的。
     // 不继续猜，改成观测：额度数值下降那一刻就是一次真实重置。
+
+    // MARK: - v2.5.6 周期观测的落盘持久化
+    //
+    // 观测要跨周才攒得够（判定自然周 vs 滚动 7 天至少要看两三次重置 = 两三周）。
+    // 只放内存的话 App 一重启就清零，用户每天开关机永远攒不到样本 ——
+    // 这是「查缺补漏」里最该补的一条。
+
+    private static func runQuotaCycleObservationStoreChecks() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quota-obs-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("quota-cycle-observations.json")
+
+        // 1) 文件不存在 → 空数组，不能崩
+        check(QuotaCycleObservationStore.load(from: url).isEmpty,
+              "观测落盘：文件不存在时返回空数组")
+
+        // 2) 追加后能读回，且字段无损。
+        //    2026-08-24 / 08-31 00:00 UTC+8 都是周一 00:00（已核对，别改）
+        let t1 = Date(timeIntervalSince1970: 1_787_500_800)
+        let t2 = Date(timeIntervalSince1970: 1_788_105_600)
+        _ = QuotaCycleObservationStore.append(
+            QuotaCycleObservationStore.Record(at: t1, from: 8000, to: 0, email: "a@example.com"),
+            to: url
+        )
+        let afterTwo = QuotaCycleObservationStore.append(
+            QuotaCycleObservationStore.Record(at: t2, from: 6500, to: 120, email: "b@example.com"),
+            to: url
+        )
+        check(afterTwo.count == 2, "观测落盘：追加两条后为 2 条（实测 \(afterTwo.count)）")
+
+        let reloaded = QuotaCycleObservationStore.load(from: url)
+        check(reloaded.count == 2, "观测落盘：重新读取仍为 2 条（模拟 App 重启）")
+        check(reloaded.first?.email == "a@example.com", "观测落盘：邮箱保留，便于事后人工核对")
+        check(reloaded.last?.from == 6500 && reloaded.last?.to == 120, "观测落盘：下降幅度保留")
+        check(abs((reloaded.first?.at.timeIntervalSince1970 ?? 0) - t1.timeIntervalSince1970) < 1,
+              "观测落盘：时间戳精确到秒")
+
+        // 3) 落盘的记录能直接喂给引擎做口径判定 —— 这是整条链路的闭环
+        var shanghai = Calendar(identifier: .iso8601)
+        shanghai.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+        let inference = QuotaCycleEngine.inferCycleMode(
+            fromResets: QuotaCycleObservationStore.resets(from: reloaded),
+            calendar: shanghai
+        )
+        // t1=2026-08-24 00:00 UTC+8 正好是周一 00:00，t2 是下一周同一刻 → 应判自然周
+        check(inference.observationCount == 2, "观测落盘：读回的记录能喂给引擎（\(inference.observationCount) 条）")
+        if case .calendarWeek(let n) = inference {
+            check(n == 2, "观测落盘：跨重启后仍能判出自然周（依据 \(n) 次实测）")
+        } else {
+            check(false, "观测落盘：两次重置都落在周一 00:00，应判为自然周，实际 \(inference)")
+        }
+
+        // 4) 条数上限：不能无限增长
+        for i in 0..<(QuotaCycleObservationStore.maximumRetained + 20) {
+            _ = QuotaCycleObservationStore.append(
+                QuotaCycleObservationStore.Record(at: t1.addingTimeInterval(Double(i)), from: 10, to: 0, email: "x"),
+                to: url
+            )
+        }
+        let capped = QuotaCycleObservationStore.load(from: url)
+        check(capped.count == QuotaCycleObservationStore.maximumRetained,
+              "观测落盘：条数封顶 \(QuotaCycleObservationStore.maximumRetained)（实测 \(capped.count)）")
+
+        // 5) 清空（排障用）
+        QuotaCycleObservationStore.clear(url)
+        check(QuotaCycleObservationStore.load(from: url).isEmpty, "观测落盘：clear 后可重新开始观测")
+    }
 
     private static func runQuotaCycleObservationChecks() {
         var cal = Calendar(identifier: .iso8601)

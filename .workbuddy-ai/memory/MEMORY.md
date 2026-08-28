@@ -26,10 +26,16 @@
 - `Sources/TypelessSwitchboardCore/LogFileRotator.swift`（新）
   **必须原地截断**（seek+write+truncateFile），绝不能 `write(to:atomically:)` 换 inode
   —— launchd 的 stdout 重定向持有老 fd，换文件会让它往已删除的 inode 写
-- `Store/SwitchboardStore+OnboardingPatch.swift`
+- `Sources/TypelessSwitchboardCore/OnboardingPatchWriter.swift`（新，**补丁逻辑唯一实现**）
+  `state(ofOnboardingFile:)` / `needsPatch(state:treatMissingAsNeedsPatch:)` /
+  `writeCompletion(toOnboardingFile:)` / `writeStorageCompletion(to:expectedEmail:reportedVersion:)` /
+  `backupIfNeeded` / `readEmail` / `isNewUser`。路径全靠参数注入 → 可单测。
+  **改引导补丁的字段逻辑一律改这里，不要动 App 层**
+- `Store/SwitchboardStore+OnboardingPatch.swift`（只剩编排，不含字段逻辑）
+  `autoHealDesktopOnboardingIfSafe()` 自愈（写完回读校验）；
+  `startOnboardingGuardIfNeeded()` 5 分钟巡检；
   `desktopOnboardingState()` 三态 `complete/incomplete/missing`；
-  `backupDesktopOnboardingFileIfNeeded()` 只留第一份备份；
-  自愈写完回读校验；`startOnboardingGuardIfNeeded()` 5 分钟巡检
+  App 层所有写文件方法都只是转发到 `OnboardingPatchWriter`
 - `Model/AppSettings.swift` `quotaCycleTimeZoneIdentifier`（空串=跟随系统，老 JSON 无需迁移）
   UI 在 `QuotaGuardTabView` 底部；改完调 `setQuotaCycleTimeZoneIdentifier` 立即生效
 
@@ -132,3 +138,7 @@
   凡是「文件缺失」类的判定，都要区分「本来就不该有」和「本该有却没了」
 - **日志必须轮转，且轮转要原地截断**：守护 60 秒一行，实测堆到 24MB。
   另外只砍一半不够，要循环砍到上限以内（15MB 砍一次还剩 7.5MB）
+- **「只在某外部条件满足时才跑的代码」要尽早把纯逻辑剥离出来注入测试**：
+  引导补丁只在「Typeless 没在运行」时才允许写盘，而 Typeless 基本常开
+  → 写盘路径测试覆盖率为零，每次改动只能靠读日志猜。
+  判断标准：函数里混了「读外部状态」和「算/写结果」，就把后半段抽成注入式纯函数

@@ -34,6 +34,31 @@ Everything stays on your machine: accounts live in
 
 <!-- TODO: add a screenshot / short GIF of the menu bar and the account pool here -->
 
+## Screenshots
+
+All sensitive data (real emails, the private MoeMail domain, usernames, passwords) is masked
+in the screenshots below.
+
+### Account pool
+
+![Account pool](docs/images/screenshot-1-account-pool.png)
+
+### Smart switching
+
+![Smart switching](docs/images/screenshot-2-smart-switch.png)
+
+### Quota guard
+
+![Quota guard](docs/images/screenshot-3-quota-guard.png)
+
+### Registration & email (after self-hosting MoeMail)
+
+![Registration & email](docs/images/screenshot-4-registration.png)
+
+### Diagnostics
+
+![Diagnostics](docs/images/screenshot-5-diagnostics.png)
+
 ---
 
 ## Quick start

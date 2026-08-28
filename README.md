@@ -21,6 +21,30 @@ Typeless 是一款很好用的 macOS 语音输入 / 转写工具，但免费账�
 <!-- TODO: 补一张菜单栏 + 账号池界面的截图或 GIF。
      工具类项目没有截图，转化率会差一大截 —— 这是当前最该补的东西。 -->
 
+## 界面预览
+
+界面是中文的，下面的截图脱敏后展示。真实邮箱、域名、用户名、密码等都打码。
+
+### 账号池
+
+![账号池](docs/images/screenshot-1-account-pool.png)
+
+### 智能换号
+
+![智能换号](docs/images/screenshot-2-smart-switch.png)
+
+### 额度守护
+
+![额度守护](docs/images/screenshot-3-quota-guard.png)
+
+### 注册与邮箱（自建 MoeMail 之后）
+
+![注册与邮箱](docs/images/screenshot-4-registration.png)
+
+### 自检排障
+
+![自检排障](docs/images/screenshot-5-diagnostics.png)
+
 ---
 
 ## 快速开始

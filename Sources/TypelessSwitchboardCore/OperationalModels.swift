@@ -1914,6 +1914,17 @@ public enum ConfigurationBundleIO {
     }
 
     /// 脱敏为 public 版：邮箱换成占位、notes 清空、保留其他结构性字段。
+    /// 脱敏：邮箱、域名、用户名、备注全部换成占位值，可安全发到公开场合。
+    ///
+    /// v2.5.6 修的两处泄漏（都是实测抓到的，不是想象出来的）：
+    /// 1. `settings` 整个照搬 → `moeMailBaseURL` 带着**真实的邮箱服务地址**，
+    ///    等于把自建服务的入口直接公布出去了；
+    /// 2. `typelessUsername` 原样保留 → 它是从真实邮箱的 local part 推导出来的
+    ///    （`sharp.writer.375478@x.com` → `sharp_writer_375478`），
+    ///    邮箱脱敏了但用户名还在，等于没脱。
+    ///
+    /// 判定标准很简单：脱敏后的 JSON 里**不该出现任何原 bundle 的字符串**，
+    /// `runConfigurationBundleChecks` 里有一条断言专门盯这个。
     public static func sanitize(_ bundle: ConfigurationBundle) -> ConfigurationBundle {
         let sanitizedAccounts: [ConfigurationBundleAccount] = bundle.accounts.enumerated().map { idx, acc in
             ConfigurationBundleAccount(
@@ -1921,19 +1932,35 @@ public enum ConfigurationBundleIO {
                 email: "demo\(idx + 1)@example.com",
                 domain: "example.com",
                 role: acc.role,
-                typelessUsername: acc.typelessUsername,
+                typelessUsername: "demo_user_\(idx + 1)",
                 notes: "",
                 createdAt: acc.createdAt,
                 status: acc.status
             )
         }
+        // 真实域名必须连根换掉：邮箱服务地址里含它，留着就等于泄露自建服务入口。
+        let realDomains = Set(
+            bundle.accounts.map(\.domain).filter { !$0.isEmpty }
+        )
+        var sanitizedBaseURL = bundle.settings.moeMailBaseURL
+        for domain in realDomains {
+            sanitizedBaseURL = sanitizedBaseURL.replacingOccurrences(of: domain, with: "example.com")
+        }
+        let sanitizedSettings = BundleSettings(
+            autoRotateRemainingThreshold: bundle.settings.autoRotateRemainingThreshold,
+            autoRotateCheckIntervalMinutes: bundle.settings.autoRotateCheckIntervalMinutes,
+            keepRunningInBackground: bundle.settings.keepRunningInBackground,
+            hotSpareTarget: bundle.settings.hotSpareTarget,
+            moeMailBaseURL: sanitizedBaseURL,
+            allowFullAutomaticReplacement: bundle.settings.allowFullAutomaticReplacement
+        )
         return ConfigurationBundle(
             schemaVersion: bundle.schemaVersion,
             appVersion: bundle.appVersion,
             exportedAt: bundle.exportedAt,
             kind: .publicEdition,
             accounts: sanitizedAccounts,
-            settings: bundle.settings
+            settings: sanitizedSettings
         )
     }
 }

@@ -2206,5 +2206,50 @@ struct OperationalFeatureChecks {
         // 7) BundleSettings 字段对齐
         check(BundleSettings.CodingKeys.allCases.count == 6,
               "BundleSettings 字段数应为 6（threshold/interval/keepRunning/hotSpare/baseURL/allowFull）")
+
+        // 8) 脱敏红线：脱敏后的 JSON **不得出现任何原始字符串**。
+        //    这是公开包的生命线 —— 漏一个字段就等于把自建服务入口或账号身份公布出去。
+        //    v2.5.6 实测抓到两处泄漏：moeMailBaseURL 带真实域名、typelessUsername
+        //    由真实邮箱 local part 推导而来（邮箱脱敏了但用户名还在 = 没脱）。
+        let secretDomain = "secret-mail.xyz"
+        let secretLocal = "sharp.writer.375478"
+        let secretUser = "sharp_writer_375478"
+        let dirtyAccounts = [
+            ConfigurationBundleAccount(
+                name: "主力", email: "\(secretLocal)@\(secretDomain)", domain: secretDomain,
+                role: "平民", typelessUsername: secretUser, notes: "内网地址 10.0.0.7",
+                createdAt: Date(timeIntervalSince1970: 1_700_000_000), status: "available"
+            )
+        ]
+        let dirtySettings = BundleSettings(
+            autoRotateRemainingThreshold: 200,
+            autoRotateCheckIntervalMinutes: 1,
+            keepRunningInBackground: true,
+            hotSpareTarget: 1,
+            moeMailBaseURL: "https://mail.\(secretDomain)",
+            allowFullAutomaticReplacement: true
+        )
+        let dirty = ConfigurationBundle(
+            appVersion: AppVersion.short, kind: .full,
+            accounts: dirtyAccounts, settings: dirtySettings
+        )
+        let clean = ConfigurationBundleIO.sanitize(dirty)
+        let cleanData = (try? JSONEncoder().encode(clean)) ?? Data()
+        let cleanText = String(data: cleanData, encoding: .utf8) ?? ""
+        for secret in [secretDomain, secretLocal, secretUser, "10.0.0.7"] {
+            check(!cleanText.contains(secret),
+                  "脱敏红线：不得残留原始串「\(secret)」")
+        }
+        check(clean.kind == .publicEdition, "脱敏：kind 必须是 publicEdition")
+        check(clean.accounts.first?.email == "demo1@example.com",
+              "脱敏：邮箱换成占位（\(clean.accounts.first?.email ?? "")）")
+        check(clean.accounts.first?.typelessUsername == "demo_user_1",
+              "脱敏：用户名必须一起换掉，否则等于没脱（\(clean.accounts.first?.typelessUsername ?? "")）")
+        check(clean.settings.moeMailBaseURL == "https://mail.example.com",
+              "脱敏：邮箱服务地址里的真实域名也要换（\(clean.settings.moeMailBaseURL)）")
+        check(clean.accounts.first?.notes.isEmpty == true, "脱敏：notes 必须清空")
+        // 阈值这类非敏感设置应当保留，脱敏不是重置
+        check(clean.settings.autoRotateRemainingThreshold == 200,
+              "脱敏：非敏感设置要保留（阈值不变）")
     }
 }

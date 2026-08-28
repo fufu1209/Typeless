@@ -320,19 +320,45 @@ export default {
       });
     }
 
-    // 3. 接口 B：获取指定邮箱的最新邮件 (用于 Switchboard 自动轮询提取 6 位验证码)
-    if (url.pathname === "/api/messages") {
-      const email = url.searchParams.get("email");
-      if (!email) {
-        return new Response(JSON.stringify({ error: "Missing email param" }), { status: 400 });
-      }
-      const messages = mailStore.get(email) || [];
-      return new Response(JSON.stringify(messages), {
+    // 3. 接口 B：生成一个随机邮箱地址（Switchboard 注册新号时先调它）
+    if (url.pathname === "/api/emails/generate" && request.method === "POST") {
+      const local = "t" + Math.random().toString(36).substring(2, 10);
+      const address = local + "@" + actualDomain;
+      mailStore.set(address.toLowerCase(), []);
+      return new Response(JSON.stringify({ id: local, address, email: address, domain: actualDomain }), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
 
-    return new Response("MoeMail Mock Server Running", { status: 200 });
+    // 4. 接口 C：列出已有邮箱（Switchboard「注册与邮箱」页拉取域名列表时用）
+    if (url.pathname === "/api/emails" && request.method === "GET") {
+      const list = [...mailStore.keys()].map((address) => ({
+        id: address.split("@")[0],
+        address,
+        email: address,
+        domain: actualDomain
+      }));
+      return new Response(JSON.stringify({ emails: list }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 5. 接口 D：取某个邮箱收到的邮件（Switchboard 轮询这里提取 6 位验证码）
+    //    注意路径是 /api/emails/{id}，不是 /api/messages —— 早期版本写错过。
+    const detail = url.pathname.match(/^\/api\/emails\/(.+)$/);
+    if (detail && request.method === "GET") {
+      const key = decodeURIComponent(detail[1]).toLowerCase();
+      const address = key.includes("@") ? key : key + "@" + actualDomain;
+      const messages = mailStore.get(address) || [];
+      return new Response(JSON.stringify({ messages }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    return new Response(JSON.stringify({ error: "Not Found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
   },
 
   // 4. Cloudflare Email Routing 接收邮件触发器

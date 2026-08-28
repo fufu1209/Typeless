@@ -29,6 +29,14 @@ struct QuotaSummaryView: View {
         store.state.accounts.filter { $0.status == .paused || $0.effectiveReviewState == .rejected }.count
     }
 
+    /// v2.5.3：全池统一的下一次额度刷新时间（Typeless 官方按自然周，周一 00:00 本地时区）。
+    /// 用尽的号数 > 0 时才展示，避免额度充足时噪音。
+    private var nextRefreshText: String? {
+        guard exhaustedCount > 0 else { return nil }
+        guard let reset = QuotaCycleEngine.nextCalendarWeekReset(now: Date()) else { return nil }
+        return QuotaCycleEngine.countdownText(from: Date(), to: reset)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -42,6 +50,17 @@ struct QuotaSummaryView: View {
                 Spacer()
                 Text("\(totalRemaining)")
                     .font(.title3.weight(.semibold))
+            }
+            if let nextRefreshText {
+                HStack(spacing: 4) {
+                    Image(systemName: "clock.badge.questionmark")
+                        .imageScale(.small)
+                    Text("用尽的号 \(nextRefreshText)后恢复")
+                        .lineLimit(1)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("Typeless 官方按自然周计额度，每周一 00:00（本地时区）刷新")
             }
             Divider()
             HStack(spacing: 8) {

@@ -226,6 +226,72 @@ public enum QuotaCycleEngine {
         return silentReady.first
     }
 
+    // MARK: - 倒计时文案
+
+    /// 人类可读倒计时。≥1 天显示「X 天 Y 小时」，≥1 小时显示「X 小时 Y 分」，否则「X 分」。
+    /// 目标时间已过或为 0 时返回「即将」。
+    public static func countdownText(from now: Date = Date(), to target: Date) -> String {
+        let seconds = max(0, target.timeIntervalSince(now))
+        let totalMinutes = Int(seconds / 60)
+        if totalMinutes <= 0 { return "即将" }
+
+        let days = totalMinutes / 1440
+        let hours = (totalMinutes % 1440) / 60
+        let minutes = totalMinutes % 60
+
+        if days > 0 {
+            return "\(days) 天 \(hours) 小时"
+        }
+        if hours > 0 {
+            return "\(hours) 小时 \(minutes) 分"
+        }
+        return "\(minutes) 分"
+    }
+
+    /// 账号「下次可用」展示文案。UI 直接绑定这个，避免各处自己拼字符串造成口径不一致。
+    /// - 已耗尽：显示到下次刷新的倒计时 + 刷新时点说明。
+    /// - 余额 > 0 且可用：显示「立即可用」。
+    /// - 暂停：显示「已暂停，需手动恢复」。
+    public static func nextAvailabilityText(
+        for account: AccountQuotaSnapshot,
+        now: Date = Date(),
+        mode: QuotaCycleMode = .calendarWeek,
+        calendar: Calendar = .current
+    ) -> String {
+        if account.status == .paused {
+            return "已暂停，需手动恢复"
+        }
+        if account.remainingCharacters > 0 && (account.status == .available || account.status == .nearlySpent) {
+            return "立即可用"
+        }
+
+        switch mode {
+        case .calendarWeek:
+            guard let reset = nextCalendarWeekReset(now: now, calendar: calendar) else {
+                return "刷新时间计算失败"
+            }
+            return "\(countdownText(from: now, to: reset))后（周一 00:00）"
+        case .rollingWeek:
+            let reset = account.lastResetAt.addingTimeInterval(weekSeconds)
+            return "\(countdownText(from: now, to: reset))后（注册满 7 天）"
+        }
+    }
+
+    /// 下次刷新的绝对时间点，UI 用来做定时刷新 / 状态栏展示。
+    public static func nextResetDate(
+        for account: AccountQuotaSnapshot,
+        now: Date = Date(),
+        mode: QuotaCycleMode = .calendarWeek,
+        calendar: Calendar = .current
+    ) -> Date? {
+        switch mode {
+        case .calendarWeek:
+            return nextCalendarWeekReset(now: now, calendar: calendar)
+        case .rollingWeek:
+            return account.lastResetAt.addingTimeInterval(weekSeconds)
+        }
+    }
+
     // MARK: - 摘要
 
     /// 给 UI 展示的周期摘要，例如：

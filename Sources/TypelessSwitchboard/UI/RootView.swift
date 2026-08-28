@@ -9,6 +9,11 @@ import TypelessSwitchboardCore
 // - 下面 TabView 承载 5 个功能面，每个 tab 内部用 NavigationStack + 统一卡片排版；
 // - 原来右侧 360px 的 InspectorView 拆散后按语义归位到对应 tab，不再有深层折叠。
 
+extension Notification.Name {
+    /// 顶部告警横幅 → 跳到「自检排障」tab。
+    static let switchboardJumpToDiagnostics = Notification.Name("local.typeless.switchboard.jumpToDiagnostics")
+}
+
 struct RootView: View {
     @EnvironmentObject private var store: SwitchboardStore
 
@@ -53,6 +58,9 @@ struct RootView: View {
                 selectedAccountID = store.state.accounts.first?.id
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .switchboardJumpToDiagnostics)) { _ in
+            selection = .diagnostics
+        }
         .task {
             guard !commandLineAutomationStarted else { return }
             commandLineAutomationStarted = true
@@ -83,8 +91,14 @@ private struct GlobalStatusBar: View {
                 .background(Color.accentColor.gradient)
                 .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
 
-            Text("Typeless Switchboard")
-                .font(.headline)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Typeless Switchboard")
+                    .font(.headline)
+                // v2.5.3：v2 改 5-tab 后丢掉了这句副标题，这里补回，保留产品身份识别。
+                Text("MoeMail 注册与账号切换")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
 
             Divider()
                 .frame(height: 22)
@@ -94,10 +108,24 @@ private struct GlobalStatusBar: View {
             Spacer(minLength: 8)
 
             if store.diagnostics.contains(where: { $0.level == .error }) {
-                Label("环境依赖或权限缺失", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption.weight(.semibold))
+                // v2.2.0 只留了一个图标 + help 提示，用户看不到「去哪修」。
+                // v2.5.3：把这句找回并做成可点的，直接跳到自检 tab。
+                Button {
+                    NotificationCenter.default.post(name: .switchboardJumpToDiagnostics, object: nil)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text("环境依赖或权限缺失")
+                                .font(.caption.weight(.semibold))
+                            Text("部分功能受限，点此运行一键自检")
+                                .font(.caption2)
+                        }
+                    }
                     .foregroundStyle(.orange)
-                    .help("部分功能受限，请到「自检排障」运行一键自检")
+                }
+                .buttonStyle(.plain)
+                .help("部分功能受限，点此跳到「自检排障」运行一键自检")
             }
 
             if store.isSyncingSession {

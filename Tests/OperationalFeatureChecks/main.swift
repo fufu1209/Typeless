@@ -405,7 +405,209 @@ struct OperationalFeatureChecks {
         runKeychainCacheBehaviorChecks()
         runConfigurationBundleChecks()
 
+        // MARK: - v2.5.3：用户回归报障三项（新手引导 / 下次可用 / 无感换号）
+        runNextAvailabilityChecks()
+        runOnboardingSchemaChecks()
+
         print("Operational feature checks passed")
+    }
+
+    // MARK: - v2.5.3 「下次可用」文案
+    //
+    // 背景：QuotaCycleEngine 的周期方法 v2.1.0 就有了，但 UI 从未调用，
+    // 账号行/详情里「下次可用」永远是空白。这里把桥接层钉死。
+
+    private static func runNextAvailabilityChecks() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.firstWeekday = 2 // Monday
+
+        // --- countdownText 三档格式 ---
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        check(
+            QuotaCycleEngine.countdownText(from: base, to: base.addingTimeInterval(3 * 86400 + 5 * 3600)) == "3 天 5 小时",
+            "countdownText：3 天 5 小时档"
+        )
+        check(
+            QuotaCycleEngine.countdownText(from: base, to: base.addingTimeInterval(5 * 3600 + 12 * 60)) == "5 小时 12 分",
+            "countdownText：5 小时 12 分档"
+        )
+        check(
+            QuotaCycleEngine.countdownText(from: base, to: base.addingTimeInterval(42 * 60)) == "42 分",
+            "countdownText：42 分档"
+        )
+        check(
+            QuotaCycleEngine.countdownText(from: base, to: base.addingTimeInterval(-10)) == "即将",
+            "countdownText：目标已过返回「即将」"
+        )
+        // 边界：正好 24 小时应归到「1 天 0 小时」而不是「24 小时 0 分」
+        check(
+            QuotaCycleEngine.countdownText(from: base, to: base.addingTimeInterval(86400)) == "1 天 0 小时",
+            "countdownText：正好 24h 归到天档"
+        )
+        // 边界：正好 60 分钟应归到「1 小时 0 分」
+        check(
+            QuotaCycleEngine.countdownText(from: base, to: base.addingTimeInterval(3600)) == "1 小时 0 分",
+            "countdownText：正好 60min 归到小时档"
+        )
+
+        // --- nextAvailabilityText 状态机 ---
+        func snapshot(
+            status: AccountQuotaSnapshot.Status,
+            used: Int,
+            limit: Int = 8000,
+            lastResetAt: Date = Date()
+        ) -> AccountQuotaSnapshot {
+            AccountQuotaSnapshot(
+                id: UUID(),
+                email: "a@example.com",
+                status: status,
+                reviewState: .approved,
+                usedCharacters: used,
+                monthlyLimit: limit,
+                lastResetAt: lastResetAt,
+                createdAt: Date(),
+                hasSilentSessionPayload: true
+            )
+        }
+
+        let usable = snapshot(status: .available, used: 1000)
+        check(
+            QuotaCycleEngine.nextAvailabilityText(for: usable, calendar: cal) == "立即可用",
+            "nextAvailabilityText：有余额且可用 → 立即可用"
+        )
+
+        let nearlySpent = snapshot(status: .nearlySpent, used: 7900)
+        check(
+            QuotaCycleEngine.nextAvailabilityText(for: nearlySpent, calendar: cal) == "立即可用",
+            "nextAvailabilityText：nearlySpent 仍有余额 → 立即可用"
+        )
+
+        let exhausted = snapshot(status: .exhausted, used: 8000)
+        let exhaustedText = QuotaCycleEngine.nextAvailabilityText(for: exhausted, calendar: cal)
+        check(exhaustedText.contains("周一 00:00"), "nextAvailabilityText：用尽 → 带「周一 00:00」说明")
+        check(exhaustedText.contains("后（"), "nextAvailabilityText：用尽 → 带倒计时前缀")
+        check(!exhaustedText.contains("立即可用"), "nextAvailabilityText：用尽不能显示立即可用")
+
+        let paused = snapshot(status: .paused, used: 0)
+        check(
+            QuotaCycleEngine.nextAvailabilityText(for: paused, calendar: cal) == "已暂停，需手动恢复",
+            "nextAvailabilityText：暂停 → 需手动恢复（不能被自动复活语义污染）"
+        )
+
+        // 余额为 0 但状态仍是 available：口径应判为不可用（走倒计时）
+        let zeroLeft = snapshot(status: .available, used: 8000)
+        check(
+            QuotaCycleEngine.nextAvailabilityText(for: zeroLeft, calendar: cal) != "立即可用",
+            "nextAvailabilityText：余额 0 即使 status=available 也不能说立即可用"
+        )
+
+        // --- nextResetDate 与 daysUntilReset 一致性 ---
+        let mondayMidnight = cal.date(from: DateComponents(year: 2026, month: 8, day: 24, hour: 0, minute: 0))!
+        let anyAccount = snapshot(status: .exhausted, used: 8000)
+        guard let resetDate = QuotaCycleEngine.nextResetDate(for: anyAccount, now: mondayMidnight, calendar: cal) else {
+            check(false, "nextResetDate：本周一 00:00 必须能算出下次刷新时间")
+            return
+        }
+        let days = QuotaCycleEngine.daysUntilReset(now: mondayMidnight, mode: .calendarWeek, calendar: cal)
+        let intervalDays = Int(round(resetDate.timeIntervalSince(mondayMidnight) / 86400))
+        check(days == intervalDays, "nextResetDate 与 daysUntilReset 口径一致（\(days) vs \(intervalDays)）")
+        check(resetDate > mondayMidnight, "nextResetDate 必须晚于 now")
+
+        // rollingWeek：刷新点 = lastResetAt + 7 天
+        let weekAgo = mondayMidnight.addingTimeInterval(-7 * 86400)
+        let rollingAccount = snapshot(status: .exhausted, used: 8000, lastResetAt: weekAgo)
+        let rollingReset = QuotaCycleEngine.nextResetDate(
+            for: rollingAccount, now: mondayMidnight, mode: .rollingWeek, calendar: cal
+        )
+        check(rollingReset == mondayMidnight, "rollingWeek：lastResetAt + 7 天即刷新点")
+
+        // rollingWeek 文案
+        let rollingText = QuotaCycleEngine.nextAvailabilityText(
+            for: snapshot(status: .exhausted, used: 8000, lastResetAt: mondayMidnight.addingTimeInterval(-6 * 86400)),
+            now: mondayMidnight,
+            mode: .rollingWeek,
+            calendar: cal
+        )
+        check(rollingText.contains("注册满 7 天"), "rollingWeek 文案：注册满 7 天")
+    }
+
+    // MARK: - v2.5.3 Typeless 2.4.0 onboarding schema
+    //
+    // 背景：Typeless 2.4.0 把 onboarding 平台枚举从 4 个扩到 7 个
+    //（+ linux / harmony / webpage），macos 节点还新增 app_version / completed_at。
+    // 旧补丁只写 4 个，新号仍会被判为「引导未完成」而弹新手引导。
+
+    private static func runOnboardingSchemaChecks() {
+        let officialPlatforms = ["ios", "android", "macos", "windows", "linux", "harmony", "webpage"]
+        check(officialPlatforms.count == 7, "Typeless 2.4.0 平台枚举应为 7 个")
+
+        // 模拟 2.4.0 真实文件：只带 macos（已完成）+ 三个新平台（未完成）
+        var onboarding: [String: Any] = [
+            "ios": ["completed": false],
+            "android": ["completed": false],
+            "macos": ["completed": true, "app_version": "2.4.0", "completed_at": "2026-08-28T15:22:38Z"],
+            "windows": ["completed": false],
+            "linux": ["completed": false],
+            "harmony": ["completed": false],
+            "webpage": ["completed": false]
+        ]
+
+        // 复刻补丁里的平台并集逻辑：官方枚举 ∪ 文件已有键
+        let platformKeys = Set(officialPlatforms).union(onboarding.keys)
+        for platform in platformKeys {
+            var state = onboarding[platform] as? [String: Any] ?? [:]
+            state["completed"] = true
+            if platform == "macos" {
+                if state["app_version"] == nil { state["app_version"] = "2.4.0" }
+                if state["completed_at"] == nil { state["completed_at"] = "now" }
+            }
+            onboarding[platform] = state
+        }
+
+        for platform in officialPlatforms {
+            let state = onboarding[platform] as? [String: Any]
+            check(state?["completed"] as? Bool == true, "补丁后 \(platform) 必须 completed=true")
+        }
+        // 重点回归：2.4.0 新增的三个平台不能被漏掉
+        for platform in ["linux", "harmony", "webpage"] {
+            let state = onboarding[platform] as? [String: Any]
+            check(state?["completed"] as? Bool == true, "补丁后 2.4.0 新增平台 \(platform) 必须 completed=true")
+        }
+        // macos 节点的 2.4.0 专属字段必须保留（不能被覆盖成占位值）
+        let macos = onboarding["macos"] as? [String: Any]
+        check(macos?["app_version"] as? String == "2.4.0", "已存在的 app_version 必须保留不被覆盖")
+        check(macos?["completed_at"] as? String == "2026-08-28T15:22:38Z", "已存在的 completed_at 必须保留不被覆盖")
+
+        // 未来官方再加平台：文件里出现未知键也应被一并置为 completed
+        var futureOnboarding: [String: Any] = ["visionos": ["completed": false], "macos": ["completed": false]]
+        let futureKeys = Set(officialPlatforms).union(futureOnboarding.keys)
+        for platform in futureKeys {
+            var state = futureOnboarding[platform] as? [String: Any] ?? [:]
+            state["completed"] = true
+            futureOnboarding[platform] = state
+        }
+        check(
+            (futureOnboarding["visionos"] as? [String: Any])?["completed"] as? Bool == true,
+            "未来新增平台（visionos）应被自动兼容"
+        )
+        check(futureKeys.count == 8, "并集应覆盖 7 官方 + 1 未知 = 8 个平台")
+
+        // 空 onboarding 字典：仍要补齐 7 个平台
+        var emptyOnboarding: [String: Any] = [:]
+        for platform in Set(officialPlatforms).union(emptyOnboarding.keys) {
+            var state = emptyOnboarding[platform] as? [String: Any] ?? [:]
+            state["completed"] = true
+            emptyOnboarding[platform] = state
+        }
+        check(emptyOnboarding.count == 7, "空 onboarding 补丁后应补齐 7 个平台")
+
+        // 8000 是每账号「每周」字数额度，不是账号数（用户误解澄清点，写成断言固化）
+        check(QuotaCycleEngine.defaultWeeklyLimit == 8000, "单账号周额度上限固定为 8000 字")
+        check(AccountQuotaSnapshot(
+            id: UUID(), email: "x@example.com", status: .available, reviewState: .approved,
+            usedCharacters: 0, monthlyLimit: 8000, lastResetAt: Date(), createdAt: Date(),
+            hasSilentSessionPayload: false
+        ).remainingCharacters == 8000, "新建账号初始剩余额度 = 8000")
     }
 
     private static func runQuotaCycleEngineChecks() {

@@ -40,8 +40,14 @@ struct RotateTabView: View {
             if let account = selectedAccount {
                 InfoLine(
                     label: "当前选中",
-                    value: "\(account.email) · 剩余 \(account.remainingCharacters) / \(account.monthlyLimit)",
+                    value: "\(account.email) · 本周剩余 \(account.remainingCharacters) / \(account.monthlyLimit)",
                     color: account.remainingCharacters > 0 ? .primary : .orange
+                )
+                // v2.5.3：换号决策最关心的是「这个号什么时候能再用」，之前完全没显示。
+                InfoLine(
+                    label: "下次可用",
+                    value: account.nextAvailabilityText,
+                    color: account.nextAvailabilityText == "立即可用" ? .primary : .orange
                 )
             } else {
                 InfoLine(label: "当前选中", value: "未选择账号", color: .orange)

@@ -14,6 +14,8 @@ struct AccountDetailView: View {
     @EnvironmentObject private var store: SwitchboardStore
     @State private var showingDeleteConfirmation = false
     @State private var generatedPassword = ""
+    @State private var isPatchingOnboarding = false
+    @State private var onboardingPatchSummary = ""
 
     var body: some View {
         ScrollView {
@@ -74,7 +76,9 @@ struct AccountDetailView: View {
     private var quotaPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label("本月额度", systemImage: "gauge.with.dots.needle.50percent")
+                // v2.5.3：Typeless 官方口径是「周额度」（week_word_usage），
+                // 旧 UI 写「本月额度」会误导，这里统一为周。
+                Label("本周额度", systemImage: "gauge.with.dots.needle.50percent")
                     .font(.headline)
                 Spacer()
                 Text("剩余 \(account.remainingCharacters) 字")
@@ -84,9 +88,28 @@ struct AccountDetailView: View {
             ProgressView(value: account.usageRatio)
                 .tint(account.status.color)
 
+            // v2.5.3：接上 QuotaCycleEngine —— 周额度何时刷新、距离刷新还有多久。
+            HStack(spacing: 6) {
+                Image(systemName: "clock.badge.questionmark")
+                    .foregroundStyle(.secondary)
+                Text("下次可用：\(account.nextAvailabilityText)")
+                    .font(.callout)
+                if let reset = account.nextResetDate {
+                    Spacer()
+                    Text(reset.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("下次额度刷新的确切时间（周一 00:00 本地时区）")
+                }
+            }
+
+            Text("口径：Typeless 官方按自然周计额度，每周一 00:00（本地时区）刷新。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
             HStack(spacing: 12) {
                 NumberField(title: "已用字数", value: binding(\.usedCharacters))
-                NumberField(title: "每月额度", value: binding(\.monthlyLimit))
+                NumberField(title: "每周额度", value: binding(\.monthlyLimit))
             }
 
             HStack(spacing: 8) {
@@ -104,7 +127,7 @@ struct AccountDetailView: View {
                     account.lastResetAt = Date()
                     onSave()
                 } label: {
-                    Label("本月重置", systemImage: "arrow.clockwise")
+                    Label("本周重置", systemImage: "arrow.clockwise")
                 }
             }
             .buttonStyle(.bordered)
@@ -313,6 +336,16 @@ struct AccountDetailView: View {
                     Label("复制摘要", systemImage: "list.clipboard")
                 }
 
+                // v2.5.3：独立于换号流程的引导补丁入口。
+                // Typeless 2.4.0 起 onboarding schema 变了（平台枚举 4 → 7），
+                // 旧补丁漏写 linux/harmony/webpage 三个，导致新号仍会弹引导。
+                Button {
+                    Task { await skipDesktopOnboarding() }
+                } label: {
+                    Label(isPatchingOnboarding ? "处理中…" : "跳过新手引导", systemImage: "forward.end")
+                }
+                .disabled(isPatchingOnboarding)
+
                 Button(role: .destructive) {
                     showingDeleteConfirmation = true
                 } label: {
@@ -320,8 +353,23 @@ struct AccountDetailView: View {
                 }
             }
             .buttonStyle(.bordered)
+
+            if !onboardingPatchSummary.isEmpty {
+                Text(onboardingPatchSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
         }
         .panelStyle()
+    }
+
+    private func skipDesktopOnboarding() async {
+        isPatchingOnboarding = true
+        defer { isPatchingOnboarding = false }
+        let log = await store.skipTypelessDesktopOnboardingNow()
+        onboardingPatchSummary = log.joined(separator: "\n")
+        store.statusMessage = log.last ?? "新手引导处理完成"
     }
 
     private func binding<Value>(_ keyPath: WritableKeyPath<Account, Value>) -> Binding<Value> {

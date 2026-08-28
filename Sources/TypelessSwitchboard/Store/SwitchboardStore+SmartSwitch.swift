@@ -17,17 +17,8 @@ extension SwitchboardStore {
         let now = now
         for index in state.accounts.indices {
             let account = state.accounts[index]
-            let snapshot = AccountQuotaSnapshot(
-                id: account.id,
-                email: account.email,
-                status: Self.snapshotStatus(from: account.status),
-                reviewState: Self.snapshotReviewState(from: account.effectiveReviewState),
-                usedCharacters: account.usedCharacters,
-                monthlyLimit: account.monthlyLimit,
-                lastResetAt: account.lastResetAt,
-                createdAt: account.createdAt,
-                hasSilentSessionPayload: !(account.rawUserDataPayload?.isEmpty ?? true)
-            )
+            // v2.5.3：桥接收敛到 Account.quotaSnapshot，避免与 UI 的周期口径分叉。
+            let snapshot = account.quotaSnapshot
             guard QuotaCycleEngine.shouldRevive(account: snapshot, now: now, mode: mode, calendar: calendar) else { continue }
             state.accounts[index].status = .available
             state.accounts[index].usedCharacters = 0
@@ -39,23 +30,6 @@ extension SwitchboardStore {
             save()
         }
         return revivedEmails
-    }
-
-    static func snapshotStatus(from status: AccountStatus) -> AccountQuotaSnapshot.Status {
-        switch status {
-        case .available: return .available
-        case .nearlySpent: return .nearlySpent
-        case .exhausted: return .exhausted
-        case .paused: return .paused
-        }
-    }
-
-    static func snapshotReviewState(from state: ReviewState) -> AccountQuotaSnapshot.ReviewState {
-        switch state {
-        case .pending: return .pending
-        case .approved: return .approved
-        case .rejected: return .rejected
-        }
     }
 
     /// v2.1.0 接线：候选池生成前先复活已过期账号，再走原 SmartSwitchPolicy 决策。
@@ -145,6 +119,17 @@ extension SwitchboardStore {
             state.settings.checklist[idx].isDone = false
         }
 
+        // v2.5.3 兜底：若拉起后桌面端仍被判为新用户（例如 Typeless 启动时重写了 storage），
+        // 这里不打断用户（不退出重启），只把文件补写成最终态，保证下次启动不会再弹引导。
+        if typelessDesktopIsNewUser() {
+            let backfill = writeTypelessDesktopOnboardingFiles(
+                storageURL: typelessStorageURL(),
+                onboardingURL: typelessOnboardingURL(),
+                expectedEmail: nil
+            )
+            appendOnboardingPatchLog("无感换号后补写引导标记：\(backfill.joined(separator: "；"))")
+        }
+
         liveAccountEmail = targetAccount.email
         if liveRemainingCharacters == nil {
             liveRemainingCharacters = targetAccount.remainingCharacters
@@ -195,6 +180,19 @@ extension SwitchboardStore {
         // 确保 Typeless 数据目录存在，避免设备缓存被清后 Electron 冷启动路径异常。
         for directory in typelessDesktopSessionDataDirectories() {
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        // v2.5.3：无感换号的关键一步。
+        // 会话缓存刚写入时 userData.is_new_user=true，若直接拉起 Typeless，
+        // 它冷启动读盘就会判定为新用户并弹出新手引导 —— 这就是「换号后又要走新手引导」的根因。
+        // 这里在**拉起之前**把引导完成标记写死，Typeless 第一次读盘即是非新用户，全程无感。
+        let patchLog = writeTypelessDesktopOnboardingFiles(
+            storageURL: typelessStorageURL(),
+            onboardingURL: typelessOnboardingURL(),
+            expectedEmail: nil
+        )
+        if patchLog.contains(where: { $0.contains("失败") }) {
+            appendOnboardingPatchLog("无感换号写引导标记异常：\(patchLog.joined(separator: "；"))")
         }
 
         launchTypelessInBackground(activate: activateTypeless)

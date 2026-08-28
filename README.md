@@ -1,16 +1,77 @@
 # Typeless Switchboard
 
-一个兼容 macOS 的本地账号切换辅助工具，用来管理账号邮箱、每月额度状态，并完成 Typeless + Chrome + MoeMail 的全自动一键换号流程。
+**Typeless 免费额度快用完时，自动换到下一个有额度的账号，你完全感觉不到。**
+
+[![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
+[![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-2.5.6-blue.svg)](CHANGELOG.md)
+
+> 🌍 [English README](README.en.md)
+
+Typeless 是一款很好用的 macOS 语音输入 / 转写工具，但免费账号**每周只有 8000 字**。
+用完之后，你得手动退出、登录另一个号、再走一遍新手引导 —— 一天可能要来两三次。
+
+这个工具把整套流程自动化：预先注册好一批账号，额度低了就**静默切换**，
+切换过程不打断你打字，也不用再走新手引导。
+
+> ⚠️ 本项目**只包含代码**，不含任何密钥、密码或账号数据。
+> 你的数据只存在本机 `~/Library/Application Support/TypelessSwitchboard/` 与 macOS Keychain。
+
+<!-- TODO: 补一张菜单栏 + 账号池界面的截图或 GIF。
+     工具类项目没有截图，转化率会差一大截 —— 这是当前最该补的东西。 -->
+
+---
+
+## 快速开始
+
+**前置条件**：macOS 13+，Xcode 命令行工具（提供 Swift 6），一个域名。
+
+```bash
+# 1. 克隆并构建安装，产物落在 /Applications/TypelessSwitchboard.app
+git clone https://github.com/fufu1209/Typeless.git
+cd Typeless
+./scripts/build-app.sh --install
+
+# 2. 打开 App，按「自检排障」页把需要的 macOS 权限开了
+open /Applications/TypelessSwitchboard.app
+
+# 3. 想要「自动注册新号」的话，还需要一个能收验证码的邮箱服务
+#    完整教程（买域名 → DNS → 部署邮箱 API）见 docs/DEPLOYMENT.md
+```
+
+只有第 3 步需要额外配置。**如果你已经有一批 Typeless 账号，前两步就够用了** ——
+手动把账号加进池子，工具就能自动轮换。
+
+> 第一次用建议先读 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)，
+> 里面有验证邮箱服务是否接通的三条 `curl`，先确认通了再往下走，
+> 否则后面报「取不到验证码」时分不清是邮箱没通还是注册流程的问题。
+
+---
+
+## 目录
+
+- [这个工具能做什么](#这个工具能做什么)
+- [这个工具不会做什么](#这个工具不会做什么)
+- [推荐使用方式](#推荐使用方式)
+- [macOS 权限](#macos-权限)
+- [全自动一键换号流程](#全自动一键换号流程)
+- [开机轻量额度守护](#开机轻量额度守护推荐不必一直开着-app)
+- [数据保存位置](#数据保存位置)
+- [域名邮箱搭建](docs/DEPLOYMENT.md)
+- [从零部署教程](docs/DEPLOYMENT.md)
+- [常见问题](#常见问题)
+- [参与贡献](#参与贡献)
+- [许可](#许可)
+
+---
 
 ## 更新记录
 
-### v1.1.0 — 速度与稳定性优化（2026-08-14）
+**当前版本 v2.5.6**（2026-08-29）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-- **换号全程不再冻结界面**：Chrome 弹窗处理、桌面会话清理、handoff、新手引导跳过等阻塞调用全部改为后台执行，`Thread.sleep` 换成可取消的异步等待；新手引导补丁最长等待不再卡死主线程。
-- **静默换号验证提速**：注入会话后的账号确认改为「本地解密快速校验」（新增 `--local-only` 模式，不请求官方额度 API），确认成功后再补一次完整额度同步；最坏验证耗时从约 80 秒降到约 20 秒，且不受网络波动影响。全自动换号完成后的会话固化循环同样受益。
-- **修复子进程管道死锁**：`runProcess` 改为边跑边读（缓冲上限 512KB），避免 Playwright/node 输出超过 64KB 管道缓冲后写阻塞、直到超时被杀的「卡 3 分钟」问题；超时时会带上已产生的部分输出。
-- **MoeMail 请求显式超时**：验证码轮询请求 8 秒超时（普通请求 15 秒），一次慢请求不再挤占整个验证码轮询窗口。
-- **减少重复写盘**：`save()` 内容未变时跳过 JSON 编码与原子写盘，UI 逐字符输入不再反复全量落盘。
+最近的主要变化：周期口径改为**实测观测**（不再靠猜）、额度周期**时区可切换且不用重启**、
+新手引导补丁**收成单一入口**、新增 `--export-full-bundle` / `--import-bundle` 便于换机迁移。
 
 ## 这个工具能做什么
 
@@ -19,7 +80,7 @@
 - 一键打开 Typeless 登录页、MoeMail 控制台或账号对应的邮箱入口。
 - 可打开本机 Typeless App、Typeless 官网，并检查 Typeless 入口是否可访问。
 - 一键自检 Typeless App、官网入口、MoeMail 配置、Node/npm/Playwright 缓存、macOS 权限和账号池可切换状态。
-- 复制邮箱地址，记录已用字数，标记本月额度已用完。
+- 复制邮箱地址，记录已用字数，标记本周额度已用完。
 - 保存本地切换检查清单，避免每次手动换号时漏步骤。
 - 本地保存 MoeMail API Key 到 macOS 钥匙串；密钥不会写入仓库。
 - 从 MoeMail 读取已有邮箱列表，并导入到账号池。
@@ -38,12 +99,12 @@
 - 右侧“连接设置”提供“打开权限设置”和“复制权限清单”，可快速处理辅助功能、自动化、麦克风、输入监听、屏幕录制、Chrome 外部协议和钥匙串授权。
 - 随机生成候选用户名、邮箱地址和强密码，减少手动输入。
 - 提供注册助手 / 兜底面板：自动流程卡住时，可复制邮箱、用户名、验证码，打开注册页和邮箱，记录核验完成。
-- 提供“准备切换”：把当前账号标记为本月已用完，选择下一个可用账号，复制邮箱，并打开 Typeless 与邮箱入口。
+- 提供“准备切换”：把当前账号标记为本周已用完，选择下一个可用账号，复制邮箱，并打开 Typeless 与邮箱入口。
 - 批量生成候选账号资料，方便之后自动注册或逐个兜底核验。
 - 候选账号只在自动化无法证明注册完成时进入“兜底确认队列”；正常全自动一键换号成功后会直接自动确认。
 - 通过剪贴板复制/恢复账号池 JSON 备份。
 - 通过剪贴板复制/导入账号 CSV，方便和表格工具配合整理大批账号。
-- 月初批量重置已确认账号的本月额度。
+- 每周新周期开始时批量复活已确认账号的额度。
 - 在侧边栏搜索账号，并按全部、可用、待确认、用完、暂停筛选。
 - 侧边栏显示可用、待确认、用完、暂停等运营摘要；账号行显示状态标签。
 - 复制当前账号切换摘要，方便兜底核验或留档。
@@ -81,7 +142,7 @@
 10. 需要集中准备资料时，在“账号池工具”里批量生成候选账号。
 11. 在“兜底确认队列”里核验每个候选账号，点“确认”后才会进入可用池。
 12. 只想半自动换已有账号时点“准备切换”，工具会打开本机 Typeless App、选择账号、复制邮箱并打开邮箱入口。
-13. 账号很多时，用“复制 CSV / 导入 CSV”和表格工具批量整理；每月新周期用“月初重置已确认账号”。
+13. 账号很多时，用“复制 CSV / 导入 CSV”和表格工具批量整理；每周新周期用「复活已用尽的账号」。
 14. 用侧边栏搜索和状态筛选快速定位账号；需要留档时点“复制摘要”。
 15. 定期点“复制体检报告”，检查重复邮箱、未填邮箱、待确认核和低额度账号。
 16. 需要核验本机环境时，可点“复制设备信息”或“生成登录态快照”，得到可留档的本机报告。
@@ -105,34 +166,20 @@
 
 ## 全自动一键换号流程
 
-点击“全自动一键换号”后，工具会按顺序执行：
+点一次「全自动一键换号」，工具会做完这些事：
 
-1. 先做 macOS 权限预检：辅助功能、自动化 Apple Events、Google Chrome 外部协议、Typeless 常用权限会在创建新邮箱前检查/触发；关键权限未开时会先暂停并打开系统设置，避免注册跑到中途才卡权限。随后准备 Node/npm/Playwright/Chromium 自动化运行环境；首次自检/首次换号会安装并写入 ready marker，后续只有在 Playwright 包和 Chromium 可执行文件都真实存在时才跳过 `npm install` 和 `playwright install`；如果失败，不创建新邮箱账号。
-2. 先处理 Google Chrome 里可能遗留的“要打开 Typeless.app 吗？”弹窗：勾选“始终允许 www.typeless.com 在关联的应用中打开此类链接”，再点击“打开 Typeless.app”，避免上一次 handoff 卡住。
-3. 退出本机 Typeless App，并把旧桌面登录态目录备份隔离到 `Automation/DesktopSessionBackups/<时间>/`；随后在原路径创建空目录，避免桌面 App 继续沿用旧账号。
-4. 关闭本工具之前打开的 Typeless 持久浏览器窗口，并把旧 `Automation/BrowserProfiles/` 整体备份隔离到 `Automation/BrowserSessionBackups/<时间>/`；随后创建新的空 `BrowserProfiles/`，避免旧网页登录态影响新号。
-5. 打开/复用 Google Chrome 的 Typeless 标签，清理 `typeless.com` 的 localStorage、sessionStorage、Cookie、IndexedDB 和 Cache，让 Chrome 也不再停留在旧 Typeless 账号。
-6. 调用 MoeMail API 创建新的邮箱。
-7. 生成 Typeless 用户名和强密码。
-8. 把强密码保存到 macOS Keychain，账号池里只保存“已保存到 Keychain”的提示。
-9. 生成 Playwright 注册脚本到：
+1. **预检**：macOS 权限 + Node/npm/Playwright/Chromium 运行环境，缺什么先补什么
+2. **清场**：退出 Typeless、备份隔离旧的桌面登录态与浏览器登录态、清 Chrome 的 Typeless 站点数据
+3. **建号**：调 MoeMail 生成新邮箱 → 生成用户名与强密码（**密码只进 Keychain，不落明文**）
+4. **注册**：用账号专属的 Chromium profile 跑 Playwright 脚本填表，
+   脚本文件不含明文密码，密码经进程环境变量注入
+5. **收码**：轮询 MoeMail 取验证码，写进桥接文件交给浏览器脚本继续提交
+6. **判定**：只有浏览器结果证明注册完成（进到 Dashboard/成功页）才算成功，
+   否则保留为「待兜底确认」，旧账号状态不变 —— **不会把你正在用的号弄丢**
+7. **收尾**：同步 Chrome 的网页登录态到新号、打开 Typeless handoff、跳过桌面端新手引导
 
-```text
-~/Library/Application Support/TypelessSwitchboard/Automation/
-```
-
-验证码桥接文件和浏览器结果 JSON 也位于同一个目录。脚本会等待验证码文件出现，避免验证码到达后重新打开页面丢失注册上下文；提交后会写回结果 JSON，App 会检查最终 URL/页面标题；只有结果像 Dashboard/工作台/成功页时才判定“完成”，否则进入“待兜底确认”。自动化脚本文件不写入明文密码，密码只从 Keychain 读取后通过当前进程环境变量传给脚本。
-
-10. 执行前先用 `node --check` 检查脚本语法；一键自检和正式执行都会准备/复用 Playwright 运行时，所有 npm/Playwright 步骤都有超时兜底，App 会为 Finder 启动场景补充 `~/.local/bin`、Homebrew 等常见 Node 路径。
-11. 在自动化目录本地安装/复用 Playwright 后，通过 `node <script>` 使用账号专属 Chromium profile 在后台填写注册页；注册前会清理该新号 profile，并尝试点击 Typeless 的 Logout/Log out/Sign out/登出/退出，避免页面残留会话影响新号注册。密码通过进程环境变量注入，脚本文件不保存明文密码。脚本兼容单页注册、多步骤 Continue/Next、确认密码、`name`/`id`/`aria-label`/`placeholder`/`label for`/`data-testid`/`data-cy` 风格输入框、分格 OTP 验证码、`verification_code`/`type=tel`/PIN 类单个验证码框、必选条款/隐私复选框、自定义 `role="checkbox"`，以及 `<button>`、`<a>` 链接、`input[type=button/submit]`、`data-testid`/`data-cy` 和 `role="button"` 风格的注册/发码/提交控件；如果页面里有隐藏模板字段或隐藏按钮排在前面，脚本会跳过不可见/不可编辑项，优先使用可见真实控件；遇到没有显式提交按钮的表单，会在验证码输入后按 Enter 兜底提交；遇到常见 Cookie/隐私弹窗会自动点击 Accept/Agree/同意/关闭类按钮，避免遮挡表单。注册成功后的网页登录态会保留在该账号的浏览器 profile 目录里，不会因脚本关闭而直接丢失。
-12. 浏览器脚本会先寻找 Send code/Get code/验证邮箱等按钮；如果填写账号资料后还需要 Continue/Next 才出现发码按钮，会自动推进一步后再次寻找发码按钮。随后页面保持打开，并等待本机验证码桥接文件。
-13. Swift 轮询 MoeMail 当前邮箱邮件，自动提取 4-8 位验证码；轮询采用“前几次 1-2 秒快速检查、后续退避”的 schedule，既更快拿到常见秒到验证码，又保持总窗口覆盖浏览器验证码桥接等待时间，避免验证码邮件稍慢到达时过早写入 `NO_CODE`；支持连续数字、空格分隔或短横线分隔的常见邮件格式。
-14. 提取到验证码后复制到剪贴板，同时写入验证码桥接文件；浏览器脚本读取后继续填入并提交。
-15. 浏览器提交后会等待 Dashboard/Workspace/成功页或明确错误页出现，兼容“创建工作区中/异步跳转”的延迟状态；成功页文案也支持 `You're all set`、`Account created` 等常见表达，然后写回结果 JSON，工具读取最终 URL 和页面标题。
-16. 只有浏览器结果证明注册完成时，才把新账号标记为可用并把当前账号标记为本月用完；如果页面无需验证码或浏览器已进入 Dashboard/Workspace，也以浏览器完成结果为准，不会因为 Swift 端没有提取到验证码而误退回兜底确认。
-17. 注册完成后会把 Google Chrome 的 Typeless 网页会话同步到新账号，并打开 Typeless handoff；如果 Chrome 弹出“要打开 Typeless.app 吗？”，工具会先勾选“始终允许 www.typeless.com...”，再点击“打开 Typeless.app”。成功路径不会自动打开账号专属 Playwright/Chromium 额外浏览器；该 profile 只保留用于右侧“打开新账号会话”手动排查。桌面端新手引导会尽量自动完成或跳过；自动化结果会记录被替换的旧账号，旧账号会标记为本月已用完。
-18. 如果结果仍停在注册/验证/错误页面，旧账号状态不变，新账号保留为待兜底确认，并在右侧“最近自动换号”里保存账号 ID、状态、验证码、脚本路径、验证码桥接文件、浏览器结果 JSON、浏览器登录态目录和日志；点击“重试最近自动化”可复用同一账号和脚本继续执行。
-
+每一步的完整细节、脚本路径、以及注册卡住时的排查方法，见
+**[docs/AUTOMATION.md](docs/AUTOMATION.md)**。
 
 ## 跨平台兼容
 
@@ -151,18 +198,6 @@ Windows 可用：
 
 ```powershell
 node scripts/typeless-portable-preflight.js --config config.local.json
-```
-
-## 运行
-
-```bash
-./scripts/run.sh
-```
-
-也可以直接运行：
-
-```bash
-swift run TypelessSwitchboard
 ```
 
 ## 开机轻量额度守护（推荐：不必一直开着 App）
@@ -269,162 +304,101 @@ $HOME/Library/Caches/TypelessSwitchboard/TypelessSwitchboard.app
 
 ---
 
-## 📧 域名邮箱（MoeMail）搭建与对接配置指南
+## 📧 邮箱服务配置
 
-本工具（`Typeless Switchboard`）采用开源的临时/自建域名邮箱体系（以 `MoeMail` 为标准 API 协议）来接收并轮询注册验证码。
-只要在工具右侧的「连接设置」中填写您**自建邮箱服务的 API 域名**与**自定义卡密 (API Key)**，即可实现全自动验证码收码。
+自动注册新号需要一个能收验证码的邮箱。在 App 的「连接设置」里填三项：
 
-### 1. 软件客户端配置项说明
+| 配置项 | 填什么 |
+|---|---|
+| 官方注册入口 | 默认 `https://www.typeless.com/login` |
+| 邮箱服务 URL | 你自建服务的 API 根路径，如 `https://mail.yourdomain.com`（**必须 HTTPS**） |
+| API Key / 卡密 | 你自己设的访问令牌，防止域名邮箱被别人盗刷 |
 
-当您或您的朋友使用本工具时，在右侧「连接设置」中需要填写以下三个信息：
-* **官方注册入口**：默认填 `https://www.typeless.com/login`。
-* **邮箱服务 URL**：填您自建域名邮箱系统的 API 根路径，例如 `https://mail.yourdomain.com`（必须支持 HTTPS）。
-* **API Key / 卡密**：您在自建后端服务时，自行在环境变量中设置的访问令牌（用来保障您的域名邮箱不被他人盗刷）。
+**怎么搭这个服务**：完整教程见 **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** ——
+从买域名、DNS 托管 Cloudflare、配置 MX/SPF/DKIM/DMARC，到部署邮箱 API，
+附可直接粘贴的 Cloudflare Worker 代码（约 100 行）和三条验证用的 `curl`。
 
-### 2. ⚡️ 1分钟极速自建方案 (基于 Cloudflare Workers 免费部署)
+需要的接口只有 4 个（鉴权头统一是 `X-API-Key`）：
 
-如果您不想购买并配置云服务器，可以直接使用 **Cloudflare Workers** 跑一个无服务器 (Serverless) 的轻量邮箱 API。步骤如下：
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/api/config` | 自检 + 取可用域名 |
+| GET | `/api/emails` | 列出已有邮箱 |
+| POST | `/api/emails/generate` | 生成随机邮箱 |
+| GET | `/api/emails/{id}` | 取该邮箱收到的邮件（轮询验证码） |
 
-#### 第一步：在 Cloudflare 中创建 Worker
-1. 登录 Cloudflare 控制台，进入 **Workers & Pages** -> 点击 **Create Application** -> **Create Worker**。
-2. 命名为 `typeless-moemail-backend` 并部署。
-3. 点击 **Quick Edit**（快速编辑），将以下完整的极简 API 代码粘贴进去并保存部署：
+字段名有容错：邮件对象认 `id/_id/messageId`、正文认 `text/body/content/preview`、
+时间认 `createdAt/receivedAt/date`，用哪个都行。
 
-```javascript
-// Cloudflare Worker 极简 MoeMail 协议仿真后端
-const API_KEY = "您自定义的卡密内容"; // 建议在 Worker 设置的 Environment Variables 中配置为 API_KEY 变量
-const DOMAIN = "yourdomain.com"; // 您的自定义邮箱域名
-
-// 内存数据库：用于临时缓存收到的邮件 (实际生产中可绑定 KV 存储)
-const mailStore = new Map(); 
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const clientKey = request.headers.get("x-api-key");
-    const actualKey = env.API_KEY || API_KEY;
-    const actualDomain = env.DOMAIN || DOMAIN;
-
-    // 1. 校验卡密 / API Key
-    if (clientKey !== actualKey) {
-      return new Response(JSON.stringify({ error: "Unauthorized API Key" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
-
-    // 2. 接口 A：自检配置，返回可用域名列表
-    if (url.pathname === "/api/config") {
-      return new Response(JSON.stringify({ domains: [actualDomain] }), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
-
-    // 3. 接口 B：生成一个随机邮箱地址（Switchboard 注册新号时先调它）
-    if (url.pathname === "/api/emails/generate" && request.method === "POST") {
-      const local = "t" + Math.random().toString(36).substring(2, 10);
-      const address = local + "@" + actualDomain;
-      mailStore.set(address.toLowerCase(), []);
-      return new Response(JSON.stringify({ id: local, address, email: address, domain: actualDomain }), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
-
-    // 4. 接口 C：列出已有邮箱（Switchboard「注册与邮箱」页拉取域名列表时用）
-    if (url.pathname === "/api/emails" && request.method === "GET") {
-      const list = [...mailStore.keys()].map((address) => ({
-        id: address.split("@")[0],
-        address,
-        email: address,
-        domain: actualDomain
-      }));
-      return new Response(JSON.stringify({ emails: list }), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
-
-    // 5. 接口 D：取某个邮箱收到的邮件（Switchboard 轮询这里提取 6 位验证码）
-    //    注意路径是 /api/emails/{id}，不是 /api/messages —— 早期版本写错过。
-    const detail = url.pathname.match(/^\/api\/emails\/(.+)$/);
-    if (detail && request.method === "GET") {
-      const key = decodeURIComponent(detail[1]).toLowerCase();
-      const address = key.includes("@") ? key : key + "@" + actualDomain;
-      const messages = mailStore.get(address) || [];
-      return new Response(JSON.stringify({ messages }), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
-
-    return new Response(JSON.stringify({ error: "Not Found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-    });
-  },
-
-  // 4. Cloudflare Email Routing 接收邮件触发器
-  async email(message, env, ctx) {
-    const emailTo = message.to; // 例如 sharp.orbit.123456@yourdomain.com
-    const emailFrom = message.from;
-    
-    // 读取邮件全文
-    let rawBody = "";
-    const reader = message.raw.getReader();
-    const decoder = new TextDecoder("utf-8");
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      rawBody += decoder.decode(value, { stream: true });
-    }
-
-    // 解析出 6 位数字验证码 (例如 Typeless 验证码为 123456)
-    const codeMatch = rawBody.match(/\b\d{6}\b/);
-    const code = codeMatch ? codeMatch[0] : "";
-    
-    const mailItem = {
-      id: Math.random().toString(36).substring(2),
-      from: emailFrom,
-      to: emailTo,
-      subject: `Your Typeless Verification Code: ${code}`,
-      body: rawBody,
-      text: `Your code is ${code}`,
-      createdAt: new Date().toISOString()
-    };
-
-    // 存入当前邮箱的收件箱列表
-    const emailKey = emailTo.toLowerCase();
-    if (!mailStore.has(emailKey)) {
-      mailStore.set(emailKey, []);
-    }
-    const list = mailStore.get(emailKey);
-    list.unshift(mailItem);
-    // 只保留最近 10 条，避免内存膨胀
-    if (list.length > 10) list.pop(); 
-  }
-};
-```
-
-#### 第二步：在 Cloudflare 中配置域名接收路由
-1. 进入您的域名控制台，点击 **Email -> Email Routing**。
-2. 开启 Email Routing，并在 **Routing Rules (路由规则)** 页面：
-   * 点击 **Add Rule (添加规则)**。
-   * 选择 **Catch-All (捕获所有未定义前缀的邮件)**。
-   * Action 选择 **Send to Worker**，并指定为您刚刚创建的 `typeless-moemail-backend` Worker。
-3. 按照 Cloudflare 引导自动一键添加 MX 记录以开始接收全球投递的邮件。
-
-#### 第三步：绑定自定义域名到 Worker (选填)
-在 Worker 的 **Settings -> Triggers -> Custom Domains** 里，添加一个您自定义的 API 子域名（例如 `mail.yourdomain.com`）指向该 Worker，大功告成！
+也可以直接用现成的开源项目 [moemail](https://github.com/beilunyang/moemail)，
+它本身就是按这套 API 设计的。
 
 ---
 
-## 🔍 SEO 检索与推广关键词优化（GitHub Search Optimization）
+## 常见问题
 
-为了方便更多开发者、自动化效率工具爱好者在 GitHub 上检索、收藏和复用本项目，我们在此列出关键的检索索引主题：
+**Q：一定要自建邮箱服务吗？**
+只有「自动注册新号」需要。已经有一批账号的话，直接加进池子就能自动轮换，
+邮箱服务可以完全不碰。
 
-* **GitHub Keywords**:
-  * `typeless-switchboard`, `typeless-automation`, `typeless-helper`, `playwright-autoclicker`, `macos-tcc-helper`, `voice-typing-switcher`, `temp-mail-auto-register`, `moemail-self-host`, `quota-auto-monitor`, `keychain-credential-injector`.
-* **搜索引擎检索方向**:
-  * **Typeless 自动换号/智能切换**：利用 macOS Keychain 凭证注入，快速进行客户端与 Chrome 网页版登录态重置。
-  * **MoeMail 自建域名邮箱对接**：全自动通过 Cloudflare Workers Catch-All 邮件转发并轮询提取 6 位数字验证码。
-  * **Mac 辅助安全性与自动化权限修复**：一键清除由于代码重签导致的 TCC.db 权限拉黑缓存，恢复 Apple Events 及控制权限。
-  * **免浏览器额度秒级自检**：使用 AES-CBC 动态指纹密钥直接解密 Electron 本地缓存文件，实现轻量级 API 额度同步。
+**Q：免费额度到底怎么刷新，是周一还是用满 7 天？**
+**官方没有说明**（定价页与账单 FAQ 只写「每周 8000 字」）。所以本工具不替你下定论：
+它每次拿到额度就采样，发现数值骤降就记为一次真实重置，攒够样本后自动校准口径。
+在「额度守护」页底部可以看到当前结论是「待确认」还是「已确认，依据 N 次实测」。
+系统时区与实际所在地不一致的话，那里还能一键改刷新时区，**不用重启**。
 
+**Q：注册时取不到验证码？**
+按顺序排查：① `docs/DEPLOYMENT.md` 里的三条 `curl` 是否全通；
+② `dig MX 你的域名.com` 看 MX 是否生效；③ Catch-All 规则的 Action 是不是 **Send to Worker**；
+④ 验证码邮件可能被判垃圾，去邮箱原始内容里翻一下。
+
+**Q：中国大陆自建会踩 25 端口的坑吗？**
+按本文的 Cloudflare 方案**不会** —— 收信只需要 MX 记录指向 Cloudflare，
+你自己从不主动发起 SMTP 连接。只有「自建邮局」（Mailu / Poste.io 之类）才会踩到
+国内云厂商默认封禁 25 出方向的问题。
+
+**Q：换台电脑怎么办？**
+```bash
+# 旧机器导出
+/Applications/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard --export-full-bundle
+# 新机器导入（按邮箱去重，已有账号不会重复添加）
+/Applications/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard --import-bundle <文件路径>
+```
+密码在 macOS Keychain、登录态与设备身份绑定，这两样要在新机器上重建 ——
+这是 Typeless 服务端的限制，绕不过去。
+
+**Q：会不会把我正在用的号弄丢？**
+不会。只有浏览器结果明确证明注册完成（进到 Dashboard / 成功页）才会切换，
+否则新号保留为「待兜底确认」，**旧账号状态不变**。
+
+**Q：密码安全吗？**
+强密码只写进 macOS Keychain，账号池里只存一句「已保存到 Keychain」的提示。
+生成的自动化脚本不含明文密码，密码经进程环境变量注入。
+
+---
+
+## 参与贡献
+
+欢迎提 Issue 和 PR。动手前请注意：
+
+- 改动**必须**跑通 `swift run OperationalFeatureChecks`（当前 451 条断言）与
+  `./scripts/test-browser-automation-smoke.sh`
+- 不要在本仓库提交任何真实账号、密码、API Key 或 `store.json`
+- 涉及 Typeless 客户端内部行为的改动，请在描述里说明**是怎么验证的** ——
+  这个项目吃过「以为对了其实没验证」的亏
+
+相关文档：
+
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) —— 从零部署
+- [docs/AUTOMATION.md](docs/AUTOMATION.md) —— 一键换号每一步的细节
+- [docs/cross-platform-compatibility.md](docs/cross-platform-compatibility.md) —— 跨平台兼容矩阵
+- [CHANGELOG.md](CHANGELOG.md) —— 版本记录
+
+---
+
+## 许可
+
+[MIT](LICENSE)。你可以自由使用、修改、分发，包括商用。
+
+Typeless 是第三方产品，本项目与之无隶属关系。请遵守 Typeless 自身的
+[服务条款](https://www.typeless.com/terms)。批量注册多账号存在被限制的风险，请自行判断。

@@ -135,7 +135,121 @@
    - `API_KEY`：你自己想一个长随机串
    - `DOMAIN`：你的域名
 
-完整代码见 [README.md → 1分钟极速自建方案](../README.md#2-️-1分钟极速自建方案-基于-cloudflare-workers-免费部署)。
+完整代码如下（**注意接口是 `/api/emails/{id}`，不是 `/api/messages`**）：
+
+```javascript
+// Cloudflare Worker 极简 MoeMail 协议仿真后端
+const API_KEY = "您自定义的卡密内容"; // 建议在 Worker 设置的 Environment Variables 中配置为 API_KEY 变量
+const DOMAIN = "yourdomain.com"; // 您的自定义邮箱域名
+
+// 内存数据库：用于临时缓存收到的邮件 (实际生产中可绑定 KV 存储)
+const mailStore = new Map(); 
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const clientKey = request.headers.get("x-api-key");
+    const actualKey = env.API_KEY || API_KEY;
+    const actualDomain = env.DOMAIN || DOMAIN;
+
+    // 1. 校验卡密 / API Key
+    if (clientKey !== actualKey) {
+      return new Response(JSON.stringify({ error: "Unauthorized API Key" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 2. 接口 A：自检配置，返回可用域名列表
+    if (url.pathname === "/api/config") {
+      return new Response(JSON.stringify({ domains: [actualDomain] }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 3. 接口 B：生成一个随机邮箱地址（Switchboard 注册新号时先调它）
+    if (url.pathname === "/api/emails/generate" && request.method === "POST") {
+      const local = "t" + Math.random().toString(36).substring(2, 10);
+      const address = local + "@" + actualDomain;
+      mailStore.set(address.toLowerCase(), []);
+      return new Response(JSON.stringify({ id: local, address, email: address, domain: actualDomain }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 4. 接口 C：列出已有邮箱（Switchboard「注册与邮箱」页拉取域名列表时用）
+    if (url.pathname === "/api/emails" && request.method === "GET") {
+      const list = [...mailStore.keys()].map((address) => ({
+        id: address.split("@")[0],
+        address,
+        email: address,
+        domain: actualDomain
+      }));
+      return new Response(JSON.stringify({ emails: list }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 5. 接口 D：取某个邮箱收到的邮件（Switchboard 轮询这里提取 6 位验证码）
+    //    注意路径是 /api/emails/{id}，不是 /api/messages —— 早期版本写错过。
+    const detail = url.pathname.match(/^\/api\/emails\/(.+)$/);
+    if (detail && request.method === "GET") {
+      const key = decodeURIComponent(detail[1]).toLowerCase();
+      const address = key.includes("@") ? key : key + "@" + actualDomain;
+      const messages = mailStore.get(address) || [];
+      return new Response(JSON.stringify({ messages }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    return new Response(JSON.stringify({ error: "Not Found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
+  },
+
+  // 4. Cloudflare Email Routing 接收邮件触发器
+  async email(message, env, ctx) {
+    const emailTo = message.to; // 例如 sharp.orbit.123456@yourdomain.com
+    const emailFrom = message.from;
+    
+    // 读取邮件全文
+    let rawBody = "";
+    const reader = message.raw.getReader();
+    const decoder = new TextDecoder("utf-8");
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      rawBody += decoder.decode(value, { stream: true });
+    }
+
+    // 解析出 6 位数字验证码 (例如 Typeless 验证码为 123456)
+    const codeMatch = rawBody.match(/\b\d{6}\b/);
+    const code = codeMatch ? codeMatch[0] : "";
+    
+    const mailItem = {
+      id: Math.random().toString(36).substring(2),
+      from: emailFrom,
+      to: emailTo,
+      subject: `Your Typeless Verification Code: ${code}`,
+      body: rawBody,
+      text: `Your code is ${code}`,
+      createdAt: new Date().toISOString()
+    };
+
+    // 存入当前邮箱的收件箱列表
+    const emailKey = emailTo.toLowerCase();
+    if (!mailStore.has(emailKey)) {
+      mailStore.set(emailKey, []);
+    }
+    const list = mailStore.get(emailKey);
+    list.unshift(mailItem);
+    // 只保留最近 10 条，避免内存膨胀
+    if (list.length > 10) list.pop(); 
+  }
+};
+```
+
 
 ### 3.4 把收到的信转给 Worker
 

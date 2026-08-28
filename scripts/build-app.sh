@@ -27,9 +27,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.1.0</string>
+  <string>2.0.0</string>
   <key>CFBundleVersion</key>
-  <string>2</string>
+  <string>3</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
@@ -53,3 +53,17 @@ if command -v codesign >/dev/null 2>&1; then
 fi
 
 echo "Built $APP"
+
+# v2.0.0：可选安装到 /Applications。用法：./scripts/build-app.sh --install [--launch]
+if [[ "${1:-}" == "--install" || "${2:-}" == "--install" ]]; then
+  DEST="/Applications/$APP"
+  echo "Installing to $DEST"
+  rm -rf "$DEST"
+  cp -R "$APP" "$DEST"
+  xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
+  echo "Installed $DEST"
+  if [[ "${1:-}" == "--launch" || "${2:-}" == "--launch" ]]; then
+    open "$DEST"
+    echo "Launched $DEST"
+  fi
+fi

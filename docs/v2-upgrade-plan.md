@@ -318,9 +318,81 @@ Sources/
 
 ### 10.4 遗留项（非阻塞）
 
-- `SwitchboardStore+Accounts.swift`（1677 行）与 `+LaunchAgent.swift`（1930 行）仍偏大，
-  可继续按「MoeMail 客户端 / 浏览器自动化 / 权限探测」再拆一轮。
+- ~~`SwitchboardStore+Accounts.swift`（1677 行）与 `+LaunchAgent.swift`（1930 行）仍偏大~~
+  **v2.5.1 已解决**：两个大文件按职责拆为 15 个文件，Store 目录最大文件从 1930 行降到 720 行。
 - UI 截图对照（§3.3 验收项）未做——需要人工在每个 tab 各截一张留档。
+
+### 10.5 功能保真审计（v2.5.1 补做）
+
+用户核心担忧：「不要把之前已有的一些很不错的功能板块都没留住」。
+以 v1.1.0（`33ed9f1`）为基线做**功能级**比对（不是"符号在不在"，是"每个可操作入口在不在"）：
+
+| 比对维度 | v1.1.0 | v2.0.0 | 丢失 |
+|---|---|---|---|
+| UI 调用的 store 成员 | 64 | 70 | **0** |
+| Toggle/Picker/TextField/SecureField/Stepper | 30 | 30 | **0**（完全一致） |
+| 按钮文案 | 53 | 57 | 0（1 条"差异"经查是 SF Symbol 图标名，误报） |
+| SwiftUI 可交互元素总数 | 258 | 254 | 0 |
+| 未挂载的 UI 组件（定义了但没被任何 tab 引用） | — | **0** | — |
+| 钥匙串 / 剪贴板 / Workspace 副作用调用 | — | 全部 ≥ 基线 | 0 |
+
+结论：**v1.1.0 的全部功能入口在 v2 中都保留，且新增 6 个 store 功能入口。**
+
+### 10.6 Store 二次拆分（v2.5.1）
+
+`SwitchboardStore+Accounts.swift`（1677 行）→ 8 个文件
+`SwitchboardStore+LaunchAgent.swift`（1930 行）→ 7 个文件
+
+拆分后 Store 目录：
+
+```
+SwitchboardStore.swift              449   类声明/存储属性/init/迁移
+SwitchboardStore+QuotaSync          257
+SwitchboardStore+RotateMonitor      395
+SwitchboardStore+SmartSwitch        216
+SwitchboardStore+AccountCRUD        163   增删改查/筛选/候选生成
+SwitchboardStore+ClipboardIO        259   剪贴板导入导出 + CSV 编解码
+SwitchboardStore+ReportExport       272   审计/环境/快照/排障包
+SwitchboardStore+MoeMail            170
+SwitchboardStore+MoeMailHTTP        181   HTTP 客户端 + JSON 解析
+SwitchboardStore+Permissions        152
+SwitchboardStore+TypelessApp        109
+SwitchboardStore+SetupDiagnostics   126
+SwitchboardStore+AutomaticReplacement 488
+SwitchboardStore+LaunchAgentControl 180
+SwitchboardStore+AutomationRuntime  322
+SwitchboardStore+RegistrationBridge 153
+SwitchboardStore+DeviceReset        201
+SwitchboardStore+BrowserAutomation  720
+SwitchboardStore+OnboardingPatch    301
+```
+
+**验证方式（内容级，不是"能编译就行"）**：
+- 成员数守恒：Accounts 63/63、LaunchAgent 75/75
+- **逐行内容比对**：拆分前后去掉 import 头与 extension 包裹后，
+  LaunchAgent 1747 行、Accounts 1502 行**完全一致（零丢失、零改写）**
+- `swift build` 零 error 零 warning
+- `OperationalFeatureChecks` / `AutomationSmokeChecks` / `test-operational-features.sh` 全绿
+- 真实启动：进程存活、stderr 零输出
+
+---
+
+### 10.7 拆分工具与踩坑（可复用）
+
+拆分脚本位于 `/tmp/`（未入库，如需复用请移入 `scripts/`）：
+`split_by_lines.py`（按成员起始行划区间）、`split_groups.py`（按配置输出文件）、
+`verify_split.py`（逐行内容比对）、`extract-ui.py`（SwiftUI 元素地毯式提取）。
+
+**关键踩坑**：
+1. **不要用大括号匹配来定函数边界**。函数体内若含字符串（尤其是 JS/AppleScript
+   模板字面量里的括号），括号计数会失衡，导致函数范围算错、吞掉后面的函数。
+   → 改用「成员起始行划区间」：区间 = 起始行 → 下一个成员起始行 − 1。绝不漏、绝不重叠。
+2. **回吸注释/属性后，区间起点要用回吸行而非签名行**，否则会切掉
+   `///` 文档注释和 `@discardableResult` 这类属性行。
+3. **成员函数修饰符要列全**（`nonisolated` / `static` / `mutating` / `override` 等），
+   否则 `nonisolated static func` 会被漏识别。
+4. **extension 内第一个成员之前的 `// MARK:` 不属于任何成员**，需单独补回。
+5. 拆分后必须做**逐行内容比对**，方法名数量守恒不足以证明内容没丢。
 
 ---
 

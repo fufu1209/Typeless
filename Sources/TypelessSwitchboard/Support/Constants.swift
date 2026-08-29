@@ -6,18 +6,14 @@ import Security
 import Darwin
 import TypelessSwitchboardCore
 
+/// 账号池首次创建时预填的邮箱域名。
+///
+/// 这里只放**中性占位值**，不要放任何人的真实域名 ——
+/// 这个仓库是公开的，硬编码真实域名等于把自建邮箱服务入口、
+/// 以及域名里可能带的姓名/生日信息一并公布出去。
+/// 用户在 App「注册与邮箱」页填自己的域名即可，会持久化到 store.json。
 let defaultDomains = [
-    "8888891.xyz",
-    "xiefucai1209.com",
-    "fucai.edu.kg",
-    "fucaixie.xyz",
-    "cnmlgb.de",
-    "zhooo.amyjaneofficial.ccwu.ccorg",
-    "coolkid.icu",
-    "zhooo.ggff.net",
-    "coolkidsa.ggff.net",
-    "20030416.xyz",
-    "amyjaneofficial.ccwu.cc"
+    "example.com"
 ]
 
 let typelessOfficialURL = "https://www.typeless.com/"

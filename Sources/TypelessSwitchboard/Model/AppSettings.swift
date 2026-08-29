@@ -32,7 +32,8 @@ struct AppSettings: Codable, Equatable, Sendable {
 
     static let defaults = AppSettings(
         typelessLoginURL: typelessDefaultLoginURL,
-        moeMailBaseURL: "https://mail.8888891.xyz",
+        // 中性占位，别填任何人的真实服务地址 —— 这个仓库是公开的。
+        moeMailBaseURL: "https://mail.example.com",
         domains: defaultDomains,
         checklist: [
             SwitchTask(title: "确认当前账号本月额度已经用完", isRequired: true),

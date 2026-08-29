@@ -431,7 +431,7 @@ extension SwitchboardStore {
             : 1
         let count = min(max(requestedCount, 1), 5)
         let domain = commandLineValue(for: "--auto-switch-domain", in: arguments)
-            .ifEmpty(state.settings.domains.first ?? "8888891.xyz")
+            .ifEmpty(state.settings.domains.first ?? "example.com")
         let apiKey = KeychainStore.readAPIKey()
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             fputs("TypelessSwitchboard CLI: MoeMail API Key missing in Keychain\n", stderr)

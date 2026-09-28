@@ -206,6 +206,33 @@ open /Applications/TypelessSwitchboard.app
 每一步的完整细节、脚本路径、以及注册卡住时的排查方法，见
 **[docs/AUTOMATION.md](docs/AUTOMATION.md)**。
 
+## 账号池运维脚本
+
+四个独立脚本，覆盖「体检 → 复活 → 校准 → 验收」：
+
+| 脚本 | 用途 | 是否写数据 |
+| --- | --- | --- |
+| `scripts/audit-account-pool.js` | 逐账号问官方「本周还剩多少字」，给出 verdict（`usable` / `exhausted` / `token-expired` / `dead` / `no-session` / `device-limit` …） | **只读** |
+| `scripts/revive-account-sessions.js` | 让静默会话过期的账号重新可用（借官方桌面端自己的刷新能力，外部进程刷不动） | 写会话与账号池 |
+| `scripts/sync-account-quotas.js` | 把账号池里的 `monthlyLimit` / `usedCharacters` 刷成服务端真实值 | 写账号池 |
+| `scripts/verify-silent-switch.js` | 真机端到端验证「账号能不能正常更换」，逐个走一遍换号并记录耗时 | 写会话（结束会恢复原账号） |
+
+```bash
+# 只读体检
+node scripts/audit-account-pool.js
+
+# 把额度字段刷成真实值（先看会改什么）
+node scripts/sync-account-quotas.js --dry-run
+
+# 验证换号（会重启 Typeless；结束自动恢复原账号）
+node scripts/verify-silent-switch.js --limit 3
+```
+
+> ⚠️ 跑真机换号验证（`verify-silent-switch.js`）前**必须先停掉自动轮换**，
+> 否则守护每 60 秒就会把你刚切上去的账号换走。做法是退出 App 并执行
+> `launchctl unload ~/Library/LaunchAgents/local.typeless.switchboard.quota-guard.plist`，
+> 验证完再装回来。
+
 ## 跨平台兼容
 
 - 本台 macOS 是当前最高优先级和已真实验证路径；不要为 Windows 适配破坏这条稳定链路。

@@ -397,6 +397,7 @@ struct OperationalFeatureChecks {
         runRegistrationCompletionPolicyChecks()
         runBrowserAutomationResultPayloadChecks()
         runToolkitAccountImporterEdgeCaseChecks()
+        runPreflightVerdictChecks()
         runLegacyQuotaRescaleChecks()
         runStoreRecoveryChecks()
         runQuotaGuardLaunchAgentPlannerChecks()
@@ -1808,6 +1809,39 @@ struct OperationalFeatureChecks {
               "importableAccount: 无 @ 邮箱切分 first = 整体（当前实现行为）")
         check(r8.account.domain == "only.com",
               "importableAccount: 无 @ 邮箱 → domain 走 existingDomains fallback")
+    }
+
+    // MARK: - v2.6.0 预检判定语义（PreflightVerdict）
+    //
+    // 锁的是「超时 ≠ 失败」这条语义。踩过的坑：
+    // `node --check` 实际 0.03 秒就能跑完，却因为进程等待机制在高负载下报「命令超时」，
+    // 被当成语法错误，直接中断了一次正常的全自动注册（第 2 个测试账号 needsAttention）。
+    // 预检只是廉价前置检查，真正的判据是紧接着的真实执行 —— 所以超时不能拦。
+    private static func runPreflightVerdictChecks() {
+        // 1) 三种输入 → 三种判定
+        check(PreflightVerdict.from(exitStatus: 0) == .ok, "退出码 0 → ok")
+        check(PreflightVerdict.from(exitStatus: 1) == .failed, "退出码 1 → failed（真有语法错误）")
+        check(PreflightVerdict.from(exitStatus: 127) == .failed, "退出码 127（命令不存在）→ failed")
+        check(PreflightVerdict.from(exitStatus: -1) == .failed, "退出码 -1（无法启动）→ failed")
+        check(PreflightVerdict.from(exitStatus: PreflightVerdict.timeoutExitStatus) == .unverified,
+              "超时退出码 → unverified，**不是** failed")
+
+        // 2) 只有「确实失败」才允许拦流程
+        check(PreflightVerdict.ok.shouldBlock == false, "ok 不得拦流程")
+        check(PreflightVerdict.unverified.shouldBlock == false,
+              "unverified 不得拦流程（否则一次假超时就会中断整轮注册）")
+        check(PreflightVerdict.failed.shouldBlock == true, "failed 必须拦流程")
+
+        // 3) 超时退出码本身不能和「正常失败」撞车
+        check(PreflightVerdict.timeoutExitStatus != 0, "超时退出码不得为 0")
+        check(PreflightVerdict.timeoutExitStatus < 0,
+              "超时退出码必须为负，与 POSIX 退出码（0-255）天然隔离")
+
+        // 4) 判定稳定、无副作用
+        for _ in 0..<200 {
+            check(PreflightVerdict.from(exitStatus: -2) == .unverified, "超时判定必须稳定")
+            check(PreflightVerdict.from(exitStatus: 0) == .ok, "成功判定必须稳定")
+        }
     }
 
     // MARK: - v2.6.0 存量迁移（LegacyQuotaRescale）

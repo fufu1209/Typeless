@@ -87,12 +87,14 @@ extension SwitchboardStore {
 
     func runPlaywrightScript(_ scriptURL: URL, password: String) async -> (success: Bool, message: String) {
         await Task.detached(priority: .utility) {
-            let syntaxCheck = SwitchboardStore.runProcess(
-                arguments: ["node", "--check", scriptURL.path],
-                environment: SwitchboardStore.automationEnvironment()
-            )
-            guard syntaxCheck.status == 0 else {
-                return (false, "Playwright 脚本语法检查失败：\(syntaxCheck.output.ifEmpty("退出码 \(syntaxCheck.status)"))")
+            switch SwitchboardStore.checkNodeScriptSyntax(scriptURL) {
+            case .failed(let reason):
+                return (false, "Playwright 脚本语法检查失败：\(reason)")
+            case .unverified(let note):
+                // 不拦：语法检查只是预检，紧接着的真实执行才是判据。
+                print("TypelessSwitchboard: Playwright 脚本语法检查未完成，继续执行 —— \(note)")
+            case .ok:
+                break
             }
 
             let scriptFolder = scriptURL.deletingLastPathComponent()
@@ -251,44 +253,93 @@ extension SwitchboardStore {
         process.standardError = pipe
 
         // 边跑边读：子进程输出超过管道缓冲（约 64KB）时会写阻塞，若等进程退出后才读会永远等不到退出。
-        // 这里用一个后台读取线程持续消费管道，最多保留 512KB，超时终止时也能拿到已产生的部分输出。
-        let readHandle = pipe.fileHandleForReading
+        // 最多保留 512KB，超时终止时也能拿到已产生的部分输出。
         let outputBuffer = OutputBuffer(maxBytes: 512 * 1024)
+        let exited = DispatchSemaphore(value: 0)
+        let drained = DispatchSemaphore(value: 0)
+
+        // v2.6.0 修复：全程改用**内核回调**，不再往 DispatchQueue.global 上丢阻塞线程。
+        //
+        // 旧实现每调一次 runProcess 就永久占用一个线程池线程去 `waitUntilExit()`，
+        // 再拿第二个线程去阻塞读管道。而自动化流程里子进程调用非常密集
+        // （node → npm → osascript → playwright 层层嵌套），叠上 Typeless 冷启动的 CPU 压力，
+        // 线程池会被这些「只为等待而存在」的线程占满，后提交的 block 排不上队 ——
+        // 于是明明 0.03 秒就跑完的 `node --check` 也会被判成「命令超时」。
+        //
+        // 实测后果很具体：全自动注册第 2 个账号因此中断（needsAttention），
+        // 而生成的脚本本身完全正常。terminationHandler / readabilityHandler
+        // 由内核直接回调，不占用线程池线程，从根上消除这类假超时。
+        process.terminationHandler = { _ in exited.signal() }
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                drained.signal()
+                return
+            }
+            outputBuffer.append(chunk)
+        }
 
         do {
             try process.run()
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
             return (-1, error.localizedDescription)
         }
 
-        let group = DispatchGroup()
-        group.enter() // 进程退出
-        group.enter() // 管道读完
-        DispatchQueue.global(qos: .utility).async {
-            process.waitUntilExit()
-            group.leave()
-        }
-        DispatchQueue.global(qos: .utility).async {
-            while true {
-                let chunk = readHandle.availableData
-                if chunk.isEmpty { break }
-                outputBuffer.append(chunk)
-            }
-            group.leave()
-        }
-
-        let timedOut = group.wait(timeout: .now() + timeoutSeconds) == .timedOut
+        let timedOut = exited.wait(timeout: .now() + timeoutSeconds) == .timedOut
         if timedOut {
             process.terminate()
-            // 给子进程死亡、管道 EOF 一点收尾时间。
-            _ = group.wait(timeout: .now() + 2)
+            // 给子进程死亡一点收尾时间。
+            _ = exited.wait(timeout: .now() + 2)
         }
+        // 等管道读到 EOF，把尾部输出取干净（最多再等 1 秒，拿不到就算了，不能让收尾拖慢主流程）。
+        _ = drained.wait(timeout: .now() + 1)
+        pipe.fileHandleForReading.readabilityHandler = nil
 
         let output = outputBuffer.string()
         if timedOut {
             return (-2, "命令超时：\(arguments.joined(separator: " "))\(output.isEmpty ? "" : "\n\(output)")")
         }
         return (process.terminationStatus, output)
+    }
+
+    /// `node --check` 的语义化结果。
+    ///
+    /// 必须区分两件事，因为处置完全相反：
+    ///   * **真有语法错误** —— 脚本必然跑不起来，必须中止；
+    ///   * **没能完成检查**（超时/无法执行）—— 只是「没验证过」，不该拦。
+    ///
+    /// v2.6.0 实测教训：`node --check` 明明 0.03 秒就能跑完，却因为 runProcess
+    /// 的线程池耗尽报「命令超时」，把一次完全正常的全自动注册判成失败。
+    /// 语法检查只是**廉价的预检**，真正的判据是紧接着的真实执行 —— 所以超时不拦，只留痕。
+    enum NodeSyntaxCheck {
+        case ok
+        /// 确实有语法错误，附原因。
+        case failed(String)
+        /// 没检查成，附说明。
+        case unverified(String)
+    }
+
+    nonisolated static func checkNodeScriptSyntax(
+        _ scriptURL: URL,
+        currentDirectory: URL? = nil,
+        timeoutSeconds: TimeInterval = 30
+    ) -> NodeSyntaxCheck {
+        let result = runProcess(
+            arguments: ["node", "--check", scriptURL.path],
+            environment: automationEnvironment(),
+            currentDirectory: currentDirectory,
+            timeoutSeconds: timeoutSeconds
+        )
+        switch PreflightVerdict.from(exitStatus: result.status) {
+        case .ok:
+            return .ok
+        case .unverified:
+            return .unverified("node --check 未在 \(Int(timeoutSeconds)) 秒内完成；脚本未必有问题，交由后续真实执行判定")
+        case .failed:
+            return .failed(result.output.ifEmpty("退出码 \(result.status)"))
+        }
     }
 
 

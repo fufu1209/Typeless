@@ -695,14 +695,13 @@ extension SwitchboardStore {
             ))
             try script.write(to: scriptURL, atomically: true, encoding: .utf8)
 
-            let syntaxCheck = SwitchboardStore.runProcess(
-                arguments: ["node", "--check", scriptURL.path],
-                environment: SwitchboardStore.automationEnvironment(),
-                currentDirectory: folder,
-                timeoutSeconds: 15
-            )
-            guard syntaxCheck.status == 0 else {
-                return "新账号浏览器会话脚本语法检查失败：\(syntaxCheck.output.ifEmpty("退出码 \(syntaxCheck.status)"))"
+            switch SwitchboardStore.checkNodeScriptSyntax(scriptURL, currentDirectory: folder, timeoutSeconds: 15) {
+            case .failed(let reason):
+                return "新账号浏览器会话脚本语法检查失败：\(reason)"
+            case .unverified(let note):
+                print("TypelessSwitchboard: 浏览器会话脚本语法检查未完成，继续执行 —— \(note)")
+            case .ok:
+                break
             }
 
             let process = Process()

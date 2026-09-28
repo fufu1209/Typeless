@@ -31,6 +31,16 @@
 - **会话/额度脚本存在两份实现并已分叉**。仓库 `scripts/extract-active-session.js`
   与 Swift 源码里的内嵌字符串各演化一份，线上跑的那份和仓库里已经不是同一个东西。
   现收敛为 App 包内 `Resources/extract-active-session.js` 单一来源。
+- **自动化子进程调用在系统高负载下假超时**。`runProcess` 把 `waitUntilExit()`
+  丢到 `DispatchQueue.global` 上，**每调一次就永久占用一个线程池线程**；
+  自动化流程里子进程调用非常密集（node → npm → osascript → playwright 层层嵌套），
+  叠上 Typeless 冷启动的 CPU 压力，线程池被这些「只为等待而存在」的线程占满，
+  后提交的 block 排不上队 —— 于是明明 **0.03 秒**就跑完的 `node --check`
+  也会被判成「命令超时」。实测后果：全自动注册第 2 个账号因此中断（`needsAttention`），
+  而生成的脚本本身完全正常。现已改为全程内核回调
+  （`terminationHandler` / `readabilityHandler`），不再占用线程池线程。
+  同时把「预检命令的判定语义」下沉为 Core 的 `PreflightVerdict`：
+  **超时 ≠ 失败**，`unverified` 不拦流程，只有真正 `failed` 才中止。
 - **macOS 27 SDK 下编译失败**。系统 SDK 把 SwiftUI 改成了宏实现
   （`SwiftUIMacros.StateMacro`），而宏插件只随完整 Xcode 分发，
   只装 Command Line Tools 的机器 `swift build` 必失败。

@@ -1558,6 +1558,35 @@ public struct SmartSwitchDecision: Equatable, Sendable {
     }
 }
 
+/// 「预检命令」（`node --check` 之类）执行结果的判定语义。
+///
+/// 必须把「命令跑完并失败」和「我们没能完成检查」分开，因为处置完全相反：
+///   * `failed`     —— 脚本确实有语法错误，跑不起来，**必须中止**；
+///   * `unverified` —— 超时 / 无法执行，只是「没验证过」，**不该拦**。
+///
+/// v2.6.0 实测教训：`node --check` 明明 0.03 秒就能跑完，却因为进程等待机制
+/// 占用线程池、在系统高负载下排不上队而报「命令超时」，
+/// 把一次完全正常的全自动注册判成失败（needsAttention）。
+/// 语法检查只是**廉价预检**，真正的判据是紧接着的真实执行。
+public enum PreflightVerdict: Equatable, Sendable {
+    case ok
+    case failed
+    case unverified
+
+    /// `SwitchboardStore.runProcess` 约定的超时退出码。
+    public static let timeoutExitStatus: Int32 = -2
+
+    /// - Parameter exitStatus: 子进程退出码；`timeoutExitStatus` 表示超时。
+    public static func from(exitStatus: Int32) -> PreflightVerdict {
+        if exitStatus == 0 { return .ok }
+        if exitStatus == timeoutExitStatus { return .unverified }
+        return .failed
+    }
+
+    /// 这个判定是否应当中止流程。只有「确实失败」才拦。
+    public var shouldBlock: Bool { self == .failed }
+}
+
 /// v2.6.0 的一次性存量数据迁移：官方周额度 8000 → 2000。
 ///
 /// 抽成纯函数是为了能被测试**直接**覆盖，而不是靠「源码里有没有这句话」的字符串断言。

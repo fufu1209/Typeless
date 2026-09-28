@@ -5,11 +5,11 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.5.6-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.0-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
-Typeless 是一款很好用的 macOS 语音输入 / 转写工具，但免费账号**每周只有 8000 字**。
+Typeless 是一款很好用的 macOS 语音输入 / 转写工具，但免费账号**每周只有 2000 字**。
 用完之后，你得手动退出、登录另一个号、再走一遍新手引导 —— 一天可能要来两三次。
 
 这个工具把整套流程自动化：预先注册好一批账号，额度低了就**静默切换**，
@@ -92,10 +92,11 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.5.6**（2026-08-29）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.6.0**（2026-09-29）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-最近的主要变化：周期口径改为**实测观测**（不再靠猜）、额度周期**时区可切换且不用重启**、
-新手引导补丁**收成单一入口**、新增 `--export-full-bundle` / `--import-bundle` 便于换机迁移。
+最近的主要变化：**会话复活**（Token 过期的账号一键恢复可用，不必重新注册）、
+适配 **Typeless 2.7.0 / 2.8.0** 的新签名协议（密钥自动从 App 提取，跨版本不再硬编码）、
+额度口径改为**每周 2000 字**并重算换号阈值（默认 120）、周期口径改为**实测观测**（不再靠猜）。
 
 ## 这个工具能做什么
 
@@ -111,7 +112,7 @@ open /Applications/TypelessSwitchboard.app
 - 通过 MoeMail API 生成邮箱并导入账号池。
 - 一键用 MoeMail 生成注册候选账号：创建真实邮箱、生成用户名、复制强密码，并放入兜底确认队列。
 - 读取当前已关联 MoeMail 邮箱的邮件摘要，方便兜底查看验证码邮件。
-- **开机轻量额度守护（推荐，不必常驻 GUI）**：用 macOS LaunchAgent 定时执行 `--daemon-check`。**只有剩余字数 &lt; 阈值（默认 200）才自动换号**；额度够只检查就退出。登录后自动跑，不要求一直开着本窗口。
+- **开机轻量额度守护（推荐，不必常驻 GUI）**：用 macOS LaunchAgent 定时执行 `--daemon-check`。**只有剩余字数 &lt; 阈值（默认 120）才自动换号**；额度够只检查就退出。登录后自动跑，不要求一直开着本窗口。
 - **App 内循环监控（可选）**：打开 App 时可勾选「打开本 App 时循环监控」；默认关闭，避免占后台。
 - **热备池**：额度还够时，后台预注册 1 个带静默会话缓存的备用号；真正低额度时秒切，尽量让你感觉不到。
 - **智能换号**：也可手动点一次。优先池内静默注入；没有可注入会话时再全自动注册；静默失败自动降级注册。
@@ -160,7 +161,7 @@ open /Applications/TypelessSwitchboard.app
 5. 当前账号额度用完时，点击“标记已用完”，再点“选择下一个可用账号”。
 6. 使用“打开 Typeless”“打开邮箱”“复制邮箱”完成手动登录或注册核验。
 7. 如果账号已关联 MoeMail ID，可以点“读取当前账号邮件”查看邮件摘要，再兜底处理验证码。
-8. 日常推荐：装好权限与 MoeMail API Key 后，让 **Typeless Switchboard 在后台跑着**（菜单栏有图标；关窗默认不退出）。它会自己监测额度，剩余 &lt; 200 时静默换号。
+8. 日常推荐：装好权限与 MoeMail API Key 后，让 **Typeless Switchboard 在后台跑着**（菜单栏有图标；关窗默认不退出）。它会自己监测额度，剩余 &lt; 120 时静默换号。
 9. 侧栏确认 **「无感额度守护」** 与 **「池空时自动注册新号」** 已打开；热备数量默认 1。需要立刻换时可点 **「智能换号」**；一定要全新号再点「强制全自动注册新号」。
 9. 如果本机没有 Node/npm/Playwright，或 Typeless 页面结构发生变化，工具会保留自动化脚本路径、邮箱、用户名、验证码和最近日志；可复制结果后手动兜底。
 10. 需要集中准备资料时，在“账号池工具”里批量生成候选账号。

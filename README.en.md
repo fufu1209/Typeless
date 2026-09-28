@@ -1,12 +1,12 @@
 # Typeless Switchboard
 
 **Free unlimited Typeless on macOS** — a native Swift menu bar app that automatically rotates
-multiple accounts when the free **8,000 words/week** quota runs low.
+multiple accounts when the free **2,000 words/week** quota runs low.
 
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.5.6-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.0-blue.svg)](CHANGELOG.md)
 
 > 🌏 [中文版 README](README.md) — the Chinese one is more detailed.
 
@@ -15,7 +15,7 @@ multiple accounts when the free **8,000 words/week** quota runs low.
 ## The problem
 
 [Typeless](https://www.typeless.com) is a great voice-to-text app for macOS, but the free plan
-gives you only **8,000 words per week**. Once it's gone you have to sign out, sign in with
+gives you only **2,000 words per week**. Once it's gone you have to sign out, sign in with
 another account, and walk through the onboarding wizard again — possibly a few times a day.
 
 ## What this does
@@ -110,7 +110,7 @@ Do you already have several Typeless accounts?
 ## How the quota cycle works
 
 **Typeless does not document how the weekly quota resets** — the pricing page and billing FAQ
-only say "8,000 words per week". So this tool doesn't guess for you. It **observes**:
+only say "2,000 words per week". So this tool doesn't guess for you. It **observes**:
 every time it fetches a fresh quota reading it records a sample; a sharp drop counts as a real
 reset. After enough samples it tells you whether resets land on Monday 00:00 or are scattered
 across the week.

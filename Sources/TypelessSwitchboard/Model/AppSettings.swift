@@ -15,7 +15,7 @@ struct AppSettings: Codable, Equatable, Sendable {
     var isAutoRotateEnabled: Bool
     /// 常规巡检间隔（分钟），1–120；额度接近阈值时会自动加速到约 20 秒。
     var autoRotateCheckIntervalMinutes: Int
-    /// 剩余字数低于该阈值时触发自动换号（默认 200）。
+    /// 剩余字数低于该阈值时触发自动换号（默认见 `SmartSwitchPolicy.defaultRemainingThreshold`）。
     var autoRotateRemainingThreshold: Int
     /// 监测到低额度且池内没有可静默切换账号时，是否自动走全自动注册换号。
     var autoCreateWhenPoolEmpty: Bool
@@ -152,6 +152,18 @@ struct PersistedState: Codable, Equatable, Sendable {
     var registrationPlans: [RegistrationPreparationPlan]?
     var deviceReport: DeviceInfoReport?
     var lastAutomationResult: RegistrationAutomationResult?
+    /// 已经执行过的一次性迁移键。
+    ///
+    /// v2.6.0 新增。在此之前「是否迁移过」记在 `UserDefaults` 里，而 `UserDefaults`
+    /// 有**两个致命问题**：
+    ///   ① 它和 store.json 不是同一个存储，两者可以不一致；
+    ///   ② 迁移只改内存、从不落盘，标记却被写死了 —— 于是迁移永远不生效（见
+    ///      `SwitchboardStore.migrateDefaultsIfNeeded()` 的注释）。
+    /// 现在把记录放进 store.json 本身：**数据和「数据已迁移」这个事实同生共死**，
+    /// 落盘成功即迁移成功，不会再出现「标记说改过了、文件说没改」的分裂状态。
+    ///
+    /// 用可选类型是为了让旧版 store.json 仍然能解码（缺字段 → nil）。
+    var appliedMigrations: [String]?
 
     static let empty = PersistedState(
         accounts: [],
@@ -160,7 +172,8 @@ struct PersistedState: Codable, Equatable, Sendable {
         loginSnapshots: [],
         registrationPlans: [],
         deviceReport: nil,
-        lastAutomationResult: nil
+        lastAutomationResult: nil,
+        appliedMigrations: []
     )
 }
 

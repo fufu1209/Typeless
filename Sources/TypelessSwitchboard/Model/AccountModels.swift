@@ -127,7 +127,7 @@ struct Account: Identifiable, Codable, Equatable, Sendable {
             email: "",
             domain: settings.domains.first ?? "",
             role: "平民",
-            monthlyLimit: 8000,
+            monthlyLimit: QuotaCycleEngine.defaultWeeklyLimit,
             usedCharacters: 0,
             status: .available,
             typelessURL: settings.typelessLoginURL,

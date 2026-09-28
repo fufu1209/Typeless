@@ -163,16 +163,33 @@ extension SwitchboardStore {
             return false
         }
 
+        // v2.6.0：注入后**轮询**等待桌面端真正读入新会话，而不是死等一个固定秒数。
+        //
+        // 旧实现是「在 reinjectSessionPayload 里死等 2 秒 + 8 轮 × 2 秒校验」= 最多 18 秒。
+        // 而 Typeless 是 Electron 应用，冷启动到读盘完成实测约 120 秒 —— 18 秒必然等不到，
+        // 于是静默换号在冷启动场景下 100% 误判失败（会话其实已经写好了）。
+        // 现在改成：只要本地能解出目标账号就立刻返回（热启动实测 5～10 秒），
+        // 冷启动才吃满 `silentInjectSettleSeconds` 的上限。
+        statusMessage = "已写入「\(targetAccount.email)」的会话，等待桌面端读入…"
+        let settleDeadline = Date().addingTimeInterval(
+            TimeInterval(SmartSwitchPolicy.silentInjectSettleSeconds)
+        )
         var verified = false
-        for attempt in 0..<SmartSwitchPolicy.silentSwitchVerifyAttempts {
-            if attempt > 0 {
-                try? await Task.sleep(nanoseconds: SmartSwitchPolicy.silentSwitchVerifyDelaySeconds * 1_000_000_000)
-            }
+        var pollRound = 0
+        while Date() < settleDeadline {
+            pollRound += 1
+            let nap = pollRound == 1
+                ? SmartSwitchPolicy.silentInjectMinSettleSeconds
+                : SmartSwitchPolicy.silentInjectPollIntervalSeconds
+            try? await Task.sleep(nanoseconds: nap * 1_000_000_000)
+
             if lastSyncHitDeviceUserLimit {
                 lastSilentSwitchFailureReason = "设备登录用户数已超限，静默会话不可用"
                 return false
             }
-            // 验证只需要本地解密出的当前桌面账号，无需每次请求官方额度 API。
+            // 判据是「本地解密出的当前桌面账号」，这正是「App 是否已读入新会话」的直接证据，
+            // 比看文件 mtime 更硬 —— App 也可能只把文件重写成登出空壳。
+            // 验证只需要本地解密，无需每次请求官方额度 API。
             if let synced = await syncActiveAppSessionAndQuota(localOnly: true),
                let syncedIndex = accountIndex(id: synced),
                state.accounts[syncedIndex].email.lowercased() == targetAccount.email.lowercased() {
@@ -182,10 +199,10 @@ extension SwitchboardStore {
                 verified = true
                 break
             }
-            if lastSyncHitDeviceUserLimit {
-                lastSilentSwitchFailureReason = syncStatusMessage.ifEmpty("设备登录用户数已超限，静默会话不可用")
-                return false
-            }
+        }
+        if !verified && lastSyncHitDeviceUserLimit {
+            lastSilentSwitchFailureReason = syncStatusMessage.ifEmpty("设备登录用户数已超限，静默会话不可用")
+            return false
         }
 
         guard verified else {
@@ -289,8 +306,8 @@ extension SwitchboardStore {
         }
 
         launchTypelessInBackground(activate: activateTypeless)
-        // 给 Electron 一点时间读入新会话并生成新的 device.cache。
-        try? await Task.sleep(nanoseconds: SmartSwitchPolicy.silentInjectSettleSeconds * 1_000_000_000)
+        // 这里**不再**死等固定秒数：等待逻辑交给调用方轮询「本地会话是否已解出目标账号」。
+        // 理由见 `SmartSwitchPolicy.silentInjectSettleSeconds` 的注释。
         return true
     }
 

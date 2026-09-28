@@ -155,7 +155,8 @@ extension SwitchboardStore {
             account.email = email
             account.domain = domain
             account.role = csvValue(row, keys: keys, name: "role").ifEmpty("平民")
-            account.monthlyLimit = Int(csvValue(row, keys: keys, name: "monthly_limit")) ?? 8000
+            account.monthlyLimit = Int(csvValue(row, keys: keys, name: "monthly_limit"))
+                ?? QuotaCycleEngine.defaultWeeklyLimit
             account.usedCharacters = Int(csvValue(row, keys: keys, name: "used_characters")) ?? 0
             account.status = status
             account.reviewState = reviewState

@@ -1558,10 +1558,58 @@ public struct SmartSwitchDecision: Equatable, Sendable {
     }
 }
 
+/// v2.6.0 的一次性存量数据迁移：官方周额度 8000 → 2000。
+///
+/// 抽成纯函数是为了能被测试**直接**覆盖，而不是靠「源码里有没有这句话」的字符串断言。
+/// 这个迁移出过一次典型静默失效：旧实现只改内存、把「已迁移」标记写进 UserDefaults，
+/// 却从不落盘 —— 标记被烧掉、数据没变、没有任何报错。本机实测就是这样：
+/// 标记为 `true`，而 store.json 里的阈值还停在 200。
+public enum LegacyQuotaRescale {
+    /// 幂等键。
+    ///
+    /// **这个记录必须落在 store.json 里**，不能只记 UserDefaults：
+    /// UserDefaults 与 store.json 是两套独立存储，可以互相矛盾，而且矛盾时无法自愈
+    /// （UserDefaults 说改过了，文件说没改，谁都发现不了）。
+    /// 放进 store.json 后，「数据」和「数据已迁移」同生共死。
+    public static let migrationKey = "didRescaleQuotaFor2000WeeklyLimit_v1"
+
+    /// 8000 时代的旧默认阈值。
+    public static let legacyThreshold = 200
+    /// 8000 时代的旧周额度。
+    public static let legacyWeeklyLimit = 8000
+
+    /// 这次迁移是否还没跑过。
+    public static func shouldApply(appliedMigrations: [String]) -> Bool {
+        !appliedMigrations.contains(migrationKey)
+    }
+
+    /// 阈值换算。只动「恰好等于旧默认值」的数据 —— 用户手改过的一律不碰，
+    /// 否则会把「我就是想要 200」的用户悄悄改成 120。
+    public static func rescaledThreshold(_ current: Int) -> Int {
+        current == legacyThreshold ? SmartSwitchPolicy.defaultRemainingThreshold : current
+    }
+
+    /// 账号周额度换算。同样只动「恰好等于旧上限 8000」的数据。
+    public static func rescaledWeeklyLimit(_ current: Int) -> Int {
+        current == legacyWeeklyLimit ? QuotaCycleEngine.defaultWeeklyLimit : current
+    }
+}
+
 /// 统一「点一下换号」与后台额度监测的决策逻辑，避免 UI / monitor 各写一套。
 public enum SmartSwitchPolicy {
     /// 剩余字数低于该值时立刻静默换号。
-    public static let defaultRemainingThreshold = 200
+    ///
+    /// v2.6.0 从 200 下调到 120。注意：这个值**不由周额度决定，而由「消耗速度 × 巡检间隔」决定** ——
+    /// 它的唯一职责是「别在听写中途撞到 0」，所以要挡住的是「两次巡检之间最多会烧掉多少字」。
+    ///
+    /// 本机实测平均语速 200 字/分（官方 `avg_wpm`），常规巡检 1 分钟 ⇒ 两次巡检之间最多 200 字。
+    /// 设紧急巡检倍率 M、阈值 T，则常规带里 R ≥ M·T；最坏情况一次常规巡检后落到 M·T − 200，
+    /// 要保证那时还没跌破 T（否则就来不及进紧急档）：T(M − 1) ≥ 200。
+    /// 取 M = 4 ⇒ T ≥ 67，留到 120 可覆盖到 360 字/分的语速。
+    ///
+    /// 顺带把占比从 200/2000 = 10% 降到 120/2000 = 6%：
+    /// 周额度从 8000 砍到 2000 之后，同样 200 字的绝对预留等于白扔 10% 的额度。
+    public static let defaultRemainingThreshold = 120
     /// 常规巡检间隔（分钟）；额度接近阈值时会自动加速。
     public static let defaultCheckIntervalMinutes = 1
     /// App 启动后首次巡检等待：尽量短，让菜单栏尽快显示真实剩余字数。
@@ -1569,16 +1617,41 @@ public enum SmartSwitchPolicy {
     /// 额度接近阈值时的加速巡检间隔（秒）。
     public static let urgentCheckIntervalSeconds: UInt64 = 20
     /// remaining < threshold * urgentMultiplier 时进入加速巡检。
-    public static let urgentRemainingMultiplier = 2
+    ///
+    /// v2.6.0 从 2 提到 4：阈值下调后必须更早进入 20 秒一轮的精细档，
+    /// 否则 1 分钟一轮的粗档会在最后 200 字里直接跨过阈值。推导见 `defaultRemainingThreshold`。
+    public static let urgentRemainingMultiplier = 4
+    /// 本机实测平均听写语速（字/分）。官方 `/user/usage_stats` 的 `avg_wpm` 实测 ≈ 200。
+    ///
+    /// 它不是设置项，而是**安全不变式的输入**：
+    /// `defaultRemainingThreshold × (urgentRemainingMultiplier − 1) ≥ assumedDictationWordsPerMinute`。
+    /// 不满足就说明「两次常规巡检之间能烧穿预留量」，会在听写中途撞到 0。
+    /// 改这个数等于改安全边界，`runThresholdBoundaryChecks` 会一起验。
+    public static let assumedDictationWordsPerMinute = 200
     /// 热备池目标：始终尽量保有这么多「可静默注入」的备用号。
     public static let defaultHotSpareTarget = 1
     public static let sessionCaptureRetryAttempts = 8
     public static let sessionCaptureRetryDelaySeconds: UInt64 = 2
-    /// 静默注入后等待桌面端读入新会话 / 生成新 device.cache 的秒数。
-    public static let silentInjectSettleSeconds: UInt64 = 2
-    /// 静默切换后校验目标邮箱的最大轮数（每轮会再同步官方额度）。
-    public static let silentSwitchVerifyAttempts = 8
-    public static let silentSwitchVerifyDelaySeconds: UInt64 = 2
+    /// 静默注入后等待桌面端读入新会话 / 生成新 device.cache 的**最长**秒数。
+    ///
+    /// v2.6.0 从 2 秒上调到 120 秒。原来的 2 秒是一个**实测错误**，不是保守取值：
+    ///
+    /// - Typeless 是 Electron 应用，冷启动到读盘完成实测需要约 **120 秒**
+    ///   （本机 2026-09-29 反复实测；同一台机器上热启动只要 5～10 秒）。
+    /// - 旧实现「死等 2 秒 + 8 轮 × 2 秒校验」合计最多 18 秒，冷启动时必然等不到 App 读盘，
+    ///   于是静默换号报「注入后未能确认目标账号已生效」——**会话其实已经写好了**。
+    ///   上层把这个误判当失败，还会继续换下一个号，白白烧掉一个账号的额度。
+    ///
+    /// 现在的等待是**轮询**而不是死等：只要本地能解出目标账号就立刻返回。
+    /// 热启动 5～10 秒完成，只有真正的冷启动才会吃满这个上限。
+    public static let silentInjectSettleSeconds: UInt64 = 120
+    /// 轮询「本地会话是否已解出目标账号」的间隔（秒）。
+    public static let silentInjectPollIntervalSeconds: UInt64 = 1
+    /// 拉起桌面端后**至少**等待的秒数。
+    ///
+    /// 不能让轮询从 0 秒就开始：App 还没读盘，此时解出的仍是旧会话，
+    /// 会在第一轮就把「注入失败」误判出来。3 秒是实测「App 已起但尚未读盘」的下界。
+    public static let silentInjectMinSettleSeconds: UInt64 = 3
 
     public static func isQuotaLow(remaining: Int, threshold: Int) -> Bool {
         remaining < max(threshold, 0)
@@ -1599,6 +1672,21 @@ public enum SmartSwitchPolicy {
             return "当前额度充足（剩余 \(remaining)，阈值 \(normalized)）：持续监控，暂不换号"
         }
         return "当前额度低于阈值 \(normalized)（剩余 \(remaining)）"
+    }
+
+    /// Typeless 2.7.0 起对非官方客户端返回的「客户端不受支持」错误（HTTP 403 / code 20006）。
+    ///
+    /// **这不是网络抖动，重试一万次也没用**：官方轮换了签名密钥或改了签名协议。
+    /// 必须显性报出来。反面教材就在眼前 —— 2.4.0 → 2.7.0 那次密钥轮换后，
+    /// 额度接口一直 403，而旧代码把它归成「额度没刷新」静默跳过，
+    /// 于是自动换号停摆了两周，日志里全是「跳过换号决策」，谁也没发现。
+    public static func isClientNotSupportedError(_ message: String?) -> Bool {
+        guard let message else { return false }
+        let lower = message.lowercased()
+        return lower.contains("client_not_supported")
+            || lower.contains("this client is not supported")
+            || lower.contains("please use the official typeless app")
+            || lower.contains("20006")
     }
 
     /// Typeless 服务端「同一设备登录用户数超限」类错误。命中后应重置设备身份并优先走全自动换号。

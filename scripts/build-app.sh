@@ -30,12 +30,36 @@ if [[ -z "$VERSION_SHORT" || -z "$VERSION_BUILD" ]]; then
   exit 1
 fi
 
+# v2.6.0：macOS 27 SDK 起，SwiftUI 的 @State / @Observable 等改成了宏实现，
+# 而宏插件（libSwiftUIMacros.dylib）只随**完整 Xcode** 分发。本机只有 Command Line
+# Tools 时，用 27 SDK 编译必然报：
+#   error: external macro implementation type 'SwiftUIMacros.StateMacro' could not be found
+# 这不是代码问题，是工具链缺件。所以没有 Xcode 时回退到仍能编译的 26.x SDK。
+# 装了 Xcode 的话什么都不用做，走系统默认。
+if [[ -z "${SDKROOT:-}" && ! -d "/Applications/Xcode.app" ]]; then
+  for candidate in /Library/Developer/CommandLineTools/SDKs/MacOSX26.*.sdk; do
+    if [[ -d "$candidate" ]]; then
+      export SDKROOT="$candidate"
+      echo "NOTE: 未检测到 Xcode，使用 SDK $(basename "$SDKROOT") 构建"
+      break
+    fi
+  done
+fi
+
 swift build -c release
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE_ROOT"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp ".build/release/TypelessSwitchboard" "$STAGE/Contents/MacOS/TypelessSwitchboard"
+
+# v2.6.0：会话/额度脚本以 SwiftPM 资源包形式随包分发（唯一来源），
+# 漏拷这个 bundle 会让 App 找不到脚本、额度同步整条失效。
+for bundle in .build/release/*.bundle; do
+  [[ -e "$bundle" ]] || continue
+  cp -R "$bundle" "$STAGE/Contents/Resources/"
+  echo "Bundled resources: $(basename "$bundle")"
+done
 
 cat > "$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

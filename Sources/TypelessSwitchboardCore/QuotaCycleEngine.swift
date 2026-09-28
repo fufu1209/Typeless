@@ -84,8 +84,12 @@ public struct AccountQuotaSnapshot: Equatable, Sendable {
 
 /// 周度复活 + 选号三件套。所有方法都是纯函数，便于单测。
 public enum QuotaCycleEngine {
-    /// Typeless 单账号周额度上限（与 `extract-active-session.js` 默认返回值对齐）。
-    public static let defaultWeeklyLimit = 8000
+    /// Typeless 单账号周额度上限。
+    ///
+    /// v2.6.0 从 8000 改成 2000 —— 官方把免费档的周额度砍到了四分之一（2026-09 实测
+    /// `/user/usage_stats` 返回 `week_word_usage_limit: 2000`）。
+    /// 这里只是「拿不到官方数字时的兜底」，正常路径一律用接口返回的真实值。
+    public static let defaultWeeklyLimit = 2000
     public static let weekSeconds: TimeInterval = 7 * 24 * 60 * 60
 
     // MARK: - 看门狗排程
@@ -321,7 +325,7 @@ public enum QuotaCycleEngine {
     // MARK: - 摘要
 
     /// 给 UI 展示的周期摘要，例如：
-    /// "本周已用 6133/8000 · 还剩 1,867 · 距离刷新还有 3 天（周一 00:00）"
+    /// "本周已用 6133/2000 · 还剩 1,867 · 距离刷新还有 3 天（周一 00:00）"
     public static func summary(
         for account: AccountQuotaSnapshot,
         now: Date = Date(),

@@ -140,8 +140,17 @@ extension SwitchboardStore {
         liveAccountEmail = state.accounts[currentIndex].email
         // 本周额度 API 未成功时：只展示缓存，绝不据此自动换号（避免陈旧数字误触发）。
         if !lastQuotaSyncFresh {
-            lastAutoRotateDecisionReason = "本周额度 API 未刷新成功，跳过换号决策（避免陈旧数字）"
-            autoRotateMonitorStatus = "巡检完成：\(weeklyQuotaSummaryLine)；本轮不换号"
+            // v2.6.0：把「客户端指纹失效」和「网络抖动」分开报。
+            // 前者重试一万次也不会好，必须让人看见，而不是混在「跳过换号决策」里被忽略
+            // —— Typeless 2.4.0 → 2.7.0 就是这么让自动换号静默停摆两周的：
+            // 日志每分钟一行「跳过换号决策」，看起来一切正常。
+            if lastSyncHitClientNotSupported {
+                lastAutoRotateDecisionReason = "Typeless 已拒绝本客户端（客户端指纹过期），自动换号停摆：请升级 Typeless Switchboard"
+                autoRotateMonitorStatus = "⚠️ 自动换号已停摆：Typeless 拒绝本客户端指纹，需要新版本 App 适配"
+            } else {
+                lastAutoRotateDecisionReason = "本周额度 API 未刷新成功，跳过换号决策（避免陈旧数字）"
+                autoRotateMonitorStatus = "巡检完成：\(weeklyQuotaSummaryLine)；本轮不换号"
+            }
             return currentID
         }
 

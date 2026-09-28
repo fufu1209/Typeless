@@ -1,6 +1,70 @@
 # 更新记录
 
-当前版本 **v2.5.6**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.6.0**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.6.0（2026-09-29）
+
+这一版的主线只有一句话：**把「额度接口静默失效两周没人发现」这类问题从根上堵掉**，
+并顺手把 Typeless 2.7.0 / 2.8.0 带来的免费额度缩水（8000 → 2000 字/周）适配好。
+
+### 修复
+
+- **额度接口全线失效（最严重）**。Typeless 2.4.0 → 2.7.0 轮换了签名密钥、
+  并把 `X-Authorization` 从 HMAC-SHA1 摘要换成了 AES-256-CBC 加密负载。
+  旧代码把接口返回的 HTTP 403 `code:20006` 归类成「额度没刷新」**静默跳过** ——
+  结果守护日志 9/20–9/28 记了 **9124 条「跳过换号决策」、0 条成功**，连续两周没人察觉。
+  现在按 2.7.0 协议重写签名，并改为**从本机 `app.asar` 现场提取密钥**
+  （按 `[0-9a-f]{56}` 的形状捞，不写死具体值），下次官方再轮换密钥不必改代码。
+- **密钥轮换自动跟上（本版发布前刚被验证过一次）**。Typeless 2.7.0 → **2.8.0**
+  又轮换了一次密钥（`1a0b8ae1…` → `3fa18880…`），工具靠现场提取零改动恢复可用。
+  顺带把过期的兜底常量与 `FALLBACK_APP_VERSION` 更新到 2.8.0，
+  并把 20006 的重试从「只重试一次」改成**四段递进阶梯**
+  （换角色 ↔ 强制重新提取），覆盖「角色猜反 + 密钥轮换」同时发生的组合。
+- **静默换号在冷启动场景 100% 误判失败**。`silentInjectSettleSeconds` 原本是 **2 秒**，
+  加上 8 轮 × 2 秒校验合计最多 18 秒；而 Typeless 是 Electron 应用，
+  冷启动到读盘完成实测需要约 **120 秒**。等待不足 → 报「注入后未能确认目标账号已生效」，
+  上层把已经写好的会话当成失败、继续换下一个号，白白烧掉一个账号的额度。
+  现在上限提到 120 秒，且由**死等改为轮询**：只要本地能解出目标账号就立刻返回
+  （热启动实测 5～10 秒），只有真正的冷启动才吃满上限。
+- **会话/额度脚本存在两份实现并已分叉**。仓库 `scripts/extract-active-session.js`
+  与 Swift 源码里的内嵌字符串各演化一份，线上跑的那份和仓库里已经不是同一个东西。
+  现收敛为 App 包内 `Resources/extract-active-session.js` 单一来源。
+- **macOS 27 SDK 下编译失败**。系统 SDK 把 SwiftUI 改成了宏实现
+  （`SwiftUIMacros.StateMacro`），而宏插件只随完整 Xcode 分发，
+  只装 Command Line Tools 的机器 `swift build` 必失败。
+  `build-app.sh` 现在会自动回退到 `MacOSX26.*.sdk`。
+
+### 变更
+
+- **免费周额度 8000 → 2000 字**，阈值随之下调：
+  `defaultRemainingThreshold` 200 → **120**，`urgentRemainingMultiplier` 2 → **4**。
+  阈值不由周额度决定，而由「消耗速度 × 巡检间隔」决定，
+  安全不变式 `阈值 × (紧急倍率 − 1) ≥ 每分钟最大消耗字数`
+  （120 × 3 = 360 ≥ 实测语速 200）已写进 `runThresholdBoundaryChecks` 一起验。
+  顺带把预留占比从 200/2000 = 10% 压到 120/2000 = 6%。
+- **「客户端指纹过期」不再和「网络抖动」混为一谈**。新增
+  `isClientNotSupportedError`，UI 会显性提示 `⚠️ 客户端指纹已过期`，
+  而不是继续显示「额度同步中」。这类错误重试一万次也没用，必须让人看见。
+- 迁移 `didRescaleQuotaFor2000WeeklyLimit_v1` 自动把存量账号的阈值与 `monthlyLimit` 改过来。
+
+### 新增
+
+- **`scripts/revive-account-sessions.js` —— 会话复活**。
+  `access_token` 只有 24 小时有效期，账号池里存的是「抓取那一刻」的快照，隔天就过期；
+  而官方对 `/oauth/refresh_access_token` 做了 JA3/TLS 指纹白名单
+  （Node、curl、Chromium 全部过不去，只有官方 Electron 在名单内）。
+  但**官方桌面端自己刷得动**：它启动时会拿 `refresh_token` 换一个新的 24h token 并写回文件。
+  这个脚本就是走这条路：写入目标会话 → 拉起 Typeless → 等它自己换新 token →
+  读回 → 调官方额度接口验证 → 写回账号池 → 恢复原活跃账号。
+  带自动备份（`Logs/revive-backups/<时间戳>/`），支持
+  `--dry-run` / `--limit N` / `--email X` / `--keep-last`。
+  本机实测：16 个僵尸账号复活 **15 个**，池子剩余额度从 0 回到约 28,670 字。
+- **`scripts/audit-account-pool.js` 重写**：判定细分为
+  `usable` / `exhausted` / `token-expired` / `dead` / `no-session` / `device-limit` /
+  `unreachable` / `payload-corrupt` / `payload-incomplete` / `email-mismatch`，
+  能准确回答「这个号现在能不能正常换上去」。
 
 ---
 

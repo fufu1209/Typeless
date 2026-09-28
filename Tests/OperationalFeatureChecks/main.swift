@@ -397,6 +397,7 @@ struct OperationalFeatureChecks {
         runRegistrationCompletionPolicyChecks()
         runBrowserAutomationResultPayloadChecks()
         runToolkitAccountImporterEdgeCaseChecks()
+        runLegacyQuotaRescaleChecks()
         runStoreRecoveryChecks()
         runQuotaGuardLaunchAgentPlannerChecks()
 
@@ -419,6 +420,9 @@ struct OperationalFeatureChecks {
         // MARK: - v2.5.6：周期口径改为实测观测，不再靠猜
         runQuotaCycleObservationChecks()
         runQuotaCycleObservationStoreChecks()
+
+        // MARK: - v2.6.0：Typeless 2.7.0 客户端指纹 + 脚本单一来源
+        runTypelessClientFingerprintChecks()
 
         print("Operational feature checks passed")
     }
@@ -1198,13 +1202,16 @@ struct OperationalFeatureChecks {
         }
         check(emptyOnboarding.count == 7, "空 onboarding 补丁后应补齐 7 个平台")
 
-        // 8000 是每账号「每周」字数额度，不是账号数（用户误解澄清点，写成断言固化）
-        check(QuotaCycleEngine.defaultWeeklyLimit == 8000, "单账号周额度上限固定为 8000 字")
+        // 每账号「每周」字数额度，不是账号数（用户误解澄清点，写成断言固化）。
+        // v2.6.0：官方把免费档周额度从 8000 砍到 2000（2026-09 实测接口返回）。
+        check(QuotaCycleEngine.defaultWeeklyLimit == 2000,
+              "单账号周额度上限必须=2000（v2.6.0 契约）")
         check(AccountQuotaSnapshot(
             id: UUID(), email: "x@example.com", status: .available, reviewState: .approved,
-            usedCharacters: 0, monthlyLimit: 8000, lastResetAt: Date(), createdAt: Date(),
+            usedCharacters: 0, monthlyLimit: QuotaCycleEngine.defaultWeeklyLimit,
+            lastResetAt: Date(), createdAt: Date(),
             hasSilentSessionPayload: false
-        ).remainingCharacters == 8000, "新建账号初始剩余额度 = 8000")
+        ).remainingCharacters == 2000, "新建账号初始剩余额度 = 2000")
     }
 
     private static func runQuotaCycleEngineChecks() {
@@ -1803,6 +1810,63 @@ struct OperationalFeatureChecks {
               "importableAccount: 无 @ 邮箱 → domain 走 existingDomains fallback")
     }
 
+    // MARK: - v2.6.0 存量迁移（LegacyQuotaRescale）
+    //
+    // 这一组锁的是「8000 → 2000 存量数据迁移」的两条硬约束，两条都是踩过坑换来的：
+    //
+    //   ① **幂等键必须落在 store.json 里**，不能只记 UserDefaults。
+    //      旧实现把标记写进 UserDefaults、却从不把改过的数据落盘，于是标记被烧掉、
+    //      数据没变，而且没有任何报错。本机实测：标记为 true，阈值仍是 200。
+    //      两者是两套存储，可以互相矛盾 —— 矛盾时只有「把记录和数据放在同一个文件里」
+    //      才能保证同生共死。
+    //
+    //   ② **只动「恰好等于旧默认值」的数据**。用户手改过的阈值/额度一律不碰，
+    //      否则「我就是想要 200」的用户会被悄悄改成 120。
+    private static func runLegacyQuotaRescaleChecks() {
+        // 1) 幂等键语义
+        check(LegacyQuotaRescale.shouldApply(appliedMigrations: []),
+              "从未迁移过 → 必须执行")
+        check(!LegacyQuotaRescale.shouldApply(
+                appliedMigrations: [LegacyQuotaRescale.migrationKey]),
+              "已经迁移过 → 必须跳过（否则每次启动都重写阈值）")
+        check(LegacyQuotaRescale.shouldApply(appliedMigrations: ["别的迁移"]),
+              "只记录过别的迁移 → 本次仍须执行（键不能串）")
+        check(LegacyQuotaRescale.migrationKey.hasSuffix("_v1"),
+              "幂等键必须带版本后缀，将来再改口径才能换新键重跑")
+
+        // 2) 阈值换算：旧默认 200 → 新默认 120；其余原样
+        check(LegacyQuotaRescale.rescaledThreshold(200) == SmartSwitchPolicy.defaultRemainingThreshold,
+              "阈值 200（8000 时代旧默认）必须换算成 \(SmartSwitchPolicy.defaultRemainingThreshold)")
+        check(LegacyQuotaRescale.rescaledThreshold(200) == 120, "新默认阈值必须是 120")
+        for custom in [0, 1, 50, 100, 150, 199, 201, 300, 500, 50_000] {
+            check(LegacyQuotaRescale.rescaledThreshold(custom) == custom,
+                  "用户自定义阈值 \(custom) 必须原样保留（不得被迁移覆盖）")
+        }
+
+        // 3) 周额度换算：旧上限 8000 → 新上限 2000；其余原样
+        check(LegacyQuotaRescale.rescaledWeeklyLimit(8000) == QuotaCycleEngine.defaultWeeklyLimit,
+              "周额度 8000（旧上限）必须换算成 \(QuotaCycleEngine.defaultWeeklyLimit)")
+        check(LegacyQuotaRescale.rescaledWeeklyLimit(8000) == 2000, "新周额度必须是 2000")
+        for custom in [0, 100, 1000, 2000, 4000, 8001, 20_000] {
+            check(LegacyQuotaRescale.rescaledWeeklyLimit(custom) == custom,
+                  "非旧上限的周额度 \(custom) 必须原样保留")
+        }
+
+        // 4) 换算结果必须仍满足安全不变式（否则「迁移成功」等于把安全性改坏了）
+        let migrated = LegacyQuotaRescale.rescaledThreshold(200)
+        check(migrated * (SmartSwitchPolicy.urgentRemainingMultiplier - 1)
+                >= SmartSwitchPolicy.assumedDictationWordsPerMinute,
+              "换算后的阈值 \(migrated) 必须仍满足安全不变式")
+        check(migrated < LegacyQuotaRescale.legacyThreshold,
+              "换算必须把阈值调**小**（2000 字/周下 200 等于白扔 10% 额度）")
+
+        // 5) 两次调用结果一致（纯函数、无副作用、可安全重跑）
+        for _ in 0..<50 {
+            check(LegacyQuotaRescale.rescaledThreshold(200) == 120, "阈值换算必须稳定")
+            check(LegacyQuotaRescale.rescaledWeeklyLimit(8000) == 2000, "额度换算必须稳定")
+        }
+    }
+
     // MARK: - StoreRecovery：真的读写临时目录，不做源码字符串断言
 
     private static func runStoreRecoveryChecks() {
@@ -1982,46 +2046,63 @@ struct OperationalFeatureChecks {
 
     // MARK: - v2.5.2 阈值边界
     /// 用户原问：「字数低于 200，确定是可以正常处理的吗？确定没有问题吗？」
-    /// 把 `isQuotaLow` / `isApproachingQuotaLimit` / `nextCheckDelaySeconds` 在阈值 200
-    /// 附近的边界值（199/200/201）以及极端值（0/负数/正无穷）逐个验。
+    /// 把 `isQuotaLow` / `isApproachingQuotaLimit` / `nextCheckDelaySeconds` 在阈值
+    /// 附近的边界值以及极端值（0/负数/正无穷）逐个验。
+    ///
+    /// v2.6.0：官方周额度 8000 → 2000，阈值 200 → 120、紧急倍率 2 → 4。
+    /// 阈值**不是**按额度比例拍的，而是被下面这条不变式约束死的：
+    ///     阈值 × (紧急倍率 − 1) ≥ 两次常规巡检之间最大可能消耗的字数
+    /// 不满足就会在巡检间隙直接撞到 0（听写中途断掉）。
     private static func runThresholdBoundaryChecks() {
-        let threshold = SmartSwitchPolicy.defaultRemainingThreshold  // 200
-        check(threshold == 200, "默认阈值必须=200（用户契约：<200 才换号）")
+        let threshold = SmartSwitchPolicy.defaultRemainingThreshold  // 120
+        check(threshold == 120, "默认阈值必须=120（v2.6.0 契约）")
 
-        // 1) 严格 < 语义：200 不算低、199 算低
-        check(SmartSwitchPolicy.isQuotaLow(remaining: 200, threshold: threshold) == false,
-              "isQuotaLow(200, 200) 必须 false（边界 = 阈值不算低）")
-        check(SmartSwitchPolicy.isQuotaLow(remaining: 201, threshold: threshold) == false,
-              "isQuotaLow(201, 200) 必须 false（>阈值不算低）")
-        check(SmartSwitchPolicy.isQuotaLow(remaining: 199, threshold: threshold) == true,
-              "isQuotaLow(199, 200) 必须 true（<阈值才算低，触发换号）")
+        // 0) 安全不变式：这条比具体数值更重要 —— 以后谁再调阈值/倍率，先过这一关
+        let worstCaseBurn = SmartSwitchPolicy.assumedDictationWordsPerMinute
+        check(threshold * (SmartSwitchPolicy.urgentRemainingMultiplier - 1) >= worstCaseBurn,
+              "安全不变式：阈值\(threshold) × (倍率\(SmartSwitchPolicy.urgentRemainingMultiplier) − 1) "
+              + "必须 ≥ 每分钟最大消耗 \(worstCaseBurn) 字，否则会在巡检间隙撞到 0")
+        check(SmartSwitchPolicy.urgentRemainingMultiplier > 1,
+              "紧急倍率必须 > 1，否则不存在「常规带」，不变式无意义")
+        // 阈值不得大到把整个周额度都吃掉（2000 字里的 120 = 6%）
+        check(threshold * 4 <= QuotaCycleEngine.defaultWeeklyLimit,
+              "阈值 \(threshold) 必须远小于周额度 \(QuotaCycleEngine.defaultWeeklyLimit)（否则换号等于白换）")
+
+        // 1) 严格 < 语义
+        check(SmartSwitchPolicy.isQuotaLow(remaining: 120, threshold: threshold) == false,
+              "isQuotaLow(120, 120) 必须 false（边界 = 阈值不算低）")
+        check(SmartSwitchPolicy.isQuotaLow(remaining: 121, threshold: threshold) == false,
+              "isQuotaLow(121, 120) 必须 false（>阈值不算低）")
+        check(SmartSwitchPolicy.isQuotaLow(remaining: 119, threshold: threshold) == true,
+              "isQuotaLow(119, 120) 必须 true（<阈值才算低，触发换号）")
         check(SmartSwitchPolicy.isQuotaLow(remaining: 1, threshold: threshold) == true,
-              "isQuotaLow(1, 200) 必须 true（接近 0）")
+              "isQuotaLow(1, 120) 必须 true（接近 0）")
         check(SmartSwitchPolicy.isQuotaLow(remaining: 0, threshold: threshold) == true,
-              "isQuotaLow(0, 200) 必须 true（用完）")
+              "isQuotaLow(0, 120) 必须 true（用完）")
 
         // 2) 负数不视为"低"（避免 Typeless 返回异常时误触发换号）
         //    注：实际是 normalized 用的 max(threshold, 0)，负 threshold 被钳为 0
         //    但负 remaining < 0 仍然 < 0 钳后阈值 0，恒为 true。
         check(SmartSwitchPolicy.isQuotaLow(remaining: -1, threshold: threshold) == true,
-              "isQuotaLow(-1, 200) 必须 true（负数剩余按\"已透支\"处理）")
+              "isQuotaLow(-1, 120) 必须 true（负数剩余按\"已透支\"处理）")
         check(SmartSwitchPolicy.isQuotaLow(remaining: 100, threshold: 0) == false,
               "isQuotaLow(100, 0)：threshold 被钳为 0，100>0 不算低")
 
-        // 3) isApproachingQuotaLimit：< threshold * urgentMultiplier（默认 2）= 400 时进入加速
-        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: 400, threshold: threshold) == false,
-              "isApproachingQuotaLimit(400, 200) 必须 false（边界 = 阈值*2 不算接近）")
-        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: 399, threshold: threshold) == true,
-              "isApproachingQuotaLimit(399, 200) 必须 true（<阈值*2 触发加速巡检）")
-        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: 200, threshold: threshold) == true,
-              "isApproachingQuotaLimit(200, 200) 必须 true（<400 触发加速）")
-        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: 8000, threshold: threshold) == false,
-              "isApproachingQuotaLimit(8000, 200) 必须 false（额度充足）")
+        // 3) isApproachingQuotaLimit：< threshold * urgentMultiplier（= 4）= 480 时进入加速
+        let urgentEdge = threshold * SmartSwitchPolicy.urgentRemainingMultiplier  // 480
+        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: urgentEdge, threshold: threshold) == false,
+              "isApproachingQuotaLimit(\(urgentEdge), 120) 必须 false（边界 = 阈值*倍率 不算接近）")
+        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: urgentEdge - 1, threshold: threshold) == true,
+              "isApproachingQuotaLimit(\(urgentEdge - 1), 120) 必须 true（<阈值*倍率 触发加速巡检）")
+        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: 120, threshold: threshold) == true,
+              "isApproachingQuotaLimit(120, 120) 必须 true（<480 触发加速）")
+        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: 2000, threshold: threshold) == false,
+              "isApproachingQuotaLimit(2000, 120) 必须 false（额度充足）")
 
         // 4) nextCheckDelaySeconds：接近阈值时 20s，否则按分钟配置
-        let fast = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 100, threshold: 200, intervalMinutes: 10)
-        let slow = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 5000, threshold: 200, intervalMinutes: 10)
-        let nilCase = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: nil, threshold: 200, intervalMinutes: 10)
+        let fast = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 100, threshold: 120, intervalMinutes: 10)
+        let slow = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 5000, threshold: 120, intervalMinutes: 10)
+        let nilCase = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: nil, threshold: 120, intervalMinutes: 10)
         check(fast <= 60, "接近阈值时本轮 sleep 必须 <= 60s（实际: \(fast)）")
         check(slow == 10 * 60, "额度充足时按分钟配置 sleep（10 分钟 = 600s）")
         check(nilCase == 10 * 60, "remaining=nil 时按默认间隔 sleep（避免无数据时高频）")
@@ -2029,16 +2110,16 @@ struct OperationalFeatureChecks {
         // 5) normalizeThreshold：负数/超大值都钳到合法范围
         check(SmartSwitchPolicy.normalizeThreshold(-50) == 0, "负阈值被钳为 0")
         check(SmartSwitchPolicy.normalizeThreshold(0) == 0, "0 阈值合法")
-        check(SmartSwitchPolicy.normalizeThreshold(200) == 200, "200 原样保留")
+        check(SmartSwitchPolicy.normalizeThreshold(120) == 120, "120 原样保留")
         check(SmartSwitchPolicy.normalizeThreshold(100_000) == 50_000,
               "超大阈值被钳为上限 50_000")
 
-        // 6) 不抖动：阈值附近的 198/199/200/201/202 各跑一次，状态必须单调
+        // 6) 不抖动：阈值附近的 118/119/120/121/122 各跑一次，状态必须单调
         var lowFlags: [Bool] = []
-        for r in [198, 199, 200, 201, 202] {
-            lowFlags.append(SmartSwitchPolicy.isQuotaLow(remaining: r, threshold: 200))
+        for r in [118, 119, 120, 121, 122] {
+            lowFlags.append(SmartSwitchPolicy.isQuotaLow(remaining: r, threshold: 120))
         }
-        // 期望：[true, true, false, false, false] — 200 是「回到不低」的拐点
+        // 期望：[true, true, false, false, false] — 120 是「回到不低」的拐点
         check(lowFlags == [true, true, false, false, false],
               "isQuotaLow 在阈值附近必须单调：\(lowFlags)")
 
@@ -2048,6 +2129,26 @@ struct OperationalFeatureChecks {
         }
         check(consecutive.allSatisfy { $0 },
               "连续多次低于阈值，结果必须稳定为 true（不抖动）")
+
+        // 8) v2.6.0：静默换号的等待预算必须覆盖 Electron 冷启动
+        //
+        // 这是一条**回归锁**。旧值 2 秒不是「保守取值」，是实测错误：
+        // Typeless 冷启动到读盘完成约 120 秒，而旧实现是「死等 2 秒 + 8 轮 × 2 秒校验」，
+        // 合计最多 18 秒 —— 冷启动场景必然报「注入后未能确认目标账号已生效」。
+        // 更糟的是上层把已经写好的会话当失败，继续换下一个号，白白烧掉一个账号的额度。
+        let coldStartSeconds: UInt64 = 120
+        check(SmartSwitchPolicy.silentInjectSettleSeconds >= coldStartSeconds,
+              "静默注入等待上限 \(SmartSwitchPolicy.silentInjectSettleSeconds)s "
+              + "必须 ≥ Electron 冷启动实测 \(coldStartSeconds)s")
+        check(SmartSwitchPolicy.silentInjectMinSettleSeconds >= 1,
+              "至少等待必须 ≥ 1s：App 还没读盘就轮询，会把旧会话误判成注入失败")
+        check(SmartSwitchPolicy.silentInjectMinSettleSeconds < SmartSwitchPolicy.silentInjectSettleSeconds,
+              "至少等待必须严格小于上限，否则「轮询」退化成死等")
+        check(SmartSwitchPolicy.silentInjectPollIntervalSeconds >= 1,
+              "轮询间隔必须 ≥ 1s，避免高频解密本地会话把 CPU 打满")
+        check(SmartSwitchPolicy.silentInjectPollIntervalSeconds
+                <= SmartSwitchPolicy.silentInjectSettleSeconds,
+              "轮询间隔必须 ≤ 上限，否则一轮都跑不完")
     }
 
     // MARK: - v2.5.2 钥匙串缓存行为
@@ -2251,5 +2352,84 @@ struct OperationalFeatureChecks {
         // 阈值这类非敏感设置应当保留，脱敏不是重置
         check(clean.settings.autoRotateRemainingThreshold == 200,
               "脱敏：非敏感设置要保留（阈值不变）")
+    }
+
+    // MARK: - v2.6.0 Typeless 2.7.0 客户端指纹
+    //
+    // 背景（这一轮最贵的一课）：
+    // Typeless 2.7.0 给 `/user/usage_stats` 加了客户端校验 —— 签名密钥轮换、
+    // 时间戳改成毫秒并叠加官方客户端的时差校正、`X-Authorization` 从「一个 HMAC 摘要」
+    // 变成「整包加密的 JSON 负载」。旧实现因此一直吃 HTTP 403 / code 20006。
+    //
+    // 真正致命的不是协议变了，而是**旧代码把它归成「额度没刷新」静默跳过**：
+    // 守护日志每分钟一行「跳过换号决策」，看上去一切正常，自动换号却停摆了两周。
+    // 所以这一组断言要钉死两件事：
+    //   ① 这类错误必须能被单独识别，且不得与「设备登录用户数超限」互相误判；
+    //   ② 会话脚本必须只有一份，不能再出现「仓库一份、App 内嵌一份」各自演化后分叉。
+    private static func runTypelessClientFingerprintChecks() {
+
+        // ── 1) 错误识别：官方原文 / 变体 / 错误码 ──
+        let official = "This client is not supported. Please use the official Typeless app."
+        check(SmartSwitchPolicy.isClientNotSupportedError(official), "识别官方原文")
+        check(SmartSwitchPolicy.isClientNotSupportedError("CLIENT_NOT_SUPPORTED"), "识别自定义错误码")
+        check(SmartSwitchPolicy.isClientNotSupportedError("HTTPException 20006"), "识别 20006 错误码")
+        check(SmartSwitchPolicy.isClientNotSupportedError("{\"code\":20006,\"status\":\"FAIL\"}"),
+              "识别报文里的 code 20006")
+        check(SmartSwitchPolicy.isClientNotSupportedError(nil) == false, "nil 不得判为客户端不受支持")
+        check(SmartSwitchPolicy.isClientNotSupportedError("") == false, "空串不得判为客户端不受支持")
+        check(SmartSwitchPolicy.isClientNotSupportedError("API 额度拉取失败 (HTTP 500)") == false,
+              "普通 5xx 不得判为客户端不受支持（那是可重试的）")
+        check(SmartSwitchPolicy.isClientNotSupportedError("API 请求连接超时") == false,
+              "超时不得判为客户端不受支持")
+        check(SmartSwitchPolicy.isClientNotSupportedError("本地缓存解密失败") == false,
+              "解密失败不得判为客户端不受支持")
+
+        // ── 2) 与「设备超限」必须互不误判（两条处置路径完全不同） ──
+        let deviceLimit = "The number of users logged into this device has exceeded the limit"
+        check(SmartSwitchPolicy.isClientNotSupportedError(deviceLimit) == false,
+              "设备超限不得被当成客户端不受支持")
+        check(SmartSwitchPolicy.isDeviceUserLimitError(official) == false,
+              "客户端不受支持不得被当成设备超限")
+        check(SmartSwitchPolicy.isClientNotSupportedError("登录该设备的用户数已超过限制") == false,
+              "中文设备超限文案不得被当成客户端不受支持")
+
+        // ── 3) 脚本单一来源：仓库里只允许 App 包内那一份 ──
+        let scriptDir = "Sources/TypelessSwitchboard/Resources"
+        let fm = FileManager.default
+        check(fm.fileExists(atPath: "\(scriptDir)/extract-active-session.js"),
+              "会话/额度脚本必须位于 App 包内 Resources")
+        check(fm.fileExists(atPath: "\(scriptDir)/write-active-session.js"),
+              "会话写入脚本必须位于 App 包内 Resources")
+        check(!fm.fileExists(atPath: "scripts/extract-active-session.js"),
+              "scripts/ 下不得再有第二份会话脚本（v2.6.0 已删掉分叉副本）")
+
+        // ── 4) 脚本行为：语法可过 + 两种模式都能产出合法 JSON ──
+        for name in ["extract-active-session.js", "write-active-session.js"] {
+            let syntax = runCommand("node", ["--check", "\(scriptDir)/\(name)"])
+            check(syntax.status == 0, "\(name) 必须通过 node --check：\(syntax.output)")
+        }
+
+        let dump = runCommand("node", ["\(scriptDir)/extract-active-session.js", "--dump-profile"])
+        check(dump.status == 0, "--dump-profile 必须正常退出：\(dump.output)")
+        check(dump.output.contains("\"appVersion\""), "指纹必须带 App 版本（签名串要用真实版本）")
+        check(dump.output.contains("\"source\""),
+              "指纹必须标出密钥来源（asar / cache / fallback），否则线上出问题无从判断")
+        // 密钥来源只可能是这三种；出现别的说明提取逻辑被改坏了
+        let knownSources = ["\"source\": \"asar\"", "\"source\": \"cache\"", "\"source\": \"fallback\""]
+        check(knownSources.contains { dump.output.contains($0) },
+              "密钥来源必须是 asar / cache / fallback 之一：\(dump.output)")
+
+        // --local-only 在没装 Typeless 的机器上会返回 success:false，
+        // 但**无论如何都必须输出合法 JSON 且退出码为 0** —— 上层靠解析这段 JSON 判断状态。
+        let localOnly = runCommand("node", ["\(scriptDir)/extract-active-session.js", "--local-only"])
+        check(localOnly.status == 0, "--local-only 必须退出码 0：\(localOnly.output)")
+        check(localOnly.output.contains("\"success\""), "--local-only 必须返回带 success 字段的 JSON")
+        check(localOnly.output.contains("email") || localOnly.output.contains("error"),
+              "--local-only 要么给出邮箱、要么给出错误原因，不得静默")
+
+        // ── 5) 未提供参数时写入脚本必须拒绝执行（防止误把空串写进会话缓存） ──
+        let writeNoArg = runCommand("node", ["\(scriptDir)/write-active-session.js"])
+        check(writeNoArg.output.contains("\"success\": false") || writeNoArg.output.contains("\"success\":false"),
+              "write-active-session 无参数时必须返回 success:false：\(writeNoArg.output)")
     }
 }

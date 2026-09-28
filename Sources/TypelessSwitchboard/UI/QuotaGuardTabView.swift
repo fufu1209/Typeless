@@ -232,7 +232,7 @@ struct QuotaGuardTabView: View {
         }
     }
 
-    /// 下次刷新的绝对时刻 + 到点会发生什么。用户最关心的就是「多久能回到 8000」。
+    /// 下次刷新的绝对时刻 + 到点会发生什么。用户最关心的就是「多久能回到满额度」。
     private var quotaCycleFootnote: String {
         let calendar = QuotaCycleClock.shared.calendar
         guard let reset = QuotaCycleEngine.nextCalendarWeekReset(calendar: calendar) else {
@@ -244,7 +244,8 @@ struct QuotaGuardTabView: View {
         formatter.dateFormat = "M月d日 EEEE HH:mm z"
         let countdown = QuotaCycleEngine.countdownText(to: reset)
         let count = store.state.accounts.count
-        let poolNote = count > 0 ? "，池内 \(count) 个账号同时回到各 8000 字" : ""
+        let perAccount = store.lastQuotaMonthlyLimit ?? QuotaCycleEngine.defaultWeeklyLimit
+        let poolNote = count > 0 ? "，池内 \(count) 个账号同时回到各 \(perAccount) 字" : ""
         return "下次刷新 \(formatter.string(from: reset))（还有 \(countdown)）\(poolNote)。到点不需要开着本 App，看门狗会按同一时刻自动复活。"
     }
 
@@ -263,7 +264,7 @@ struct QuotaGuardTabView: View {
     }
 
     private var footnote2: String {
-        "口径：Typeless 本周周额度（week_word_usage）。插件定时读官方接口；仅本周剩余 < 阈值（默认 200）且数字新鲜才自动换号。近阈值会加速到约 20 秒一轮。日志在 Application Support/TypelessSwitchboard/Logs/。"
+        "口径：Typeless 本周周额度（week_word_usage）。插件定时读官方接口；仅本周剩余 < 阈值（默认 \(SmartSwitchPolicy.defaultRemainingThreshold)）且数字新鲜才自动换号。近阈值会加速到约 20 秒一轮。日志在 Application Support/TypelessSwitchboard/Logs/。"
     }
 
 }

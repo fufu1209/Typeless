@@ -10,6 +10,7 @@ extension SwitchboardStore {
     func syncActiveAppSessionAndQuota(localOnly: Bool = false) async -> UUID? {
         isSyncingSession = true
         lastSyncHitDeviceUserLimit = false
+        lastSyncHitClientNotSupported = false
         if !localOnly {
             // 只有完整同步才清空「新鲜额度」标记；本地校验不动该标记，避免误判额度陈旧。
             lastQuotaSyncFresh = false
@@ -90,6 +91,12 @@ extension SwitchboardStore {
             if res.errorCode == "DEVICE_USER_LIMIT" || SmartSwitchPolicy.isDeviceUserLimitError(res.error) {
                 lastSyncHitDeviceUserLimit = true
             }
+            // v2.6.0：官方拒绝本客户端（签名密钥轮换 / 协议变更）。
+            // 与设备超限不同，这种情况**没有任何本地补救手段**，只能换新版 App，
+            // 所以必须单独标记并在 UI 上喊出来，不能混进「额度没刷新」里静默跳过。
+            if res.errorCode == "CLIENT_NOT_SUPPORTED" || SmartSwitchPolicy.isClientNotSupportedError(res.error) {
+                lastSyncHitClientNotSupported = true
+            }
 
             // 只有官方 usage_stats 给出本周 used/limit 才算「新鲜额度」；否则不得据此判定充足。
             let quotaFresh = res.error == nil
@@ -133,7 +140,10 @@ extension SwitchboardStore {
             
             if let matchedID = matchedID {
                 if let errorMsg = res.error {
-                    if lastSyncHitDeviceUserLimit {
+                    if lastSyncHitClientNotSupported {
+                        lastQuotaSyncFresh = false
+                        syncStatusMessage = "⚠️ Typeless 拒绝本客户端（客户端指纹已过期），本周额度读不到：\(errorMsg)"
+                    } else if lastSyncHitDeviceUserLimit {
                         syncStatusMessage = "已读到账号「\(email)」，但设备登录用户数已超限：\(errorMsg)"
                     } else {
                         // 登录态在，但本周额度 API 失败：保留旧 used/limit，明确标陈旧。
@@ -191,8 +201,8 @@ extension SwitchboardStore {
                     statusMessage = syncStatusMessage
                     return nil
                 }
-                if !quotaFresh, res.error != nil {
-                    syncStatusMessage = "发现账号「\(email)」，但本周额度 API 失败，暂不据此换号"
+                if !quotaFresh, res.error != nil, lastSyncHitClientNotSupported {
+                    syncStatusMessage = "⚠️ 发现账号「\(email)」，但 Typeless 拒绝本客户端（指纹过期），本周额度读不到"
                 } else {
                     syncStatusMessage = "发现新账号「\(email)」，已自动导入"
                 }
@@ -211,6 +221,9 @@ extension SwitchboardStore {
     func noteDeviceUserLimitIfPresent(in message: String?) {
         if SmartSwitchPolicy.isDeviceUserLimitError(message) {
             lastSyncHitDeviceUserLimit = true
+        }
+        if SmartSwitchPolicy.isClientNotSupportedError(message) {
+            lastSyncHitClientNotSupported = true
         }
     }
 
@@ -233,6 +246,9 @@ extension SwitchboardStore {
         }
         if let remaining {
             return "本周剩余约 \(remaining)（待官方刷新）· \(clock)"
+        }
+        if lastSyncHitClientNotSupported {
+            return "⚠️ 客户端指纹已过期，本周额度读不到 · \(clock)"
         }
         return lastQuotaSyncFresh ? "本周额度已同步 · \(clock)" : "本周额度尚未成功同步"
     }

@@ -25,6 +25,10 @@ final class SwitchboardStore: ObservableObject {
     @Published var lastSilentSwitchFailureReason = ""
     /// 最近一次同步官方会话时是否命中「设备登录用户数超限」。
     @Published var lastSyncHitDeviceUserLimit = false
+
+    /// 官方拒绝了本客户端（HTTP 403 / code 20006）。
+    /// 与「设备超限」不同，这种状态本地无解，必须换新版 App —— 所以要单独可见。
+    @Published var lastSyncHitClientNotSupported = false
     /// P0-2：账号池文件解码失败时记录原因并保留损坏备份。UI 侧栏错误条要展示这个。
     @Published var accountLoadError: String?
     /// 最近一次「本周额度」官方 API 是否拿到新鲜数值（失败时不得当成额度充足）。
@@ -121,6 +125,19 @@ final class SwitchboardStore: ObservableObject {
     }
 
     func migrateDefaultsIfNeeded() {
+        // v2.6.0：迁移必须**落盘**，否则就是最阴的一类静默失效。
+        //
+        // 旧实现只改内存里的 `state`，然后把「已迁移」标记写进 UserDefaults，**从不写文件**。
+        // 后果：标记被烧掉、数据没落地，下次启动看到标记为真就直接跳过 ——
+        // 迁移永远不会生效，而且没有任何报错、日志、UI 提示。
+        //
+        // 本机实测就是这样：`didRescaleQuotaFor2000WeeklyLimit_v1` 已经是 true，
+        // 而 store.json 里的阈值还停在 200 —— 在 2000 字/周下等于白扔 10% 的额度。
+        //
+        // 现在：函数末尾统一比对，只要有变化就原子落盘；并把幂等键从 UserDefaults
+        // 挪进 store.json 的 `appliedMigrations`，让「数据」和「数据已迁移」同生共死。
+        let stateBeforeMigration = state
+
         if state.settings.typelessLoginURL == oldTypelessLoginURL ||
             state.settings.typelessLoginURL == typelessOfficialURL {
             state.settings.typelessLoginURL = typelessDefaultLoginURL
@@ -153,6 +170,30 @@ final class SwitchboardStore: ObservableObject {
             }
         }
 
+        // v2.6.0：官方周额度 8000 → 2000，两处存量数据要跟着挪。
+        //   ① 阈值 200 是 8000 时代的旧默认（占比 2.5%），到 2000 时代变成 10%，等于白扔额度；
+        //   ② 库里存量账号的 monthlyLimit 还写着 8000，在轮到它之前会一直显示错误的剩余额度，
+        //      也会让选号逻辑在各账号之间产生错误的高低比较。
+        // 只动「恰好等于旧值」的数据：用户手改过的阈值一律不碰。
+        //
+        // 幂等键**只认 store.json 里的记录**，不认 UserDefaults：
+        // 本机那个 UserDefaults 键早被旧代码写成 true 了，若两者取「或」，
+        // 这次修复就会被那个假标记继续挡住。
+        let appliedMigrations = state.appliedMigrations ?? []
+        if LegacyQuotaRescale.shouldApply(appliedMigrations: appliedMigrations) {
+            state.settings.autoRotateRemainingThreshold = LegacyQuotaRescale.rescaledThreshold(
+                state.settings.autoRotateRemainingThreshold
+            )
+            for index in state.accounts.indices {
+                state.accounts[index].monthlyLimit = LegacyQuotaRescale.rescaledWeeklyLimit(
+                    state.accounts[index].monthlyLimit
+                )
+            }
+            // 顺手把旧代码留下的那个假标记清掉，免得后人再被它误导。
+            UserDefaults.standard.removeObject(forKey: LegacyQuotaRescale.migrationKey)
+            state.appliedMigrations = appliedMigrations + [LegacyQuotaRescale.migrationKey]
+        }
+
         if state.settings.autoRotateCheckIntervalMinutes <= 0 {
             state.settings.autoRotateCheckIntervalMinutes = SmartSwitchPolicy.defaultCheckIntervalMinutes
         }
@@ -173,298 +214,88 @@ final class SwitchboardStore: ObservableObject {
                 state.settings.checklist[index].title = "自动轮询对应邮箱验证码，必要时手动兜底"
             }
         }
+
+        // 有变化才写盘：迁移是幂等的，没变化时重写纯属浪费 I/O，
+        // 也会无谓地刷新 store.json 的 mtime（守护进程靠 mtime 判断外部改动）。
+        guard state != stateBeforeMigration else { return }
+        try? FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if let data = try? JSONEncoder.appEncoder.encode(state) {
+            try? data.write(to: fileURL, options: [.atomic])
+        }
     }
 
+    /// 把 App 包内的会话/额度脚本铺到 Application Support，供 `node` 调用。
+    ///
+    /// v2.6.0 之前这段脚本是以 `#"""..."""#` 字符串**内嵌在本文件里**的，
+    /// 同时仓库 `scripts/` 下还有一份独立副本。两份各自演化后彻底分叉：
+    /// 线上真正跑的那份和仓库里那份已经不是同一个东西，改哪一份都不对。
+    ///
+    /// 现在脚本的唯一来源是 `Sources/TypelessSwitchboard/Resources/*.js`
+    /// （随 App 包分发），本方法只负责复制，不再承担任何脚本内容。
+    /// 内容没变就不重写，避免把正在运行的脚本换掉。
     func ensureExtractScript() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let folder = appSupport.appendingPathComponent("TypelessSwitchboard", isDirectory: true)
-        let scriptURL = folder.appendingPathComponent("extract-active-session.js")
-        let writeURL = folder.appendingPathComponent("write-active-session.js")
-        
-        let scriptContent = #"""
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const https = require('https');
-
-function getActiveSession() {
-  return new Promise((resolve, reject) => {
-    try {
-      const platform = os.platform();
-      const arch = os.arch();
-      const appName = 'Typeless';
-      
-      const hashInput = platform + '-' + arch;
-      const sha256Hex = crypto.createHash('sha256').update(hashInput).digest('hex');
-      const pbkdf2Key = crypto.pbkdf2Sync(sha256Hex + appName, 'typeless-user-service', 10000, 32, 'sha256');
-
-      const userdataPath = path.join(process.env.HOME, 'Library/Application Support/Typeless/user-data.json');
-      if (!fs.existsSync(userdataPath)) {
-        return resolve({ success: false, error: "未检测到 Typeless 客户端的登录缓存文件" });
-      }
-
-      const data = fs.readFileSync(userdataPath);
-      if (data.length < 17 || data[16] !== 0x3a) {
-        return resolve({ success: false, error: "登录缓存文件格式不正确或已损坏" });
-      }
-
-      const iv = data.slice(0, 16);
-      const ciphertext = data.slice(17);
-      const derivedPassword = crypto.pbkdf2Sync(pbkdf2Key, iv.toString(), 10000, 32, 'sha512');
-
-      let credentials;
-      let rawJsonString = "";
-      try {
-        const decipher = crypto.createDecipheriv('aes-256-cbc', derivedPassword, iv);
-        let dec = decipher.update(ciphertext);
-        dec = Buffer.concat([dec, decipher.final()]);
-        rawJsonString = dec.toString('utf8');
-        const parsed = JSON.parse(rawJsonString);
-        credentials = JSON.parse(parsed.userData);
-      } catch (e) {
-        return resolve({ success: false, error: "本地缓存解密失败，可能是指纹不匹配或客户端已退出" });
-      }
-
-      const { access_token, user_id, email } = credentials;
-      if (!access_token || !user_id) {
-        return resolve({ success: false, error: "登录缓存中未包含有效的授权 Token" });
-      }
-
-      // 本地快速校验模式：只解密会话，不请求官方额度 API。
-      // 用于静默换号验证等「只需要确认当前桌面账号」的场景，快且不受网络波动影响。
-      if (process.argv.includes('--local-only')) {
-        return resolve({
-          success: true,
-          email: email,
-          userId: user_id,
-          rawJson: rawJsonString,
-          info: "本地会话校验（未请求额度 API）"
-        });
-      }
-
-      function looksLikeDeviceUserLimit(text) {
-        if (!text) return false;
-        const lower = String(text).toLowerCase();
-        const spaced = lower.replace(/\s+/g, ' ');
-        const compact = lower.replace(/\s+/g, '');
-        return (
-          spaced.includes('number of users logged into this device has exceeded the limit') ||
-          spaced.includes('users logged into this device has exceeded') ||
-          spaced.includes('device has exceeded the limit') ||
-          spaced.includes('device user limit') ||
-          spaced.includes('too many users on this device') ||
-          compact.includes('numberofusersloggedintothisdevicehasexceededthelimit') ||
-          compact.includes('usersloggedintothisdevicehasexceeded') ||
-          compact.includes('devicehasexceededthelimit') ||
-          compact.includes('deviceuserlimit') ||
-          compact.includes('toomanyusersonthisdevice') ||
-          spaced.includes('登录该设备的用户数已超过限制') ||
-          spaced.includes('设备登录用户数已超') ||
-          spaced.includes('设备用户数超限') ||
-          spaced.includes('此设备登录的用户数已超过限制')
-        );
-      }
-
-      function summarizeApiError(statusCode, bodyText) {
-        const compact = String(bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
-        let message = '';
-        try {
-          const parsed = JSON.parse(bodyText || '{}');
-          message = parsed.message || parsed.error || parsed.detail || parsed.msg || '';
-          if (!message && parsed.data && typeof parsed.data === 'object') {
-            message = parsed.data.message || parsed.data.error || '';
-          }
-        } catch (_) {}
-        const combined = [message, compact].filter(Boolean).join(' | ');
-        if (looksLikeDeviceUserLimit(combined) || looksLikeDeviceUserLimit(bodyText)) {
-          return {
-            code: 'DEVICE_USER_LIMIT',
-            error: `设备登录用户数已超限 (HTTP ${statusCode}): ${combined || 'The number of users logged into this device has exceeded the limit.'}`
-          };
-        }
-        return {
-          code: statusCode === 200 ? 'API_PAYLOAD_MISMATCH' : 'API_HTTP_ERROR',
-          error: statusCode === 200
-            ? (combined ? `API 返回格式不匹配：${combined}` : 'API 返回格式不匹配')
-            : `API 额度拉取失败 (HTTP ${statusCode})${combined ? ': ' + combined : ''}`
-        };
-      }
-
-      // 获取额度使用状况
-      const Qs = "7d4a8f2e6b9c3a1f5e8d2c7b4a9f6e3d1b5a2f9e6d3c0b7a4f1e8d5c2b9f6a3d";
-      const yc = "9b1c67af3f7ecd1501d7da7196f281f5e0c7c292ebc2227d49ff9d20";
-      
-      const timestamp = Math.floor(Date.now() / 1000);
-      const appVersion = "mac_2.0.0";
-      const pathname = "/user/usage_stats";
-
-      const signStr = `${timestamp}:${appVersion}:${pathname}:${user_id}`;
-      const hmacKeyString = `${timestamp}:${yc}`;
-
-      const hmac = crypto.createHmac('sha1', hmacKeyString).update(signStr).digest('hex');
-
-      const aesKey = Buffer.from(Qs, 'hex');
-      const ivAes = Buffer.alloc(16, 0);
-      const cipher = crypto.createCipheriv('aes-256-cbc', aesKey, ivAes);
-      let encrypted = cipher.update(hmac, 'utf8', 'base64');
-      encrypted += cipher.final('base64');
-
-      const options = {
-        hostname: 'api.typeless.com',
-        port: 443,
-        path: pathname,
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${access_token}`,
-          'X-Authorization': encrypted,
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Typeless/2.0.0 Chrome/120.0.6099.291 Electron/28.2.1 Safari/537.36',
-          'Accept': 'application/json',
-          'Content-Type': 'application/json'
-        },
-        timeout: 6000
-      };
-
-      const req = https.request(options, (res) => {
-        let body = '';
-        res.on('data', (chunk) => body += chunk);
-        res.on('end', () => {
-          if (res.statusCode !== 200) {
-            const summarized = summarizeApiError(res.statusCode, body);
-            return resolve({
-              success: true,
-              email: email,
-              userId: user_id,
-              rawJson: rawJsonString,
-              errorCode: summarized.code,
-              error: summarized.error
-            });
-          }
-          try {
-            const respObj = JSON.parse(body);
-            if (respObj.status === 'OK' && respObj.data && respObj.data.voice_transcription) {
-              const vt = respObj.data.voice_transcription;
-              return resolve({
-                success: true,
-                email: email,
-                userId: user_id,
-                rawJson: rawJsonString,
-                usedCharacters: vt.week_word_usage_value,
-                monthlyLimit: vt.week_word_usage_limit,
-                info: `总字数: ${vt.total_words}, 已用秒数: ${Math.round(vt.total_audio_seconds)}秒`
-              });
-            }
-            const summarized = summarizeApiError(200, body);
-            return resolve({
-              success: true,
-              email: email,
-              userId: user_id,
-              rawJson: rawJsonString,
-              errorCode: summarized.code,
-              error: summarized.error
-            });
-          } catch (e) {
-            const summarized = summarizeApiError(200, body);
-            return resolve({
-              success: true,
-              email: email,
-              userId: user_id,
-              rawJson: rawJsonString,
-              errorCode: summarized.code,
-              error: summarized.error || "解析 API 报文失败"
-            });
-          }
-        });
-      });
-
-      req.on('error', (e) => {
-        resolve({
-          success: true,
-          email: email,
-          userId: user_id,
-          rawJson: rawJsonString,
-          error: `API 请求网络连接失败: ${e.message}`
-        });
-      });
-
-      req.on('timeout', () => {
-        req.destroy();
-        resolve({
-          success: true,
-          email: email,
-          userId: user_id,
-          rawJson: rawJsonString,
-          error: "API 请求连接超时"
-        });
-      });
-
-      req.write(JSON.stringify({}));
-      req.end();
-
-    } catch (err) {
-      resolve({ success: false, error: `提取过程异常: ${err.message}` });
-    }
-  });
-}
-
-getActiveSession().then(res => {
-  console.log(JSON.stringify(res, null, 2));
-});
-"""#
-
-        let writeScriptContent = #"""
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-
-function writeActiveSession(rawJsonString) {
-  try {
-    const platform = os.platform();
-    const arch = os.arch();
-    const appName = 'Typeless';
-    
-    const hashInput = platform + '-' + arch;
-    const sha256Hex = crypto.createHash('sha256').update(hashInput).digest('hex');
-    const pbkdf2Key = crypto.pbkdf2Sync(sha256Hex + appName, 'typeless-user-service', 10000, 32, 'sha256');
-
-    const plaintext = Buffer.from(rawJsonString, 'utf8');
-    const iv = crypto.randomBytes(16);
-    const derivedPassword = crypto.pbkdf2Sync(pbkdf2Key, iv.toString(), 10000, 32, 'sha512');
-
-    const cipher = crypto.createCipheriv('aes-256-cbc', derivedPassword, iv);
-    let ciphertext = cipher.update(plaintext);
-    ciphertext = Buffer.concat([ciphertext, cipher.final()]);
-
-    const colon = Buffer.from(':');
-    const totalLength = iv.length + colon.length + ciphertext.length;
-    const finalBuffer = Buffer.concat([iv, colon, ciphertext], totalLength);
-
-    const userdataPath = path.join(process.env.HOME, 'Library/Application Support/Typeless/user-data.json');
-    const dir = path.dirname(userdataPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    fs.writeFileSync(userdataPath, finalBuffer);
-    console.log(JSON.stringify({ success: true }));
-  } catch (err) {
-    console.log(JSON.stringify({ success: false, error: err.message }));
-  }
-}
-
-const inputJson = process.argv[2];
-if (!inputJson) {
-  console.log(JSON.stringify({ success: false, error: "未提供 session payload 参数" }));
-  process.exit(1);
-}
-writeActiveSession(inputJson);
-"""#
-
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try? scriptContent.write(to: scriptURL, atomically: true, encoding: .utf8)
-        try? writeScriptContent.write(to: writeURL, atomically: true, encoding: .utf8)
+
+        var failure: String?
+        for name in Self.automationScriptNames {
+            guard let source = Self.bundledAutomationScriptURL(name) else {
+                failure = "App 包内缺少自动化脚本 \(name)，请重新打包 App"
+                continue
+            }
+            guard let content = try? String(contentsOf: source, encoding: .utf8) else {
+                failure = "读取 \(name) 失败：\(source.path)"
+                continue
+            }
+            let destination = folder.appendingPathComponent(name)
+            if let existing = try? String(contentsOf: destination, encoding: .utf8), existing == content {
+                continue
+            }
+            do {
+                try content.write(to: destination, atomically: true, encoding: .utf8)
+            } catch {
+                failure = "写入 \(name) 失败：\(error.localizedDescription)"
+            }
+        }
+        lastAutomationScriptDeployError = failure
     }
+
+    /// 需要铺到 Application Support 的自动化脚本清单。
+    nonisolated static let automationScriptNames = [
+        "extract-active-session.js",
+        "write-active-session.js"
+    ]
+
+    /// 在 App 包内定位自动化脚本。三种打包形态都要能找到：
+    ///   1. `swift build` / `swift run`：脚本在 SwiftPM 资源包 `*.bundle` 里
+    ///   2. 手工组装的 `.app`：`build-app.sh` 把脚本拷进 `Contents/Resources/`
+    ///   3. 直接跑裸二进制：脚本与可执行文件同目录
+    nonisolated static func bundledAutomationScriptURL(_ name: String) -> URL? {
+        let base = (name as NSString).deletingPathExtension
+        var candidates: [URL] = []
+        if let url = Bundle.module.url(forResource: base, withExtension: "js", subdirectory: "Resources") {
+            candidates.append(url)
+        }
+        if let url = Bundle.module.url(forResource: base, withExtension: "js") {
+            candidates.append(url)
+        }
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent(name))
+            candidates.append(resources.appendingPathComponent("Resources/\(name)"))
+        }
+        candidates.append(Bundle.main.bundleURL.appendingPathComponent(name))
+        if let executable = Bundle.main.executableURL {
+            candidates.append(executable.deletingLastPathComponent().appendingPathComponent(name))
+        }
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    /// 最近一次铺设自动化脚本失败的原因；nil 表示成功。UI 用它提示「脚本没铺上」。
+    var lastAutomationScriptDeployError: String?
 
 
     /// 最近一次成功写盘的内容快照：UI 逐字符输入也会触发 save，内容未变时跳过编码与写盘。

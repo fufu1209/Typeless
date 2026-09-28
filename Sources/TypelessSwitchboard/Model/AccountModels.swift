@@ -107,6 +107,24 @@ struct Account: Identifiable, Codable, Equatable, Sendable {
         return min(Double(usedCharacters) / Double(monthlyLimit), 1)
     }
 
+    /// 当前档位（从服务端下发的周额度反推，见 `QuotaTier`）。
+    var quotaTier: QuotaTier { QuotaTier.from(weeklyLimit: monthlyLimit) }
+
+    /// Pro 试用的到期时刻。非试用档返回 nil。
+    var trialEndsAt: Date? {
+        QuotaTier.trialEndsAt(createdAt: createdAt, weeklyLimit: monthlyLimit)
+    }
+
+    /// Pro 试用剩余天数（不足一天算 1 天；已到期为 0）。非试用档返回 nil。
+    var trialDaysRemaining: Int? {
+        QuotaTier.trialDaysRemaining(createdAt: createdAt, weeklyLimit: monthlyLimit, now: Date())
+    }
+
+    /// 账号列表上的档位徽章文案。免费档是常态，返回 nil 以免列表被噪音塞满。
+    var tierBadgeText: String? {
+        QuotaTier.badgeText(weeklyLimit: monthlyLimit, createdAt: createdAt, now: Date())
+    }
+
     var isUsable: Bool {
         (status == .available || status == .nearlySpent) && (reviewState ?? .approved) == .approved
     }

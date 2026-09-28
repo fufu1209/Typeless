@@ -399,6 +399,7 @@ struct OperationalFeatureChecks {
         runToolkitAccountImporterEdgeCaseChecks()
         runPreflightVerdictChecks()
         runLegacyQuotaRescaleChecks()
+        runQuotaTierChecks()
         runStoreRecoveryChecks()
         runQuotaGuardLaunchAgentPlannerChecks()
 
@@ -1899,6 +1900,66 @@ struct OperationalFeatureChecks {
             check(LegacyQuotaRescale.rescaledThreshold(200) == 120, "阈值换算必须稳定")
             check(LegacyQuotaRescale.rescaledWeeklyLimit(8000) == 2000, "额度换算必须稳定")
         }
+    }
+
+    // MARK: - QuotaTier：档位识别（Pro 试用 vs 免费）
+
+    /// 背景（2026-09-29 实测）：
+    ///   Typeless 新注册账号的 `role = pro_trial`，`insert_time` → `exp_time` **恰好 3 天**，
+    ///   期间周额度 23333；到期后降为 `free`，周额度 2000。
+    ///   本地 `createdAt` 与服务端 `insert_time` 吻合到 21 秒以内，
+    ///   所以「档位」与「试用剩余天数」都能在本地推算，不必为了看一眼去换号。
+    private static func runQuotaTierChecks() {
+        // 1) 档位映射：已知额度精确对应，未知额度不硬猜
+        check(QuotaTier.from(weeklyLimit: 23333) == .proTrial,
+              "23333 必须识别为 Pro 试用档")
+        check(QuotaTier.from(weeklyLimit: 2000) == .free,
+              "2000 必须识别为免费档")
+        check(QuotaTier.from(weeklyLimit: 8000) == .free,
+              "8000（2026-09 前的免费额度）仍须识别为免费档，否则老账号会被误标成试用")
+        for odd in [0, 1, 100, 1999, 2001, 10_000, 23_332, 23_334, 100_000] {
+            check(QuotaTier.from(weeklyLimit: odd) == .unknown,
+                  "未登记过的额度 \(odd) 必须判为 unknown，不得硬塞进已知档位")
+        }
+
+        // 2) 试用到期时刻 = 注册时刻 + 3 天
+        let createdAt = Date(timeIntervalSince1970: 1_787_000_000)  // 固定时刻，测试必须可复现
+        guard let endsAt = QuotaTier.trialEndsAt(createdAt: createdAt, weeklyLimit: 23333) else {
+            fputs("FAIL: Pro 试用档必须有到期时刻\n", stderr)
+            exit(1)
+        }
+        let days = endsAt.timeIntervalSince(createdAt) / QuotaTier.secondsPerDay
+        check(abs(days - 3) < 0.000_1, "试用时长必须恰好 3 天，实测 \(days)")
+        check(QuotaTier.trialEndsAt(createdAt: createdAt, weeklyLimit: 2000) == nil,
+              "免费档没有试用到期时刻")
+
+        // 3) 剩余天数：向上取整、到期为 0、非试用档为 nil
+        let midTrial = createdAt.addingTimeInterval(QuotaTier.secondsPerDay * 1.5)
+        check(QuotaTier.trialDaysRemaining(createdAt: createdAt, weeklyLimit: 23333, now: midTrial) == 2,
+              "过了 1.5 天 → 剩 2 天（向上取整，不足一天也算 1 天）")
+        let lastMoment = createdAt.addingTimeInterval(QuotaTier.secondsPerDay * 3 - 60)
+        check(QuotaTier.trialDaysRemaining(createdAt: createdAt, weeklyLimit: 23333, now: lastMoment) == 1,
+              "只剩 1 分钟也算 1 天")
+        let afterEnd = createdAt.addingTimeInterval(QuotaTier.secondsPerDay * 3 + 1)
+        check(QuotaTier.trialDaysRemaining(createdAt: createdAt, weeklyLimit: 23333, now: afterEnd) == 0,
+              "已到期必须返回 0（不能返回负数）")
+        check(QuotaTier.trialDaysRemaining(createdAt: createdAt, weeklyLimit: 2000, now: midTrial) == nil,
+              "免费档的剩余天数必须是 nil")
+
+        // 4) 徽章文案：免费档不给徽章（否则整个列表全是徽章，等于没有徽章）
+        check(QuotaTier.badgeText(weeklyLimit: 2000, createdAt: createdAt, now: midTrial) == nil,
+              "免费档不应产生徽章")
+        check(QuotaTier.badgeText(weeklyLimit: 23333, createdAt: createdAt, now: midTrial) == "Pro 试用 · 剩 2 天",
+              "试用中必须显示剩余天数")
+        check(QuotaTier.badgeText(weeklyLimit: 23333, createdAt: createdAt, now: afterEnd) == "Pro 试用 · 今日到期",
+              "已过期但服务端尚未降档时必须提示「今日到期」")
+        check(QuotaTier.badgeText(weeklyLimit: 7777, createdAt: createdAt, now: midTrial) == "额度 7777",
+              "未知档位必须原样报出额度，而不是假装知道")
+
+        // 5) 与「8000 时代」的兼容：老账号迁移后是 2000，仍是免费档
+        let migrated = LegacyQuotaRescale.rescaledWeeklyLimit(8000)
+        check(QuotaTier.from(weeklyLimit: migrated) == .free,
+              "8000 迁移成 2000 之后仍须是免费档（迁移不得把账号变成试用档）")
     }
 
     // MARK: - StoreRecovery：真的读写临时目录，不做源码字符串断言

@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.1-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -92,7 +92,7 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.6.0**（2026-09-29）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.6.1**（2026-09-29）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 最近的主要变化：**会话复活**（Token 过期的账号一键恢复可用，不必重新注册）、
 适配 **Typeless 2.7.0 / 2.8.0** 的新签名协议（密钥自动从 App 提取，跨版本不再硬编码）、

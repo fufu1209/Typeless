@@ -203,6 +203,20 @@ function activeEmail() {
 //   清 keychain 凭据 → 删 device.cache → 删 user-data.json
 //   → 清 app-storage.json 的 userData / quotaUsage → 清 Electron 残留目录
 
+// v2.6.6：读出当前设备标识（device.cache 的内容）。
+// 存在的意义是**证明**设备身份真的换了，而不是相信脚本打印的 ✓ ——
+// 2026-09-30 的教训：重置只查了一个从来不存在的路径，照样打印「成功」，
+// 但 deviceId 一个字没变，桌面端继续被服务端判「同一设备用户数超限」。
+function readDeviceCacheValue() {
+  for (const dir of DEVICE_CACHE_DIRS) {
+    const p = path.join(dir, 'device.cache');
+    try {
+      if (fs.existsSync(p)) return fs.readFileSync(p, 'utf8').trim();
+    } catch (_) { /* 读不到就当没有 */ }
+  }
+  return null;
+}
+
 function resetDeviceIdentity() {
   const steps = [];
 
@@ -277,6 +291,8 @@ async function switchOne(account, index, total, opts) {
   log(`\n${label}`);
   log(`  模式：${opts.full ? '完整换号（含设备身份重置）' : '静默注入（保留设备身份）'}`);
 
+  const deviceBefore = opts.full ? readDeviceCacheValue() : null;
+
   await quitTypeless();
   if (opts.full) {
     for (const s of resetDeviceIdentity()) log(`  · ${s}`);
@@ -341,6 +357,21 @@ async function switchOne(account, index, total, opts) {
   }
   log(`  ✓ 观察 ${(opts.observe / 1000).toFixed(0)}s 后会话仍存活且仍是目标账号`);
 
+  // ③ 设备隔离证据（v2.6.6）：桌面端在全新设备身份下重建 device.cache。
+  // 只对完整换号模式断言 —— light 模式**故意**保留设备身份，它变了反而是异常。
+  let deviceAfter = null;
+  let deviceChanged = null;
+  if (opts.full) {
+    deviceAfter = readDeviceCacheValue();
+    deviceChanged = Boolean(deviceAfter && deviceAfter !== deviceBefore);
+    if (deviceChanged) {
+      log(`  ✓ 设备身份已更换：${deviceBefore || '（无）'} → ${deviceAfter}`);
+    } else {
+      log(`  ⚠️ 设备身份未变化（${deviceAfter || '仍然没有 device.cache'}）—— 重置没生效，`
+        + `这台设备会继续累积账号，迟早再触发「设备用户数超限」`);
+    }
+  }
+
   // ④ 服务端证据：用换上的会话打官方额度接口
   const revived = readActiveSession();
   const newExp = decodeJwtPayload(revived.credentials.access_token);
@@ -375,6 +406,9 @@ async function switchOne(account, index, total, opts) {
     used: usage.usedCharacters,
     limit: usage.monthlyLimit,
     remaining,
+    deviceBefore,
+    deviceAfter,
+    deviceChanged,
     totalMs: Date.now() - t0
   };
 }

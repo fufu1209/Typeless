@@ -2896,6 +2896,13 @@ struct OperationalFeatureChecks {
               "设备身份护栏：一个都没删到时必须显式告警，不许静默跳过")
         check(!src.contains("path.join(DATA_DIR, 'device.cache')"),
               "设备身份护栏：不得再退回只查 Typeless/device.cache —— 那个路径从来不存在")
+
+        // v2.6.6 追加：隔离必须**可证明**。脚本要读出 device.cache 的真实值做前后对比，
+        // 没变时显式告警 —— 否则「重置成功」又退化回一句无法验证的声明。
+        check(src.contains("readDeviceCacheValue"),
+              "设备身份护栏：必须有读取设备标识的实现（否则无从证明重置生效）")
+        check(src.contains("设备身份未变化"),
+              "设备身份护栏：deviceId 没变时必须显式告警，不能只打印成功")
     }
 
     private static func runQuotaGuardReloadSafetyChecks() {

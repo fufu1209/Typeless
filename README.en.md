@@ -6,7 +6,7 @@ multiple accounts when the free **2,000 words/week** quota runs low.
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.5-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.6-blue.svg)](CHANGELOG.md)
 
 > 🌏 [中文版 README](README.md) — the Chinese one is more detailed.
 

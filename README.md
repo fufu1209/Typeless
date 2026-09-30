@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.5-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.6-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -98,13 +98,15 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.6.5**（2026-09-30）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.6.6**（2026-09-30）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 最近的主要变化：**会话复活**（Token 过期的账号一键恢复可用，不必重新注册）、
 适配 **Typeless 2.8.1** 的新签名协议（密钥按形状从 App 现场提取，跨版本不再硬编码）、
 额度口径改为**每周 2000 字**并重算换号阈值（默认 120）、周期口径改为**实测观测**（不再靠猜）、
 界面「可用账号 / 剩余额度」口径与选号逻辑对齐（v2.6.4）、
-**GUI 落盘不再还原维护脚本的成果**（v2.6.5，见下方「账号池运维脚本」）。
+**GUI 落盘不再还原维护脚本的成果**（v2.6.5，见下方「账号池运维脚本」）、
+**写入不再被静默丢弃 + 会制造静默失效的操作不再放行**（v2.6.6 —— 含修掉「设备重置
+漏删 `device.cache` 导致重置假成功、桌面端被判设备用户数超限」这个坑）。
 
 ## 这个工具能做什么
 

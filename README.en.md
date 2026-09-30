@@ -6,7 +6,7 @@ multiple accounts when the free **2,000 words/week** quota runs low.
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.2-blue.svg)](CHANGELOG.md)
 
 > 🌏 [中文版 README](README.md) — the Chinese one is more detailed.
 
@@ -71,6 +71,12 @@ cd Typeless
 ./scripts/build-app.sh --install     # installs to /Applications/TypelessSwitchboard.app
 open /Applications/TypelessSwitchboard.app
 ```
+
+> 💡 Run `./scripts/create-signing-identity.sh` once. The app is ad-hoc signed by
+> default, and an ad-hoc fingerprint changes on every build — while macOS keychain ACLs
+> record the fingerprint of the app that created them. That makes every reinstall pop a
+> keychain prompt; until it is answered, the window never appears and the background
+> guard stalls. A stable self-signed certificate removes the prompt for good.
 
 Then grant the permissions listed in the app's **Diagnostics** tab
 (Accessibility, Automation, Input Monitoring, Microphone, Screen Recording).

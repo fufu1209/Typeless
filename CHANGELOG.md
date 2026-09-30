@@ -1,6 +1,46 @@
 # 更新记录
 
-当前版本 **v2.6.1**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.6.2**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.6.2（2026-09-29）
+
+一个纯修复版：把三处**会静默骗过使用者**的缺陷堵上。
+
+### 修复
+
+- **安装时可能触发系统签名校验崩溃**（`EXC_CRASH (SIGKILL (Code Signature Invalid))`
+  / `Namespace CODESIGNING, Code 4, Launch Constraint Violation`）。
+  `scripts/build-app.sh` 装新包用的是 `rm -rf` + `cp -R`，中间有几秒窗口期；
+  而额度守护是 `StartInterval=60` 的 launchd 任务，随时可能被拉起 ——
+  一旦它恰好落在这几秒里，就会从「写了一半的 app 包」加载二进制，
+  被内核的 Launch Constraint 直接 kill，并往 `DiagnosticReports` 扔一份崩溃报告。
+  现在安装前后会先 `launchctl bootout` 停掉守护、退出 GUI，装完再 `bootstrap` 恢复。
+  顺带把安装后的启动从裸 `open` 改成走 Finder 的 Apple Event
+  （`open` 在受限 shell 里会静默失效）。
+
+- **会话复活脚本会把失败判成成功**。`scripts/revive-account-sessions.js` 原先只要
+  检测到 `user-data.json` 的 mtime 变化，就宣布「桌面端已换发新 token」。
+  实测（2026-09-29）证明这个判据站不住脚：`access_token` 已过期 66 天的账号，
+  桌面端同样会在 +2.6s 重写文件，但随后发现自己也换不动 token，
+  就把会话清空、退回登录页 —— mtime 确实变了，人却用不了。
+  现在改成四重校验：静置 8 秒后 ① 会话仍可解密、② `access_token` 确实换成了新的、
+  ③ 换回来的 `user_id` 与目标账号一致（防止把别的账号写回池子）、
+  ④ 新 token 未过期；最后仍以官方 `/user/usage_stats` 返回 200 为准。
+
+- **额度守护（LaunchAgent）会把自己干掉，而且界面不告诉你**。守护原来会按
+  「近阈值加速」把 plist 的 `StartInterval` 从 60 秒压到 20 秒，再
+  `launchctl bootout` + `bootstrap` 让改动生效 —— 但**守护自己就运行在这个 job 里**，
+  bootout 把 job 连同调用者一起停掉，紧随其后的 `bootstrap` 永远执行不到。
+  结果：plist 还在（界面据此报「已安装」），launchd 里却空无一物。
+  本机实测从 09-29 16:05 静默失效到 09-30 16:38，整整 24 小时无人察觉。
+  现在的三条规矩：① 守护从 job 内调用一律**拒绝重载**，改间隔只由 GUI 执行；
+  ② 重载必须**校验**（`launchctl print` 查得到才算成功）并重试；
+  ③ 界面区分「plist 在」与「launchd 真的在跑」，未运行时显式报
+  「⚠️ 已安装但未在运行」，并在 App 打开时**自动自愈**
+  （重新 `bootstrap` + 把间隔校正回配置值）。
+  顺带把守护对官方额度接口的调用量从「近阈值时 3 倍」降回 1 倍，对账号更安全。
 
 ---
 

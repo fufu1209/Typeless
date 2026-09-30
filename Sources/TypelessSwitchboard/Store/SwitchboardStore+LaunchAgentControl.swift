@@ -9,9 +9,33 @@ import TypelessSwitchboardCore
 extension SwitchboardStore {
     // MARK: - 开机轻量插件（LaunchAgent）
 
+    /// 刷新开机插件状态，并**顺手自愈**两类静默失效。
+    ///
+    /// 自愈 ①：plist 在、launchd 里却没有（历史上 bootout 之后 bootstrap 失败就会留下
+    /// 这种状态）→ 直接 bootstrap 回来。守护自己发现不了这件事：它能跑就说明 job 在，
+    /// job 不在它就永远不跑 —— 所以只能由 GUI 兜底。
+    /// 自愈 ②：plist 的巡检间隔被历史版本改歪了 → 校正回用户配置值。
+    ///
+    /// 这两件事都只能放在 GUI 路径上：守护侧不得碰 launchd（bootout 会把它自己带走，
+    /// 见 `QuotaGuardLaunchAgentPlanner` 的「重载安全」注释）。
     func refreshLaunchAgentStatus() {
+        if QuotaGuardLaunchAgent.isInstalled {
+            if !QuotaGuardLaunchAgent.isLoaded {
+                if QuotaGuardLaunchAgent.ensureLoaded() {
+                    appendDaemonLog(
+                        remaining: liveRemainingCharacters,
+                        email: liveAccountEmail,
+                        reason: "launchagent-heal plist 已安装但 launchd 中无任务，已重新加载",
+                        resultID: nil
+                    )
+                }
+            }
+            _ = QuotaGuardLaunchAgent.normalizeIntervalToConfigured(
+                minutes: state.settings.autoRotateCheckIntervalMinutes
+            )
+        }
         launchAgentStatusMessage = QuotaGuardLaunchAgent.statusSummary(
-            intervalMinutes: state.settings.autoRotateCheckIntervalMinutes
+            configuredMinutes: state.settings.autoRotateCheckIntervalMinutes
         )
     }
 

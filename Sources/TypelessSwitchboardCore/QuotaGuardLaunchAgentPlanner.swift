@@ -123,4 +123,52 @@ public enum QuotaGuardLaunchAgentPlanner {
         updated.replaceSubrange(range, with: "<key>StartInterval</key>\n  <integer>\(seconds)</integer>")
         return updated
     }
+
+    // MARK: - 重载安全（v2.6.2）
+    //
+    // 现场（2026-09-29 16:05）：守护判定「近阈值加速」后改写 plist 的 StartInterval，
+    // 紧接着 `launchctl bootout` + `bootstrap` 想让改动生效。但 **守护自己就运行在这个
+    // job 里** —— bootout 把 job 连同调用者一起停掉，紧随其后的 bootstrap 永远执行不到。
+    // 后果：plist 还在（UI 据此判定「已安装」），launchd 里却空无一物，
+    // 额度守护静默失效 24 小时（09-29 16:05 → 09-30 16:38 实测）而无人察觉。
+    //
+    // 现在的三条规矩：
+    //   ① **守护绝不 bootout 自己**：从 job 内调用一律拒绝重载，只由不在该 job 里的
+    //      进程（GUI）执行；
+    //   ② 任何重载都要**校验**（`launchctl print` 能查到才算成功）并重试；
+    //   ③ UI 必须分开看「plist 在不在」和「launchd 真的在跑没有」。
+
+    /// 当前进程是否运行在**被管理的那个 job 里**（LaunchAgent 拉起的守护，
+    /// 或手工执行的 `--daemon-check`）。是的话就不能自己 bootout —— 那等于自杀。
+    public static func runsInsideManagedJob(arguments: [String] = CommandLine.arguments) -> Bool {
+        arguments.contains(daemonFlag)
+    }
+
+    /// plist 里的 StartInterval 与期望值不一致时才值得重载（相等就别折腾 launchd）。
+    public static func needsReload(liveIntervalSeconds: Int?, desiredSeconds: Int) -> Bool {
+        liveIntervalSeconds != desiredSeconds
+    }
+
+    /// 供 UI 展示的状态文案。
+    ///
+    /// **`isLoaded` 必须来自 `launchctl print`，不能由 plist 文件是否存在推导** ——
+    /// 只看文件正是那次「静默失效 24 小时」的成因。
+    public static func statusText(
+        isInstalled: Bool,
+        isLoaded: Bool,
+        configuredMinutes: Int,
+        liveIntervalSeconds: Int?
+    ) -> String {
+        guard isInstalled else {
+            return "开机轻量插件：未安装（推荐安装，不必一直开着本 App）"
+        }
+        guard isLoaded else {
+            return "开机轻量插件：⚠️ 已安装但未在运行（launchd 里查不到该任务）—— 重开本 App 会自动修复"
+        }
+        let minutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(configuredMinutes)
+        if let live = liveIntervalSeconds, live < minutes * 60 {
+            return "开机轻量插件：运行中 · 约每 \(live) 秒巡检（常规 \(minutes) 分钟）"
+        }
+        return "开机轻量插件：运行中 · 约每 \(minutes) 分钟巡检本周额度（不常驻窗口）"
+    }
 }

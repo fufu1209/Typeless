@@ -381,20 +381,20 @@ extension SwitchboardStore {
             await ensureHotSpareIfNeeded(apiKey: apiKey, domain: state.settings.domains.first ?? "")
         }
 
-        // 近阈值时把 LaunchAgent 间隔压到约 20 秒，额度回升后再拉回用户设定分钟数。
-        if QuotaGuardLaunchAgent.isInstalled {
-            let threshold = SmartSwitchPolicy.normalizeThreshold(state.settings.autoRotateRemainingThreshold)
-            let desiredSeconds: Int
-            if lastQuotaSyncFresh,
-               let remaining = liveRemainingCharacters,
-               SmartSwitchPolicy.isApproachingQuotaLimit(remaining: remaining, threshold: threshold) {
-                desiredSeconds = Int(SmartSwitchPolicy.urgentCheckIntervalSeconds)
-            } else {
-                desiredSeconds = SmartSwitchPolicy.normalizeCheckIntervalMinutes(
-                    state.settings.autoRotateCheckIntervalMinutes
-                ) * 60
-            }
-            QuotaGuardLaunchAgent.reconcileIntervalSecondsIfNeeded(desiredSeconds)
+        // v2.6.2：**守护不再改写 launchd 任务**。
+        //
+        // 这里原来会按「近阈值加速」把 plist 的 StartInterval 压到 20 秒，再
+        // bootout + bootstrap 让改动生效。但守护自己就运行在这个 job 里 ——
+        // bootout 把 job 连同调用者一起停掉，随后的 bootstrap 永远执行不到，
+        // 结果是 plist 还在、launchd 里空无一物，守护静默失效 24 小时无人察觉
+        // （2026-09-29 16:05 → 09-30 16:38 实测）。
+        //
+        // 现在巡检间隔固定为用户配置值（默认 1 分钟），由 GUI 在
+        // refreshLaunchAgentStatus() 里校正；App 内循环监控仍按
+        // nextCheckDelaySeconds 自行加速，不受影响。顺带把守护对官方额度接口的
+        // 调用量从「近阈值时 3 倍」降回 1 倍，对账号更安全。
+        if QuotaGuardLaunchAgent.isInstalled, !QuotaGuardLaunchAgent.isLoaded {
+            print("TypelessSwitchboard daemon: warning — LaunchAgent 已安装但未在 launchd 中运行")
         }
 
         state.settings.isAutoRotateEnabled = previousAutoRotate

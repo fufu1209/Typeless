@@ -37,7 +37,9 @@ struct QuotaGuardTabView: View {
             InfoLine(
                 label: "状态",
                 value: store.launchAgentStatusMessage,
-                color: QuotaGuardLaunchAgent.isInstalled ? .green : .secondary
+                color: QuotaGuardLaunchAgent.isLoaded
+                    ? .green
+                    : (QuotaGuardLaunchAgent.isInstalled ? .orange : .secondary)
             )
 
             HStack(spacing: 8) {

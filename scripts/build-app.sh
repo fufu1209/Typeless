@@ -99,7 +99,23 @@ else
 fi
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$STAGE" >/dev/null
+  # 优先用**稳定的自签名身份**签名。
+  #
+  # 为什么重要：钥匙串条目的授权记录的是「创建它的那个 app 的签名指纹」。
+  # ad-hoc 签名（`--sign -`）的指纹每次构建都变 ⇒ 每次重装 app 都会弹
+  # 「想要使用你储存在钥匙串中的机密信息」并要登录密码，而 GUI 与守护会双双
+  # 卡死在那一句 SecItemCopyMatching 上：窗口不出、日志不写（2026-09-30 实测）。
+  # 换成固定证书后，指定要求变成「bundle id + 证书」，跨构建稳定，不再重复授权。
+  # 一次性创建：./scripts/create-signing-identity.sh
+  SIGN_IDENTITY="${TYPELESS_SIGN_IDENTITY:-TypelessSwitchboard Local}"
+  if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$STAGE" >/dev/null
+    echo "已用稳定身份签名：$SIGN_IDENTITY（钥匙串不会重复要授权）"
+  else
+    codesign --force --deep --sign - "$STAGE" >/dev/null
+    echo "WARN: 未找到代码签名身份，已退回 ad-hoc 签名 —— 每次重装 app 都会要求钥匙串授权。" >&2
+    echo "      一次性根治：./scripts/create-signing-identity.sh" >&2
+  fi
 fi
 
 echo "Built $STAGE (v${VERSION_SHORT})"
@@ -134,13 +150,63 @@ done
 
 if [[ "$DO_INSTALL" -eq 1 ]]; then
   DEST="/Applications/$APP"
+  GUARD_LABEL="local.typeless.switchboard.quota-guard"
+  GUARD_PLIST="$HOME/Library/LaunchAgents/$GUARD_LABEL.plist"
+
+  # ① 安装前先停掉守护。
+  #
+  # 为什么必须停：下面是 `rm -rf` + `cp -R`，拷贝整个 .app 有几秒窗口期。
+  # 而守护是 launchd 定时任务（StartInterval 见 plist，默认按用户配置的分钟数），随时可能被拉起 ——
+  # 只要它在这个窗口期内启动，就会从「正在被写入的 bundle」加载，
+  # 代码签名校验失败，被内核直接 SIGKILL。实测崩溃报告：
+  #   EXC_CRASH (SIGKILL (Code Signature Invalid))
+  #   Termination Reason: Namespace CODESIGNING, Code 4, Launch Constraint Violation
+  # 这不是软件缺陷，是安装流程自己的竞态；但用户会看到一份吓人的崩溃报告，
+  # 所以在这里堵掉。
+  GUARD_WAS_LOADED=0
+  if launchctl list 2>/dev/null | grep -q "$GUARD_LABEL"; then
+    GUARD_WAS_LOADED=1
+    launchctl bootout "gui/$(id -u)/$GUARD_LABEL" 2>/dev/null \
+      || launchctl unload "$GUARD_PLIST" 2>/dev/null || true
+    echo "已暂停额度守护（安装期间，避免签名校验竞态）"
+  fi
+
+  # ② 正在运行的 GUI 也要先退出：它持有旧 bundle，直接 rm 掉会留下坏状态。
+  if pgrep -f "TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard" >/dev/null 2>&1; then
+    osascript -e 'tell application "TypelessSwitchboard" to quit' >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6; do
+      pgrep -f "TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    echo "已退出运行中的 GUI"
+  fi
+
   echo "Installing to $DEST"
   rm -rf "$DEST"
   cp -R "$STAGE" "$DEST"
   xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
   echo "Installed $DEST"
+
+  # ③ 恢复守护（装完再拉起来，此时 bundle 已经是完整的新版本）。
+  #
+  # 判据用「plist 还在」而不是「装之前是否加载」：plist 在就说明用户装过这个守护，
+  # 而它完全可能正因为历史缺陷（守护自噬 → bootout 后 bootstrap 失败）处于
+  # 「已安装但没加载」的状态 —— 这里顺带治好，并且**校验**，不再静默失败。
+  if [[ -f "$GUARD_PLIST" ]]; then
+    launchctl bootstrap "gui/$(id -u)" "$GUARD_PLIST" 2>/dev/null \
+      || launchctl load "$GUARD_PLIST" 2>/dev/null || true
+    if launchctl print "gui/$(id -u)/$GUARD_LABEL" >/dev/null 2>&1; then
+      echo "已恢复额度守护（launchd 校验通过）"
+    else
+      echo "⚠️ 额度守护未能加载：请打开 App 的「额度守护」页点「安装/更新开机插件」" >&2
+    fi
+  fi
+
   if [[ "$DO_LAUNCH" -eq 1 ]]; then
-    open "$DEST"
+    # ④ 不要用裸 `open` —— 它在受限 shell 里会静默失效（不报错也不启动）。
+    #    走 Finder 的 Apple Event 才可靠。
+    osascript -e "tell application \"Finder\" to open POSIX file \"$DEST\"" >/dev/null 2>&1 \
+      || open "$DEST" 2>/dev/null || true
     echo "Launched $DEST"
   fi
 fi

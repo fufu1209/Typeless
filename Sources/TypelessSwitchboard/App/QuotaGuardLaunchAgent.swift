@@ -17,16 +17,21 @@ enum QuotaGuardLaunchAgent {
         FileManager.default.fileExists(atPath: plistURL.path)
     }
 
-    static func statusSummary(intervalMinutes: Int) -> String {
-        if isInstalled {
-            let minutes = SmartSwitchPolicy.normalizeCheckIntervalMinutes(intervalMinutes)
-            let live = currentStartIntervalSeconds()
-            if let live, live < minutes * 60 {
-                return "开机轻量插件：已安装 · 近阈值加速约每 \(live) 秒巡检（常规 \(minutes) 分钟）"
-            }
-            return "开机轻量插件：已安装 · 约每 \(minutes) 分钟巡检本周额度（不常驻窗口）"
-        }
-        return "开机轻量插件：未安装（推荐安装，不必一直开着本 App）"
+    /// launchd 里**真的**有这个 job 吗。
+    ///
+    /// 必须与 `isInstalled`（plist 文件在不在）分开看：只有文件、没有 job，
+    /// 正是 v2.6.1 那次「界面说已安装、实际 24 小时没巡检」的静默失效形态。
+    static var isLoaded: Bool {
+        runLaunchctl(["print", "gui/\(getuid())/\(label)"]).status == 0
+    }
+
+    static func statusSummary(configuredMinutes: Int) -> String {
+        QuotaGuardLaunchAgentPlanner.statusText(
+            isInstalled: isInstalled,
+            isLoaded: isLoaded,
+            configuredMinutes: configuredMinutes,
+            liveIntervalSeconds: currentStartIntervalSeconds()
+        )
     }
 
     /// 读取当前 plist 里的 StartInterval（秒）。
@@ -35,20 +40,66 @@ enum QuotaGuardLaunchAgent {
         return QuotaGuardLaunchAgentPlanner.startIntervalSeconds(inPlistData: data)
     }
 
-    /// daemon 根据本周剩余额度动态调整巡检间隔：接近阈值 → 约 20 秒；否则恢复用户设定分钟数。
-    static func reconcileIntervalSecondsIfNeeded(_ desiredSeconds: Int) {
+    /// 把 plist 的巡检间隔校正到用户配置值（GUI 调用）。
+    @discardableResult
+    static func normalizeIntervalToConfigured(minutes: Int) -> Bool {
+        reconcileIntervalSecondsIfNeeded(
+            QuotaGuardLaunchAgentPlanner.intervalSeconds(intervalMinutes: minutes)
+        )
+    }
+
+    /// 改写 plist 的 StartInterval 并让 launchd 重新加载。
+    ///
+    /// ⚠️ **从被管理的 job 内调用会被直接拒绝**：bootout 会把本 job（含本进程）一起停掉，
+    /// 紧随其后的 bootstrap 永远执行不到，结果是 plist 还在、launchd 里空无一物 ——
+    /// 2026-09-29 那次「守护静默失效 24 小时」就是这么来的。
+    @discardableResult
+    static func reconcileIntervalSecondsIfNeeded(_ desiredSeconds: Int) -> Bool {
         let clamped = QuotaGuardLaunchAgentPlanner.reconciledIntervalSeconds(desiredSeconds)
-        guard isInstalled else { return }
-        if currentStartIntervalSeconds() == clamped { return }
+        guard isInstalled else { return false }
+        // 在 job 内：绝不自己 bootout，交给 GUI 校正。
+        guard !QuotaGuardLaunchAgentPlanner.runsInsideManagedJob() else { return false }
+        guard QuotaGuardLaunchAgentPlanner.needsReload(
+            liveIntervalSeconds: currentStartIntervalSeconds(),
+            desiredSeconds: clamped
+        ) else { return true }
         guard let data = try? Data(contentsOf: plistURL),
               let text = String(data: data, encoding: .utf8),
               let updated = QuotaGuardLaunchAgentPlanner.replacingStartInterval(inPlistText: text, seconds: clamped) else {
-            return
+            return false
         }
-        // 替换 <key>StartInterval</key> 后的 integer。
         try? updated.write(to: plistURL, atomically: true, encoding: .utf8)
-        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
+        return reloadVerified()
+    }
+
+    /// 校验式重载：bootout → 等到 launchd 真的查不到 → bootstrap → **校验**，失败重试。
+    /// 只允许在「不在该 job 内」的进程（GUI）里调用。
+    @discardableResult
+    static func reloadVerified(attempts: Int = 5) -> Bool {
+        let domain = "gui/\(getuid())"
+        let target = "\(domain)/\(label)"
+        let rounds = max(attempts, 1)
+        for attempt in 1...rounds {
+            _ = runLaunchctl(["bootout", target])
+            var waited = 0
+            while runLaunchctl(["print", target]).status == 0, waited < 20 {
+                usleep(500_000)
+                waited += 1
+            }
+            _ = runLaunchctl(["bootstrap", domain, plistURL.path])
+            if isLoaded { return true }
+            if attempt < rounds { sleep(1) }
+        }
+        return false
+    }
+
+    /// 自愈：plist 在、launchd 里却没有 → 直接 bootstrap 回来（无需先 bootout）。
+    @discardableResult
+    static func ensureLoaded() -> Bool {
+        guard isInstalled else { return false }
+        if isLoaded { return true }
         _ = runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
+        return isLoaded
     }
 
     /// 优先用已打包的 .app 可执行文件；否则用当前进程路径（swift run / 开发构建）。
@@ -96,17 +147,16 @@ enum QuotaGuardLaunchAgent {
         try FileManager.default.createDirectory(at: agentsDir, withIntermediateDirectories: true)
         try plist.write(to: plistURL, atomically: true, encoding: .utf8)
 
-        // 先 bootout 再 bootstrap，兼容已安装场景。
-        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
-        let load = runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
-        if load.status != 0 {
-            // 旧系统 fallback
+        // 先 bootout 再 bootstrap，兼容已安装场景；装完必须**校验**（见 reloadVerified）。
+        if !reloadVerified() {
+            // 旧系统 fallback：老 launchctl 不认 bootstrap。
             let legacy = runLaunchctl(["load", "-w", plistURL.path])
-            if legacy.status != 0 {
+            if legacy.status != 0 || !isLoaded {
                 throw NSError(
                     domain: "QuotaGuardLaunchAgent",
                     code: 2,
-                    userInfo: [NSLocalizedDescriptionKey: "launchctl 加载失败：\(load.output.ifEmpty(legacy.output))"]
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "launchctl 加载失败：\(legacy.output.ifEmpty("校验未通过：launchd 里仍查不到该任务"))"]
                 )
             }
         }

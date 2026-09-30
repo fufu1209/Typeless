@@ -402,6 +402,7 @@ struct OperationalFeatureChecks {
         runQuotaTierChecks()
         runStoreRecoveryChecks()
         runQuotaGuardLaunchAgentPlannerChecks()
+        runQuotaGuardReloadSafetyChecks()
 
         // MARK: - v2.5.2：阈值边界 + 钥匙串缓存回归
         runThresholdBoundaryChecks()
@@ -2526,5 +2527,76 @@ struct OperationalFeatureChecks {
         let writeNoArg = runCommand("node", ["\(scriptDir)/write-active-session.js"])
         check(writeNoArg.output.contains("\"success\": false") || writeNoArg.output.contains("\"success\":false"),
               "write-active-session 无参数时必须返回 success:false：\(writeNoArg.output)")
+    }
+
+    // MARK: - v2.6.2：LaunchAgent 重载安全（防「守护自噬后静默失效」）
+
+    /// 2026-09-29 现场：守护按「近阈值加速」改写 plist 后调 `launchctl bootout`，
+    /// 把自己所在的 job 一起停掉 → 紧随的 bootstrap 永远执行不到 → plist 还在、
+    /// launchd 里空无一物，界面照样报「已安装」，守护静默失效 24 小时。
+    /// 这一组断言把「不许自噬」和「不许说谎」钉死。
+    private static func runQuotaGuardReloadSafetyChecks() {
+        let planner = QuotaGuardLaunchAgentPlanner.self
+
+        // 1. job 内判定：argv 里有守护参数 → 不许自己 bootout
+        check(planner.runsInsideManagedJob(arguments: ["/x/TypelessSwitchboard", planner.daemonFlag]),
+              "重载安全：argv 含 --daemon-check 必须判为「在 job 内」")
+        check(planner.runsInsideManagedJob(arguments: ["/x/TypelessSwitchboard"]) == false,
+              "重载安全：GUI 启动（无 --daemon-check）不得判为 job 内")
+        check(planner.runsInsideManagedJob(arguments: ["/x/TypelessSwitchboard", "--export-full-bundle"]) == false,
+              "重载安全：别的 flag 不得被误判成 job 内")
+
+        // 2. 间隔相等就不重载（少折腾 launchd）
+        check(planner.needsReload(liveIntervalSeconds: 60, desiredSeconds: 60) == false,
+              "重载安全：间隔已相等 → 不重载")
+        check(planner.needsReload(liveIntervalSeconds: 20, desiredSeconds: 60),
+              "重载安全：间隔不一致 → 需要重载")
+        check(planner.needsReload(liveIntervalSeconds: nil, desiredSeconds: 60),
+              "重载安全：读不到间隔 → 视为需要重载（宁可多写一次）")
+
+        // 3. 状态文案必须区分「plist 在」与「launchd 在跑」
+        let notInstalled = planner.statusText(
+            isInstalled: false, isLoaded: false, configuredMinutes: 1, liveIntervalSeconds: nil
+        )
+        check(notInstalled.contains("未安装"), "重载安全：无 plist → 文案说未安装")
+
+        // 本次事故的核心断言：文件在、job 不在，绝不能报成「已安装」了事。
+        let installedNotLoaded = planner.statusText(
+            isInstalled: true, isLoaded: false, configuredMinutes: 1, liveIntervalSeconds: 60
+        )
+        check(installedNotLoaded.contains("未在运行"),
+              "重载安全：plist 在但 launchd 无任务 → 必须明说「未在运行」（v2.6.1 这里说了谎）")
+        check(!installedNotLoaded.contains("运行中 ·"),
+              "重载安全：未运行状态下不得出现「运行中 ·」")
+
+        let running = planner.statusText(
+            isInstalled: true, isLoaded: true, configuredMinutes: 5, liveIntervalSeconds: 300
+        )
+        check(running.contains("运行中") && running.contains("5 分钟"),
+              "重载安全：正常态文案要给出巡检间隔")
+        let accelerated = planner.statusText(
+            isInstalled: true, isLoaded: true, configuredMinutes: 5, liveIntervalSeconds: 20
+        )
+        check(accelerated.contains("20 秒"), "重载安全：实际间隔小于配置值时要说明当前实际间隔")
+
+        // 4. 源码级护栏：守护路径不得再出现「自己 bootout」的调用
+        let daemonSrc = (try? String(
+            contentsOfFile: "Sources/TypelessSwitchboard/Store/SwitchboardStore+AutomaticReplacement.swift",
+            encoding: .utf8
+        )) ?? ""
+        check(!daemonSrc.isEmpty, "重载安全：能读到 daemon 源码（路径变了要同步改这里）")
+        check(!daemonSrc.contains("reconcileIntervalSecondsIfNeeded"),
+              "重载安全：daemon 路径不得再调 reconcileIntervalSecondsIfNeeded（会 bootout 掉自己）")
+
+        let agentSrc = (try? String(
+            contentsOfFile: "Sources/TypelessSwitchboard/App/QuotaGuardLaunchAgent.swift",
+            encoding: .utf8
+        )) ?? ""
+        check(agentSrc.contains("runsInsideManagedJob"),
+              "重载安全：QuotaGuardLaunchAgent 必须对「job 内调用」设防")
+        check(agentSrc.contains("static var isLoaded"),
+              "重载安全：必须有基于 launchctl 的 isLoaded（只看 plist 文件会重演静默失效）")
+        check(agentSrc.contains("reloadVerified"),
+              "重载安全：重载必须走校验式路径")
     }
 }

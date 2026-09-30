@@ -40,6 +40,10 @@ const TYPELESS_APP = '/Applications/Typeless.app';
 
 const REFRESH_TIMEOUT_MS = 90000;
 const POLL_INTERVAL_MS = 2000;
+// 桌面端可能连续重写多次：先换 token；若发现换不动（refresh_token 也废了），
+// 它会再把文件清空并退回登录页。首次检测到 mtime 变化后必须静置这么久，
+// 否则会把「清空前的中间态」当成复活成功。
+const SETTLE_AFTER_REFRESH_MS = 8000;
 
 // ────────────────────────────── 基础工具 ──────────────────────────────
 
@@ -159,22 +163,47 @@ async function reviveOne(account, index, total, backupDir) {
   const deadline = Date.now() + REFRESH_TIMEOUT_MS;
   while (Date.now() < deadline) {
     await sleep(POLL_INTERVAL_MS);
-    if (fs.statSync(UD).mtimeMs !== beforeMtime) { refreshed = true; break; }
+    let mt = beforeMtime;
+    try { mt = fs.statSync(UD).mtimeMs; } catch (_) { mt = -1; }  // 文件没了 = 桌面端清空了会话
+    if (mt !== beforeMtime) { refreshed = true; break; }
   }
   if (!refreshed) {
     log(`  ✗ ${REFRESH_TIMEOUT_MS / 1000} 秒内桌面端未刷新会话`);
     return { ok: false, reason: '桌面端未刷新' };
   }
 
-  // 3. 读回新会话
-  await sleep(1000);
+  // 3. 静置后读回新会话。
+  //    ⚠️ mtime 变化 ≠ 复活成功。实测（2026-09-29）：
+  //    access_token 过期太久（如 66 天）的账号，桌面端同样会
+  //    +2.6s 重写文件，但随后发现自己也换不动 token，
+  //    就把会话清空退回登录页。只看 mtime 会把这个过程误判成成功，
+  //    所以下面每一步都必须验到底。
+  await sleep(SETTLE_AFTER_REFRESH_MS);
   const revived = readActiveSession();
   if (!revived) {
-    log('  ✗ 新会话读取/解密失败');
-    return { ok: false, reason: '新会话解密失败' };
+    log('  ✗ 桌面端重写了文件，但会话已不可读（已退回登录态）');
+    return { ok: false, reason: '桌面端退回登录态' };
   }
-  const newExp = decodeJwtPayload(revived.credentials.access_token);
-  log(`  ✓ 桌面端已换发新 token，过期于 ${newExp && newExp.exp ? new Date(newExp.exp * 1000).toISOString() : '未知'}`);
+
+  const oldToken = String(creds.access_token || '');
+  const newToken = String(revived.credentials.access_token || '');
+  const newExp = decodeJwtPayload(newToken);
+  const oldUid = String(creds.user_id || '');
+  const newUid = String(revived.credentials.user_id || '');
+
+  if (!newToken || newToken === oldToken) {
+    log('  ✗ 桌面端重写了文件，但 access_token 没换新（刷新失败）');
+    return { ok: false, reason: '桌面端未换发新 token' };
+  }
+  if (oldUid && newUid && oldUid !== newUid) {
+    log(`  ✗ 换回的会话属于另一个账号（${oldUid} → ${newUid}），已中止写回`);
+    return { ok: false, reason: '换回的会话账号不匹配' };
+  }
+  if (!newExp || !newExp.exp || newExp.exp * 1000 <= Date.now()) {
+    log('  ✗ 换回的新 token 仍然是过期的');
+    return { ok: false, reason: '新 token 仍过期' };
+  }
+  log(`  ✓ 桌面端已换发新 token，过期于 ${new Date(newExp.exp * 1000).toISOString()}`);
 
   // 4. 拿新 token 打官方接口验证（这一步才是真的「能用」）
   const usage = await engine.callUsageStats(revived.credentials);

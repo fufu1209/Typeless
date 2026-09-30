@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.2-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -64,6 +64,12 @@ open /Applications/TypelessSwitchboard.app
 #    完整教程（买域名 → DNS → 部署邮箱 API）见 docs/DEPLOYMENT.md
 ```
 
+> 💡 **建议先跑一次 `./scripts/create-signing-identity.sh`**（一次性，之后自动生效）。
+> 本工具默认用 ad-hoc 签名，而 ad-hoc 的签名指纹**每次构建都变**；macOS 钥匙串条目的
+> 授权记录的恰恰是「创建它的那个 app 的签名指纹」。于是每次重装 app 都会弹一次
+> 「想要使用你储存在钥匙串中的机密信息」，不点它 GUI 窗口不会出来、开机守护也会卡住。
+> 换成一把固定的自签名证书后就不再重复要授权，也顺带杜绝了「安装窗口期签名校验失败」。
+
 只有第 3 步需要额外配置。**如果你已经有一批 Typeless 账号，前两步就够用了** ——
 手动把账号加进池子，工具就能自动轮换。
 
@@ -92,7 +98,7 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.6.1**（2026-09-29）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.6.2**（2026-09-29）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 最近的主要变化：**会话复活**（Token 过期的账号一键恢复可用，不必重新注册）、
 适配 **Typeless 2.7.0 / 2.8.0** 的新签名协议（密钥自动从 App 提取，跨版本不再硬编码）、
@@ -213,7 +219,7 @@ open /Applications/TypelessSwitchboard.app
 | 脚本 | 用途 | 是否写数据 |
 | --- | --- | --- |
 | `scripts/audit-account-pool.js` | 逐账号问官方「本周还剩多少字」，给出 verdict（`usable` / `exhausted` / `token-expired` / `dead` / `no-session` / `device-limit` …） | **只读** |
-| `scripts/revive-account-sessions.js` | 让静默会话过期的账号重新可用（借官方桌面端自己的刷新能力，外部进程刷不动） | 写会话与账号池 |
+| `scripts/revive-account-sessions.js` | 让静默会话过期的账号重新可用（借官方桌面端自己的刷新能力，外部进程刷不动）。**「换发成功」要过四关**：会话仍可解密 → token 确实换了新的 → `user_id` 与目标账号一致 → 新 token 未过期；最后仍以官方接口返回 200 为准 | 写会话与账号池 |
 | `scripts/sync-account-quotas.js` | 把账号池里的 `monthlyLimit` / `usedCharacters` 刷成服务端真实值 | 写账号池 |
 | `scripts/verify-silent-switch.js` | 真机端到端验证「账号能不能正常更换」，逐个走一遍换号并记录耗时 | 写会话（结束会恢复原账号） |
 
@@ -229,9 +235,28 @@ node scripts/verify-silent-switch.js --limit 3
 ```
 
 > ⚠️ 跑真机换号验证（`verify-silent-switch.js`）前**必须先停掉自动轮换**，
-> 否则守护每 60 秒就会把你刚切上去的账号换走。做法是退出 App 并执行
-> `launchctl unload ~/Library/LaunchAgents/local.typeless.switchboard.quota-guard.plist`，
-> 验证完再装回来。
+> 否则守护每 60 秒就会把你刚切上去的账号换走：
+>
+> ```bash
+> launchctl bootout "gui/$(id -u)/local.typeless.switchboard.quota-guard"
+> # …跑验证…
+> launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.typeless.switchboard.quota-guard.plist
+> ```
+>
+> 忘了装回来也不要紧 —— 打开 App 时「额度守护」页会**自动检测并重新加载**。
+
+### 开机守护「不会静默死掉」的保证
+
+守护是一个 launchd 任务。历史上它会在「近阈值加速」时改写自己的 plist，再
+`launchctl bootout` 让改动生效 —— 但 **bootout 会把调用者所在的 job 一起停掉**，
+紧随其后的 `bootstrap` 永远执行不到。于是 plist 还在（界面据此报「已安装」），
+launchd 里却空无一物，额度守护静默失效 24 小时而无人察觉（2026-09-29 实测）。
+现在有三条硬规矩：
+
+1. 守护**从 job 内一律拒绝重载** —— 改巡检间隔只由 App 做；
+2. 任何重载都要 `launchctl print` **校验**通过才算成功，失败自动重试；
+3. 「额度守护」页把「已安装」与「运行中」分开看，未运行时显式告警，并在 App
+   启动时**自动自愈**（重新 `bootstrap` + 把巡检间隔校正回配置值）。
 
 ## 跨平台兼容
 

@@ -404,6 +404,7 @@ struct OperationalFeatureChecks {
         runQuotaGuardLaunchAgentPlannerChecks()
         runQuotaGuardReloadSafetyChecks()
         runReviveConcurrencyGuardChecks()
+        runQuotaPoolSummaryChecks()
 
         // MARK: - v2.5.2：阈值边界 + 钥匙串缓存回归
         runThresholdBoundaryChecks()
@@ -2536,6 +2537,59 @@ struct OperationalFeatureChecks {
     /// 把自己所在的 job 一起停掉 → 紧随的 bootstrap 永远执行不到 → plist 还在、
     /// launchd 里空无一物，界面照样报「已安装」，守护静默失效 24 小时。
     /// 这一组断言把「不许自噬」和「不许说谎」钉死。
+    /// 「可用账号 / 剩余额度」的口径（v2.6.4）。
+    ///
+    /// 原来是无条件全池求和，把「没有静默会话、换过去也用不了」的账号也算进去，
+    /// 实测界面 79,866 vs 真实可换 73,866（2026-09-30）。
+    /// 这条断言保证界面数字与选号口径不再分叉。
+    private static func runQuotaPoolSummaryChecks() {
+        // 空池
+        let empty = QuotaPoolSummary.make(from: [])
+        check(empty == QuotaPoolSummary.Result.empty, "额度汇总：空池必须全 0")
+
+        // 单项分桶
+        let cases: [(QuotaPoolEntry, Int, Int, Int, Int, String)] = [
+            (QuotaPoolEntry(remainingCharacters: 2000, hasSilentSessionPayload: true, isSelectable: true),
+             1, 2000, 0, 0, "带会话且可选 → 计入可用"),
+            (QuotaPoolEntry(remainingCharacters: 2000, hasSilentSessionPayload: false, isSelectable: true),
+             0, 0, 1, 2000, "无可选会话 → 计入「未计入」而非可用"),
+            (QuotaPoolEntry(remainingCharacters: 23333, hasSilentSessionPayload: true, isSelectable: false),
+             0, 0, 0, 0, "暂停/待确认 → 两边都不计（是用户没让它上，不是换不过去）"),
+            (QuotaPoolEntry(remainingCharacters: 0, hasSilentSessionPayload: true, isSelectable: true),
+             0, 0, 0, 0, "额度为 0 → 两边都不计"),
+            (QuotaPoolEntry(remainingCharacters: 0, hasSilentSessionPayload: false, isSelectable: true),
+             0, 0, 0, 0, "无会话且额度为 0 → 不该出现在「未计入」里制造噪音"),
+        ]
+        for (entry, count, remaining, missCount, missRemaining, message) in cases {
+            let r = QuotaPoolSummary.make(from: [entry])
+            check(r.switchableCount == count && r.switchableRemaining == remaining
+                  && r.sessionlessCount == missCount && r.sessionlessRemaining == missRemaining,
+                  "额度汇总：\(message)")
+        }
+
+        // 真实场景：16 个带会话 + 2 个无会话 + 1 个暂停（额度大）+ 1 个用完
+        var real: [QuotaPoolEntry] = []
+        for _ in 0..<16 {
+            real.append(QuotaPoolEntry(remainingCharacters: 2000, hasSilentSessionPayload: true, isSelectable: true))
+        }
+        for _ in 0..<2 {
+            real.append(QuotaPoolEntry(remainingCharacters: 2000, hasSilentSessionPayload: false, isSelectable: true))
+        }
+        real.append(QuotaPoolEntry(remainingCharacters: 23333, hasSilentSessionPayload: true, isSelectable: false))
+        real.append(QuotaPoolEntry(remainingCharacters: 0, hasSilentSessionPayload: true, isSelectable: true))
+        let realResult = QuotaPoolSummary.make(from: real)
+        check(realResult.switchableCount == 16, "额度汇总：真实场景可用账号应为 16（当前 \(realResult.switchableCount)）")
+        check(realResult.switchableRemaining == 32000, "额度汇总：真实场景可用额度应为 32000（当前 \(realResult.switchableRemaining)）")
+        check(realResult.sessionlessCount == 2 && realResult.sessionlessRemaining == 4000,
+              "额度汇总：无会话的 2 个账号要单独列出，供界面解释差额")
+
+        // 不变量：两部分之和 = 所有「可选且有余量」账号的额度之和（一分不多一分不少）
+        let expected = real.filter { $0.isSelectable && $0.remainingCharacters > 0 }
+            .reduce(0) { $0 + $1.remainingCharacters }
+        check(realResult.switchableRemaining + realResult.sessionlessRemaining == expected,
+              "额度汇总：可用 + 未计入 必须恰好等于「可选且有余量」的总额")
+    }
+
     /// 会话复活的并发写者防护（v2.6.3）。
     ///
     /// 背景：`store.json` 是**整份覆写**，GUI 与额度守护各持一份内存 `state`，

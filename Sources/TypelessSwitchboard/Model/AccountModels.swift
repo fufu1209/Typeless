@@ -129,6 +129,13 @@ struct Account: Identifiable, Codable, Equatable, Sendable {
         (status == .available || status == .nearlySpent) && (reviewState ?? .approved) == .approved
     }
 
+    /// 是否带静默会话 —— 换号时要把它写进 Typeless 的 `user-data.json`，
+    /// 官方桌面端据此换发新 token。没有它就只能重新注册/登录，
+    /// 所以它的额度**换不过去**，不该算进「剩余额度」（见 `QuotaPoolSummary`）。
+    var hasSwitchableSession: Bool {
+        !(rawUserDataPayload ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     var effectiveReviewState: ReviewState {
         reviewState ?? .approved
     }

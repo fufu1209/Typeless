@@ -1,6 +1,54 @@
 # 更新记录
 
-当前版本 **v2.6.3**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.6.4**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.6.4（2026-09-30）
+
+一个把界面数字对齐到真实能力的修复版。
+
+### 修复
+
+- **「可用账号 / 剩余额度」把「换不过去」的账号也算进去了**。
+  原实现是无条件全池求和：
+
+  ```swift
+  private var totalRemaining: Int {
+      store.state.accounts.reduce(0) { $0 + $1.remainingCharacters }
+  }
+  ```
+
+  但选号逻辑（`QuotaCycleEngine` 的「静默就绪」池）要求账号**带静默会话**
+  （`rawUserDataPayload` 非空）才会被选中 —— 没有它的账号只能重新注册/登录，
+  额度**根本换不过去**。实测（2026-09-30）：界面报 **79,866**，
+  真实能换过去的只有 **73,866**，多算了 2 个无会话账号的 **4,000 字**。
+
+  这类偏差的危险不在于数字大小，而在于它**恰好落在「还能用多久」的判断上**：
+  用户看到还有余量，实际可能已经换不动了。
+
+  现在新增 `QuotaPoolSummary`（Core，纯函数），口径与选号逻辑**对齐**，
+  并单独统计被排除的部分，界面上多一行说明：
+
+  > ⚠️ 另有 2 个账号无静默会话（4,000 字未计入）
+
+  配套测试 `runQuotaPoolSummaryChecks()` 覆盖单项分桶、真实场景，
+  以及不变量「可用 + 未计入 = 所有可选且有余量账号的额度之和」（一分不多一分不少）。
+  顺带给两个数字都加了 `.help()` 说明口径。
+
+### 说明
+
+- **`token-expired` 不等于换不过去**。access_token 只有 24 小时，账号池存的是
+  「抓取那一刻」的快照，隔天必然过期；但换号时是把 `rawUserDataPayload` 写进
+  Typeless 的 `user-data.json`，由**官方桌面端自己用 `refresh_token` 换发新 token**。
+  所以只要 `refresh_token` 还活着（本机实测普遍剩 280–363 天），账号就能正常换过去。
+  真正换不过去的只有两类：**没有会话缓存**（`no-session`）和
+  **`refresh_token` 也死了**（如 `prime.draft.457706`，已废 68 天）。
+- ⚠️ 后者（`refresh_token` 已死）**目前仍会被算进「剩余额度」** —— 它带着 payload，
+  仅凭 payload 非空判断不出来，需要在 Swift 侧解析 JWT 的 `exp` 才能识别。
+  暂未实现：会话解析逻辑的唯一来源是 App 包内的 `extract-active-session.js`，
+  在 Swift 里再写一份会造成第二份真相。当前以 `scripts/audit-account-pool.js`
+  的体检结果为准。
 
 ---
 

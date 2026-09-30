@@ -9,12 +9,17 @@ import TypelessSwitchboardCore
 struct QuotaSummaryView: View {
     @EnvironmentObject private var store: SwitchboardStore
 
-    private var totalRemaining: Int {
-        store.state.accounts.reduce(0) { $0 + $1.remainingCharacters }
-    }
-
-    private var availableCount: Int {
-        store.state.accounts.filter { $0.isUsable && $0.remainingCharacters > 0 }.count
+    /// 账号池汇总。口径与选号逻辑对齐（见 `QuotaPoolSummary`）：
+    /// 只有「带静默会话、已确认未暂停、还有额度」的账号才算数 ——
+    /// 界面上的数字必须等于工具真会做的事。
+    private var poolSummary: QuotaPoolSummary.Result {
+        QuotaPoolSummary.make(from: store.state.accounts.map {
+            QuotaPoolEntry(
+                remainingCharacters: $0.remainingCharacters,
+                hasSilentSessionPayload: $0.hasSwitchableSession,
+                isSelectable: $0.isUsable
+            )
+        })
     }
 
     private var pendingCount: Int {
@@ -42,14 +47,29 @@ struct QuotaSummaryView: View {
             HStack {
                 Label("可用账号", systemImage: "person.crop.circle.badge.checkmark")
                 Spacer()
-                Text("\(availableCount)")
+                Text("\(poolSummary.switchableCount)")
                     .font(.title3.weight(.semibold))
             }
+            .help("带静默会话、已确认未暂停、且还有额度的账号 —— 也就是真能换过去用的那些")
+
             HStack {
                 Label("剩余额度", systemImage: "textformat.size")
                 Spacer()
-                Text("\(totalRemaining)")
+                Text("\(poolSummary.switchableRemaining)")
                     .font(.title3.weight(.semibold))
+            }
+            .help("只统计能换过去的账号。没有静默会话的账号换过去也用不了，其额度不计入")
+
+            if poolSummary.sessionlessCount > 0 {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .imageScale(.small)
+                    Text("另有 \(poolSummary.sessionlessCount) 个账号无静默会话（\(poolSummary.sessionlessRemaining) 字未计入）")
+                        .lineLimit(1)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("这些账号没有会话缓存，只能重新注册或登录后才能使用")
             }
             if let nextRefreshText {
                 HStack(spacing: 4) {

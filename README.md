@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.5-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -98,11 +98,13 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.6.2**（2026-09-29）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.6.5**（2026-09-30）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 最近的主要变化：**会话复活**（Token 过期的账号一键恢复可用，不必重新注册）、
-适配 **Typeless 2.7.0 / 2.8.0** 的新签名协议（密钥自动从 App 提取，跨版本不再硬编码）、
-额度口径改为**每周 2000 字**并重算换号阈值（默认 120）、周期口径改为**实测观测**（不再靠猜）。
+适配 **Typeless 2.8.1** 的新签名协议（密钥按形状从 App 现场提取，跨版本不再硬编码）、
+额度口径改为**每周 2000 字**并重算换号阈值（默认 120）、周期口径改为**实测观测**（不再靠猜）、
+界面「可用账号 / 剩余额度」口径与选号逻辑对齐（v2.6.4）、
+**GUI 落盘不再还原维护脚本的成果**（v2.6.5，见下方「账号池运维脚本」）。
 
 ## 这个工具能做什么
 
@@ -219,9 +221,9 @@ open /Applications/TypelessSwitchboard.app
 | 脚本 | 用途 | 是否写数据 |
 | --- | --- | --- |
 | `scripts/audit-account-pool.js` | 逐账号问官方「本周还剩多少字」，给出 verdict（`usable` / `exhausted` / `token-expired` / `dead` / `no-session` / `device-limit` …） | **只读** |
-| `scripts/revive-account-sessions.js` | 让静默会话过期的账号重新可用（借官方桌面端自己的刷新能力，外部进程刷不动）。**「换发成功」要过四关**：会话仍可解密 → token 确实换了新的 → `user_id` 与目标账号一致 → 新 token 未过期；最后仍以官方接口返回 200 为准。⚠️ **开工前必须退出 GUI 并停掉额度守护**（脚本会自动检查并拒绝开工）——`store.json` 是整份覆写，两个进程各持一份内存副本，脚本写回的复活结果会被静默还原；收尾还会回读账号池**校验落盘真的还在** | 写会话与账号池 |
+| `scripts/revive-account-sessions.js` | 让静默会话过期的账号重新可用（借官方桌面端自己的刷新能力，外部进程刷不动）。**「换发成功」要过四关**：会话仍可解密 → token 确实换了新的 → `user_id` 与目标账号一致 → 新 token 未过期；最后仍以官方接口返回 200 为准。开工前会**自检并发写者并拒绝开工**，收尾还会回读账号池**校验落盘真的还在** | 写会话与账号池 |
 | `scripts/sync-account-quotas.js` | 把账号池里的 `monthlyLimit` / `usedCharacters` 刷成服务端真实值 | 写账号池 |
-| `scripts/verify-silent-switch.js` | 真机端到端验证「账号能不能正常更换」，逐个走一遍换号并记录耗时 | 写会话（结束会恢复原账号） |
+| `scripts/verify-silent-switch.js` | 真机端到端验证「账号能不能正常更换」，逐个走一遍换号并记录耗时。开工前同样会**自检并发写者并拒绝开工**（v2.6.5 起）—— 不这么做会出**假失败**：GUI 会把「剩余低于阈值」的号换走 | 写会话（结束会恢复原账号） |
 
 ```bash
 # 只读体检
@@ -235,15 +237,23 @@ node scripts/verify-silent-switch.js --limit 3
 ```
 
 > ⚠️ 跑真机换号验证（`verify-silent-switch.js`）前**必须先停掉自动轮换**，
-> 否则守护每 60 秒就会把你刚切上去的账号换走：
+> 否则 GUI / 守护会把你刚切上去的账号换走。v2.6.5 起脚本会**自检并拒绝开工**，
+> 并打印要执行的命令 —— 照它说的做即可：
 >
 > ```bash
+> osascript -e 'tell application "TypelessSwitchboard" to quit'
 > launchctl bootout "gui/$(id -u)/local.typeless.switchboard.quota-guard"
 > # …跑验证…
 > launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.typeless.switchboard.quota-guard.plist
 > ```
 >
 > 忘了装回来也不要紧 —— 打开 App 时「额度守护」页会**自动检测并重新加载**。
+>
+> **v2.6.5 之前**这只是一条「运维纪律」：`store.json` 是整份覆写，GUI 任意一次落盘
+> 都会把脚本写回的结果**静默还原**（脚本那侧却报「已写回」、接口当场也 200）。
+> 现在 `save()` 落盘前会先采纳外部改动（`AccountExternalFieldMerge`，Core 纯函数），
+> 纪律降级为「跨版本升级、或手工改其它字段时仍需遵守」。改动留痕在
+> `Logs/external-merge.log`。
 
 ### 开机守护「不会静默死掉」的保证
 

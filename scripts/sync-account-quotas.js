@@ -102,7 +102,9 @@ async function main() {
       if (changed) {
         acc.monthlyLimit = r.monthlyLimit;
         acc.usedCharacters = r.usedCharacters;
-        acc.lastSyncedAt = new Date().toISOString();
+        // v2.6.6：删掉了 `acc.lastSyncedAt = ...`。`Account` 模型里没有这个字段，
+        // 写进去会被 GUI 解码忽略、落盘抹掉 —— 是幽灵字段（每账号的同步时刻
+        // 由状态级的 `store.lastQuotaSyncAt` 统一表达，那个字段现在真的持久化了）。
       }
       changes.push({
         email: acc.email, ok: true, changed,
@@ -143,6 +145,9 @@ async function main() {
   fs.mkdirSync(backupDir, { recursive: true });
   fs.copyFileSync(STORE, path.join(backupDir, `store.json.${stamp}.bak`));
 
+  // v2.6.6：这个键以前写进去会被静默丢弃 —— `PersistedState` 里没有它，
+  // GUI 解码时忽略、下一次落盘又抹掉，界面因此永远显示「—」。
+  // 现在它是真的持久化字段了，且 GUI 落盘时会与内存值取较新者（谁晚谁准）。
   store.lastQuotaSyncAt = new Date().toISOString();
   fs.writeFileSync(STORE, JSON.stringify(store, null, 2));
   console.log(`\n✓ 已写回账号池（备份在 ${backupDir}）`);

@@ -324,7 +324,9 @@ async function main() {
           fresh.accounts[idx].rawUserDataPayload = r.raw;
           fresh.accounts[idx].usedCharacters = r.used;
           fresh.accounts[idx].monthlyLimit = r.limit;
-          fresh.accounts[idx].lastSyncedAt = new Date().toISOString();
+          // v2.6.6：这里曾写 `lastSyncedAt`，但 `Account` 模型里没有这个字段、
+          // 也没有任何一方读它 —— 写进去只会被 GUI 解码时忽略、落盘时抹掉。
+          // 幽灵字段一律不再写（见 Tests 里的字段契约守卫）。
           fs.writeFileSync(STORE, JSON.stringify(fresh, null, 2));
           entry.writtenPayload = r.raw;
           log('  ✓ 已写回账号池');

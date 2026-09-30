@@ -29,14 +29,22 @@
 //   --full（真实换号）  额外重置设备身份（keychain / device.cache / Cookies / Local Storage …），
 //                       等价于 App 内硬编码的 resetDeviceIdentity: true 路径。
 //
+// ⚠️ 默认（light）模式**保留设备身份**，而服务端对「同一台设备登录过多少个用户」有上限。
+//    2026-09-30 实测：三轮 light 批量验证（3 + 18 + 18 = 39 个账号）把本机设备身份挂爆，
+//    Typeless 桌面端随即弹「The number of users logged into this device has exceeded the
+//    limit.」—— 额度链路一切正常，只有桌面端登录被拒，排查时极具迷惑性。
+//    App 自己的静默换号不受影响：它传 resetDeviceIdentity: true，每换一次就是一台新设备。
+//    所以本脚本**拒绝 light 模式批量**：light 单次最多 LIGHT_MODE_MAX_ACCOUNTS 个账号，
+//    要批量必须走 --full（每个账号都重置设备身份，慢但安全）。
+//
 // **会重启 Typeless**：请在不用电脑时跑。脚本结束时会把你原来的活跃账号恢复回去。
 //
 // 用法：
 //   node scripts/verify-silent-switch.js --dry-run        # 只列出待验证账号
-//   node scripts/verify-silent-switch.js --limit 2        # 先拿 2 个试水
-//   node scripts/verify-silent-switch.js                  # 全量（静默注入路径）
+//   node scripts/verify-silent-switch.js --limit 2        # 静默注入，≤3 个才允许
 //   node scripts/verify-silent-switch.js --full --limit 1 # 完整换号路径（含设备重置）
-//   node scripts/verify-silent-switch.js --observe 40     # 加长观察窗口（慢启动机器）
+//   node scripts/verify-silent-switch.js --full           # 全量：必须走 full
+//   node scripts/verify-silent-switch.js --observe 40000  # 加长观察窗口，单位是**毫秒**
 //
 // 退出码：0 = 全部验证完毕（含个别失败）；1 = 前置条件不满足
 
@@ -52,6 +60,12 @@ const APP_SUPPORT = path.join(os.homedir(), 'Library/Application Support');
 const STORE = path.join(APP_SUPPORT, 'TypelessSwitchboard/store.json');
 const UD = path.join(APP_SUPPORT, 'Typeless/user-data.json');
 const DATA_DIR = path.join(APP_SUPPORT, 'Typeless');
+// v2.6.6：device.cache 的实际落点是 `now.typeless.desktop/`（与 App 侧
+// `typelessDeviceCacheDirectories()` 的候选列表对齐）。`Typeless/` 作为兼容候选保留。
+const DEVICE_CACHE_DIRS = [
+  path.join(APP_SUPPORT, 'now.typeless.desktop'),
+  path.join(APP_SUPPORT, 'Typeless'),
+];
 const TYPELESS_APP = '/Applications/Typeless.app';
 const TYPELESS_PROC = 'Typeless.app/Contents/MacOS/Typeless';
 
@@ -59,6 +73,9 @@ const TYPELESS_PROC = 'Typeless.app/Contents/MacOS/Typeless';
 const POLL_INTERVAL_MS = 1000;      // 对应 silentInjectPollIntervalSeconds
 const DEFAULT_OBSERVE_MS = 25000;   // 桌面端启动 + 读盘的观察窗口
 const MAX_OBSERVE_MS = 150000;      // --observe 上限
+// light 模式（保留设备身份）单次允许验证的账号数上限。见文件头「两种模式」的说明：
+// 同一个设备身份挂太多账号会触发服务端设备用户数上限，桌面端会直接弹错。
+const LIGHT_MODE_MAX_ACCOUNTS = 3;
 
 // 设备重置要清的 keychain 条目（见 Support/Constants.swift）
 const KEYCHAIN_ITEMS = [
@@ -79,7 +96,7 @@ function decodeJwtPayload(token) {
 }
 
 function parseArgs(argv) {
-  const out = { dryRun: false, full: false, limit: 0, email: '', keepLast: false, json: false, observe: DEFAULT_OBSERVE_MS, force: false };
+  const out = { dryRun: false, full: false, limit: 0, email: '', keepLast: false, json: false, observe: DEFAULT_OBSERVE_MS, observeRaw: 0, force: false, allowLightBatch: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--dry-run') out.dryRun = true;
@@ -89,7 +106,12 @@ function parseArgs(argv) {
     else if (a === '--keep-last') out.keepLast = true;
     else if (a === '--json') out.json = true;
     else if (a === '--force') out.force = true;
-    else if (a === '--observe') out.observe = Math.min(Math.max(Number(argv[++i]) || DEFAULT_OBSERVE_MS, 5000), MAX_OBSERVE_MS);
+    else if (a === '--allow-light-batch') out.allowLightBatch = true;
+    else if (a === '--observe') {
+      // 单位是**毫秒**。旧帮助文本写 `--observe 40`，会被钳到下限 5 秒，看不出问题。
+      out.observeRaw = Number(argv[++i]) || 0;
+      out.observe = Math.min(Math.max(out.observeRaw || DEFAULT_OBSERVE_MS, 5000), MAX_OBSERVE_MS);
+    }
   }
   return out;
 }
@@ -191,9 +213,26 @@ function resetDeviceIdentity() {
     if (r.status === 0) steps.push(`已删除 keychain 凭据 ${item.service}`);
   }
 
-  const deviceCache = path.join(DATA_DIR, 'device.cache');
-  if (fs.existsSync(deviceCache)) {
-    try { fs.unlinkSync(deviceCache); steps.push('已删除 device.cache'); } catch (e) { steps.push(`删 device.cache 失败：${e.message}`); }
+  // v2.6.6：device.cache 的真实位置是 `now.typeless.desktop/`，不是 `Typeless/`。
+  // 以前这里只查 `Typeless/device.cache` 一个路径，而该路径**从来不存在** ⇒
+  // existsSync 为 false ⇒ 静默跳过 ⇒「重置设备身份」看起来成功、实际漏掉最关键的一项，
+  // 桌面端重启后继续用旧 deviceId 登录，服务端照样按「同一设备挂了太多用户」拒绝
+  // （2026-09-30 实测：重置后桌面端仍弹 The number of users logged into this device
+  //   has exceeded the limit.）。现在遍历全部候选目录，一个都没删到时**显式告警**。
+  let deviceCacheRemoved = 0;
+  for (const dir of DEVICE_CACHE_DIRS) {
+    const deviceCache = path.join(dir, 'device.cache');
+    if (!fs.existsSync(deviceCache)) continue;
+    try {
+      fs.unlinkSync(deviceCache);
+      steps.push(`已删除 device.cache：${deviceCache}`);
+      deviceCacheRemoved += 1;
+    } catch (e) {
+      steps.push(`删 device.cache 失败：${deviceCache}：${e.message}`);
+    }
+  }
+  if (deviceCacheRemoved === 0) {
+    steps.push(`⚠️ 未找到任何 device.cache（已查：${DEVICE_CACHE_DIRS.join(' | ')}）—— 设备身份可能没有真正重置`);
   }
 
   if (fs.existsSync(UD)) {
@@ -361,6 +400,11 @@ async function main() {
   if (opts.email) candidates = candidates.filter((a) => String(a.email).includes(opts.email));
   if (opts.limit > 0) candidates = candidates.slice(0, opts.limit);
 
+  if (opts.observeRaw > 0 && opts.observeRaw < 5000) {
+    log(`⚠️ --observe 的单位是毫秒：${opts.observeRaw} 太小，已按下限 ${opts.observe} ms 执行`
+      + `（想加长请写 --observe 40000）`);
+  }
+
   log(`账号池共 ${accounts.length} 个，其中带静默会话 ${candidates.length} 个待验证`);
   log(`观察窗口 ${(opts.observe / 1000).toFixed(0)}s/账号 · 模式 ${opts.full ? '完整换号' : '静默注入'}`);
   if (!candidates.length) { log('没有可验证的账号。'); return; }
@@ -369,6 +413,25 @@ async function main() {
     log('\n--dry-run，仅列出待验证账号：');
     for (const a of candidates) log(`  · ${a.email}`);
     return;
+  }
+
+  // ── 设备身份护栏（v2.6.6）────────────────────────────────────────
+  // light 模式保留设备身份，批量跑就是在**同一个设备身份**上不断挂新 user。
+  // 2026-09-30 实测：3 + 18 + 18 = 39 个账号把本机设备身份挂爆，桌面端随即弹
+  // 「The number of users logged into this device has exceeded the limit.」。
+  // 这个失败形态很隐蔽：额度接口一切正常、守护看不到异常，只有桌面端登录被拒。
+  if (!opts.full && candidates.length > LIGHT_MODE_MAX_ACCOUNTS && !opts.allowLightBatch) {
+    log(`🔴 拒绝执行：light 模式（保留设备身份）一次最多验证 ${LIGHT_MODE_MAX_ACCOUNTS} 个账号，本次 ${candidates.length} 个。`);
+    log('');
+    log('   原因：light 模式不重置设备身份，批量跑会把本机设备身份挂满账号，触发 Typeless');
+    log('         服务端的「本设备登录用户数超限」——桌面端直接弹错，而额度接口仍一切正常，');
+    log('         守护侧完全看不到，排查时极具迷惑性。');
+    log('');
+    log('   要批量验证请改用完整换号路径（每个账号都重置设备身份，慢但安全）：');
+    log('     node scripts/verify-silent-switch.js --full');
+    log('');
+    log('   确实要强行跑 light 批量（会污染设备身份，之后需要重置设备）：加 --allow-light-batch');
+    process.exit(1);
   }
 
   // 换号验证必须在「没有别人同时动账号」的前提下跑，否则会得到假失败。

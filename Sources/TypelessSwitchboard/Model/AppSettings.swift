@@ -165,6 +165,18 @@ struct PersistedState: Codable, Equatable, Sendable {
     /// 用可选类型是为了让旧版 store.json 仍然能解码（缺字段 → nil）。
     var appliedMigrations: [String]?
 
+    /// 最近一次**成功拉到本周额度**的时间（与 `SwitchboardStore.lastQuotaSyncAt` 同源）。
+    ///
+    /// v2.6.6 新增，原因是一个「写进去就没了」的静默失效：
+    /// `scripts/sync-account-quotas.js` 一直在写 `store.lastQuotaSyncAt`，但
+    /// `SwitchboardStore.lastQuotaSyncAt` 当时只是个运行时 `@Published`，**不属于本结构**
+    /// ⇒ 那份 JSON 被解码时该键被直接忽略，GUI 下一次落盘又把它抹掉。
+    /// 结果：脚本记了同步时刻，界面照样显示「—」，重启后更是彻底丢失。
+    ///
+    /// 注意 `lastQuotaSyncFresh`（本次会话最近一次同步是否成功）**故意不持久化** ——
+    /// 重启后还没验证过新鲜度，落盘一个 `true` 就是谎报。
+    var lastQuotaSyncAt: Date?
+
     static let empty = PersistedState(
         accounts: [],
         settings: .defaults,
@@ -173,7 +185,8 @@ struct PersistedState: Codable, Equatable, Sendable {
         registrationPlans: [],
         deviceReport: nil,
         lastAutomationResult: nil,
-        appliedMigrations: []
+        appliedMigrations: [],
+        lastQuotaSyncAt: nil
     )
 }
 

@@ -17,11 +17,11 @@ import TypelessSwitchboardCore
 
 extension SwitchboardStore {
 
-    /// 落盘前采纳外部脚本对账号池的改动。
+    /// 落盘前采纳外部脚本对 store.json 的改动（账号池字段 + 额度同步时刻）。
     ///
     /// 没有外部写入时开销只是一次 `stat` —— 这一点很重要：`save()` 会被
     /// UI 的逐字符输入触发，不能在每次落盘前都读一遍 50 KB 的文件。
-    func adoptExternalAccountUpdatesIfNeeded() {
+    func adoptExternalStoreUpdatesIfNeeded() {
         guard let disk = readStoreFromDiskIfExternallyChanged() else { return }
 
         // ① 外部新注册进来的账号（基线里没有、内存里也没有）→ 追加。
@@ -55,14 +55,30 @@ extension SwitchboardStore {
             }
         }
 
-        guard adoptedCount > 0 else { return }
+        // ③ v2.6.6：状态级的「额度同步时刻」也采纳 —— **取较新者**。
+        //    脚本同步与 App 同步都是「同步事件」，谁晚谁准。不做这一步，
+        //    `sync-account-quotas.js` 刚写进去的时刻会被这次落盘用内存里的旧值盖掉 ——
+        //    与 v2.6.5 修的账号字段是同一类问题，只是发生在状态级字段上。
+        let adoptedClock = (disk.lastQuotaSyncAt ?? .distantPast) > (lastQuotaSyncAt ?? .distantPast)
+        if adoptedClock {
+            lastQuotaSyncAt = disk.lastQuotaSyncAt
+        }
+
+        guard adoptedCount > 0 || adoptedClock else { return }
         lastExternalAdoptionCount = adoptedCount
         lastExternalAdoptionAt = Date()
         // 留一条痕迹：这件事以前是完全静默的，排查时最缺的就是它。
+        var parts: [String] = []
+        if adoptedCount > 0 {
+            parts.append("\(adoptedCount) 个账号（含外部新增 \(addedIDs.count) 个）")
+        }
+        if adoptedClock {
+            parts.append("额度同步时刻")
+        }
         let dir = fileURL.deletingLastPathComponent().appendingPathComponent("Logs", isDirectory: true)
         LogFileRotator.append(
-            line: "[\(ISO8601DateFormatter().string(from: Date()))] 落盘前采纳外部改动：\(adoptedCount) 个账号"
-                + "（含外部新增 \(addedIDs.count) 个）—— 否则这次覆写会把它们抹掉",
+            line: "[\(ISO8601DateFormatter().string(from: Date()))] 落盘前采纳外部改动："
+                + parts.joined(separator: "、") + " —— 否则这次覆写会把它们抹掉",
             to: dir.appendingPathComponent("external-merge.log")
         )
     }

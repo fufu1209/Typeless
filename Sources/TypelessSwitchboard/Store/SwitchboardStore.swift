@@ -108,6 +108,12 @@ final class SwitchboardStore: ObservableObject {
         // 采晚了会把 GUI 自己的换号结果当成基线，磁盘上的旧 payload 反而被判定为
         // 「外部更新」而采纳回来 —— 换号被静默回退。
         baselineAccounts = state.accounts
+        // v2.6.6：把上次会话 / 维护脚本记下的「额度同步时刻」读回运行时属性。
+        // 这个键以前不在 `PersistedState` 里 —— `sync-account-quotas.js` 写了它，
+        // 解码时被忽略、落盘时被抹掉，于是界面永远显示「—」。
+        // 注意 `lastQuotaSyncFresh` **不恢复**：它是「本次会话最近一次同步是否成功」，
+        // 重启后还没验证过，直接当成新鲜就是谎报（见 `weeklyQuotaSummaryLine`）。
+        lastQuotaSyncAt = state.lastQuotaSyncAt
         // v2.5.5：周期时区必须在**所有运行模式**下生效，不能只挂在 GUI 的 AppDelegate 上。
         // LaunchAgent 守护（--daemon-check）是独立进程，它也要按同一个时区算周界，
         // 否则会出现「App 里显示该复活了，插件巡检却认为还没到点」。

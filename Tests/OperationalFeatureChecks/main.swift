@@ -407,6 +407,12 @@ struct OperationalFeatureChecks {
         runQuotaPoolSummaryChecks()
         runAccountExternalFieldMergeChecks()
 
+        // MARK: - v2.6.6：脚本写入的字段必须在 Swift 模型里真实存在（幽灵字段守卫）
+        runPersistedFieldContractChecks()
+
+        // MARK: - v2.6.6：换号验证不许批量污染设备身份（设备身份护栏）
+        runDeviceIdentityGuardChecks()
+
         // MARK: - v2.5.2：阈值边界 + 钥匙串缓存回归
         runThresholdBoundaryChecks()
         runKeychainCacheBehaviorChecks()
@@ -2699,6 +2705,197 @@ struct OperationalFeatureChecks {
               "复活防护：换号验证必须同样拒绝在 GUI / 守护运行时开工")
         check(verifySrc.contains("out.force = true"),
               "复活防护：换号验证也要有 --force 才允许越过")
+    }
+
+    // MARK: - v2.6.6：脚本写入的字段必须在 Swift 模型里真实存在
+    //
+    // 起因：`scripts/sync-account-quotas.js` 与 `scripts/revive-account-sessions.js`
+    // 一直在写 `lastSyncedAt`，但 `Account` 里没有这个字段、也没有任何一方读它
+    // ⇒ 被 GUI 解码时直接忽略、下一次落盘又把它抹掉。脚本打印「✓ 已写回账号池」，
+    // 文件里实际什么都没留下 —— 又一类**静默假成功**。
+    // （同类问题还有状态级的 `store.lastQuotaSyncAt`：脚本一直写，但以前
+    //  `PersistedState` 里没这个键 ⇒ 界面永远显示「—」。v2.6.6 已让它真正持久化。）
+    //
+    // 这组断言把契约钉死：脚本可以写模型里**存在**的字段，不许写幽灵字段。
+    // 将来加字段若忘了同步 Swift 模型，这里会直接红，而不是等线上发现「写了等于没写」。
+
+    private static func runPersistedFieldContractChecks() {
+        let accountPath = "Sources/TypelessSwitchboard/Model/AccountModels.swift"
+        let accountSrc = (try? String(contentsOfFile: accountPath, encoding: .utf8)) ?? ""
+        check(!accountSrc.isEmpty, "字段契约：能读到 Account 模型源码（路径变了要同步改这里）")
+
+        let statePath = "Sources/TypelessSwitchboard/Model/AppSettings.swift"
+        let stateSrc = (try? String(contentsOfFile: statePath, encoding: .utf8)) ?? ""
+        check(!stateSrc.isEmpty, "字段契约：能读到 PersistedState 源码（路径变了要同步改这里）")
+
+        /// 抠出某个结构体体内的**存储属性**名。
+        ///
+        /// 只认 `var 名字: 类型` 且类型段不含 `{` 的形态 —— 这样计算属性
+        /// （`var remainingCharacters: Int { ... }`）会被排除，不会被误当成可写字段。
+        /// 结构体结束判据是行首的 `}`（嵌套类型的收尾一定是缩进的，不会误判）。
+        func storedPropertyNames(in source: String, after marker: String) -> Set<String> {
+            guard let start = source.range(of: marker) else { return [] }
+            let rest = source[start.upperBound...]
+            guard let end = rest.range(of: "\n}") else { return [] }
+            var names: Set<String> = []
+            for rawLine in rest[..<end.lowerBound].split(separator: "\n", omittingEmptySubsequences: false) {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                guard line.hasPrefix("var ") else { continue }
+                let tail = line.dropFirst(4)
+                let name = tail.prefix { $0.isLetter || $0.isNumber || $0 == "_" }
+                guard !name.isEmpty else { continue }
+                let typePart = tail.dropFirst(name.count)
+                guard !typePart.contains("{") else { continue }   // 计算属性，不可写
+                names.insert(String(name))
+            }
+            return names
+        }
+
+        let accountFields = storedPropertyNames(in: accountSrc, after: "struct Account: Identifiable")
+        check(accountFields.contains("usedCharacters") && accountFields.contains("monthlyLimit")
+                && accountFields.contains("rawUserDataPayload"),
+              "字段契约：Account 属性解析必须真的抓到东西（抓不到说明模型声明形态变了）")
+        check(!accountFields.contains("remainingCharacters"),
+              "字段契约：计算属性不得被当成可写字段")
+        check(!accountFields.contains("lastSyncedAt"),
+              "字段契约：lastSyncedAt 不是 Account 的字段（脚本曾单方面写它，纯幽灵）")
+
+        let stateFields = storedPropertyNames(in: stateSrc, after: "struct PersistedState")
+        check(stateFields.contains("accounts"),
+              "字段契约：PersistedState 属性解析必须真的抓到东西")
+        check(stateFields.contains("lastQuotaSyncAt"),
+              "字段契约：PersistedState 必须声明 lastQuotaSyncAt，否则 sync-account-quotas.js 写了也白写")
+
+        // 接收者 → 该接收者对应的 Swift 模型字段集合。
+        // 只列**会落盘**的接收者；JS 里的本地临时对象（entry / results / payload 等）
+        // 不参与核对，避免误报。
+        let receiverToModel: [String: Set<String>] = [
+            "acc": accountFields,
+            "account": accountFields,
+            "fresh.accounts[idx]": accountFields,
+            "fresh.accounts[i]": accountFields,
+            "store": stateFields,
+            "state": stateFields,
+        ]
+
+        let scriptPaths = [
+            "scripts/sync-account-quotas.js",
+            "scripts/revive-account-sessions.js",
+            "scripts/audit-account-pool.js",
+            "Sources/TypelessSwitchboard/Resources/extract-active-session.js",
+            "Sources/TypelessSwitchboard/Resources/write-active-session.js",
+        ]
+
+        var checkedAssignments = 0
+        for path in scriptPaths {
+            guard let scriptSrc = try? String(contentsOfFile: path, encoding: .utf8) else {
+                check(false, "字段契约：读不到脚本 \(path)（路径变了要同步改这里）")
+                continue
+            }
+            for (offset, rawLine) in scriptSrc.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("//") || line.hasPrefix("*") || line.hasPrefix("/*") { continue }
+                for (receiver, fields) in receiverToModel {
+                    let prefix = receiver + "."
+                    guard line.hasPrefix(prefix) else { continue }
+                    let tail = line.dropFirst(prefix.count)
+                    let name = tail.prefix { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "$" }
+                    guard !name.isEmpty else { continue }
+                    let after = tail.dropFirst(name.count).drop { $0 == " " || $0 == "\t" }
+                    // 必须是赋值：后面紧跟 `=`，且不是 `==` / `===`
+                    guard after.hasPrefix("="), !after.hasPrefix("==") else { continue }
+                    checkedAssignments += 1
+                    check(fields.contains(String(name)),
+                          "字段契约：\(path):\(offset + 1) 给 \(receiver).\(name) 赋值，"
+                              + "但 Swift 模型里没有这个字段 —— 会被解码忽略、落盘抹掉（幽灵字段）")
+                }
+            }
+        }
+        check(checkedAssignments >= 4,
+              "字段契约：至少应核到 4 处持久化字段赋值（实际 \(checkedAssignments)）—— "
+                  + "抓不到说明脚本写法变了、这组断言已经失效，必须修断言而不是放着")
+
+        // 幽灵字段必须真的消失（不是靠注释绕过 —— 上面已跳过注释行）
+        for path in scriptPaths {
+            guard let scriptSrc = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            let codeLines = scriptSrc.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.hasPrefix("//") && !$0.hasPrefix("*") && !$0.hasPrefix("/*") }
+            check(!codeLines.contains { $0.contains("lastSyncedAt") },
+                  "字段契约：\(path) 里不得再出现 lastSyncedAt（幽灵字段，v2.6.6 已删）")
+        }
+    }
+
+    // MARK: - v2.6.6：换号验证的「设备身份护栏」
+    //
+    // 起因：`verify-silent-switch.js` 默认的 light 模式**保留设备身份**（等价于
+    // `resetDeviceIdentity: false`），而服务端对「同一台设备登录过多少个用户」有上限。
+    // 2026-09-30 实测：三轮 light 批量（3 + 18 + 18 = 39 个账号）把本机设备身份挂爆，
+    // Typeless 桌面端随即弹「The number of users logged into this device has exceeded the
+    // limit.」—— 而额度接口一切正常、守护看不到任何异常，只有桌面端登录被拒，
+    // 排查时极具迷惑性（见 `2026-09-30.md` 续篇四）。
+    //
+    // 这组断言把护栏钉死：light 模式不许批量，要批量必须走 --full。
+
+    private static func runDeviceIdentityGuardChecks() {
+        let path = "scripts/verify-silent-switch.js"
+        let src = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        check(!src.isEmpty, "设备身份护栏：能读到换号验证脚本（路径变了要同步改这里）")
+
+        check(src.contains("LIGHT_MODE_MAX_ACCOUNTS"),
+              "设备身份护栏：必须有 light 模式的账号数上限常量")
+        check(src.contains("!opts.full && candidates.length > LIGHT_MODE_MAX_ACCOUNTS"),
+              "设备身份护栏：light 模式超过上限必须被拒（这是 2026-09-30 事故的直接成因）")
+        check(src.contains("allowLightBatch"),
+              "设备身份护栏：必须提供显式越权开关，而不是逼人去改代码")
+        check(src.contains("--full"),
+              "设备身份护栏：拒绝时要说清「改用 --full」这条正确路径")
+        check(src.contains("resetDeviceIdentity"),
+              "设备身份护栏：必须解释设备身份与 resetDeviceIdentity 的关系")
+        check(src.contains("超限"),
+              "设备身份护栏：必须点明「设备用户数超限」这个失败形态，否则后来者看不懂为什么要有它")
+
+        // 上限必须是个小数字：设成 18 就等于没设。只做量级校验 —— 具体数值可以调，
+        // 但不能调到失去护栏意义。
+        if let range = src.range(of: "const LIGHT_MODE_MAX_ACCOUNTS = ") {
+            let tail = src[range.upperBound...]
+            let digits = tail.prefix { $0.isNumber }
+            check(!digits.isEmpty, "设备身份护栏：上限常量必须是数字")
+            let value = Int(digits) ?? 0
+            check(value > 0 && value < 10,
+                  "设备身份护栏：上限应落在 1..9（实际 \(value)）—— 设得太大就失去护栏意义")
+        } else {
+            check(false, "设备身份护栏：上限必须写成 `const LIGHT_MODE_MAX_ACCOUNTS = N`")
+        }
+
+        // 顺序很重要：护栏必须在 --dry-run **之后**（dry-run 只读，不该被拦），
+        // 且在并发守卫**之前**（先拦掉最危险的操作形态）。
+        let dryRunIdx = src.range(of: "if (opts.dryRun) {")
+        let guardIdx = src.range(of: "LIGHT_MODE_MAX_ACCOUNTS && !opts.allowLightBatch")
+        let preflightIdx = src.range(of: "engine.preflightConcurrentWriterGuard")
+        check(dryRunIdx != nil && guardIdx != nil && preflightIdx != nil,
+              "设备身份护栏：三个顺序锚点都要能定位到（写法变了要同步改这里）")
+        if let d = dryRunIdx, let g = guardIdx, let p = preflightIdx {
+            check(d.lowerBound < g.lowerBound,
+                  "设备身份护栏：必须排在 --dry-run 之后 —— 只读操作不该被拦")
+            check(g.lowerBound < p.lowerBound,
+                  "设备身份护栏：必须排在并发守卫之前")
+        }
+
+        // v2.6.6 追加：设备重置必须**真的删到** device.cache。
+        // 2026-09-30 实测的第二个静默失效：脚本只查 `Typeless/device.cache` 一个路径，
+        // 而真实文件在 `now.typeless.desktop/device.cache` ⇒ existsSync 为 false ⇒ 静默跳过
+        // ⇒「重置设备身份」看起来成功（keychain 条目确实重建了）、实际 deviceId 没变，
+        // 桌面端重启后继续被服务端判「同一设备用户数超限」。
+        // 判据不是「有没有删成功」，而是「删的路径对不对」+「没删到时有没有喊」。
+        check(src.contains("DEVICE_CACHE_DIRS"),
+              "设备身份护栏：device.cache 必须按候选目录列表查找，不能只查一个路径")
+        check(src.contains("now.typeless.desktop"),
+              "设备身份护栏：候选列表必须包含真实落点 now.typeless.desktop")
+        check(src.contains("未找到任何 device.cache"),
+              "设备身份护栏：一个都没删到时必须显式告警，不许静默跳过")
+        check(!src.contains("path.join(DATA_DIR, 'device.cache')"),
+              "设备身份护栏：不得再退回只查 Typeless/device.cache —— 那个路径从来不存在")
     }
 
     private static func runQuotaGuardReloadSafetyChecks() {

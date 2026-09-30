@@ -261,7 +261,13 @@ extension SwitchboardStore {
             // v2.6.5：落盘前先采纳外部脚本对账号池的改动。
             // store.json 是整份覆写，GUI 常驻数小时拿着旧副本 —— 不做这一步，
             // 会话复活 / 额度同步的成果会被这次落盘整份还原（2026-09-30 实测）。
-            adoptExternalAccountUpdatesIfNeeded()
+            // v2.6.6：同一个入口现在还负责状态级的「额度同步时刻」。
+            adoptExternalStoreUpdatesIfNeeded()
+            // v2.6.6：把运行时的额度同步时刻写进持久化状态。
+            // 这个键 `sync-account-quotas.js` 一直在写，但以前 `PersistedState` 里没有它
+            // ⇒ 解码被忽略、落盘被抹掉，界面重启后永远显示「—」。
+            // 上面的采纳逻辑已保证「谁晚谁准」，这里只管把结果落下去。
+            state.lastQuotaSyncAt = lastQuotaSyncAt
             let data = try JSONEncoder.appEncoder.encode(state)
             if data != lastSavedStateData {
                 try data.write(to: fileURL, options: [.atomic])

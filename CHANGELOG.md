@@ -1,6 +1,63 @@
 # 更新记录
 
-当前版本 **v2.6.2**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.6.3**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.6.3（2026-09-30）
+
+这一版治的是**钥匙串授权框**，以及一类刚被发现的 shell 陷阱。
+
+### 修复
+
+- **每次重装都会弹钥匙串授权框，不点它 GUI 与守护就双双卡死**。
+  app 原先用 ad-hoc 签名（`codesign --force --deep --sign -`），签名指纹是
+  `cdhash`，**每次构建都不一样**；而钥匙串条目的授权记录里存的正是
+  「创建它的那个 app 的签名指纹」。于是每次重装，`SecItemCopyMatching` 都会
+  重新征求许可 —— 本机实测（2026-09-30）：装完 v2.6.2 后 GUI 前台无窗口、
+  守护进程在但日志一行不写，`sample` 显示两个进程都停在
+  `KeychainStore.readAPIKey()`，截图确认屏幕上正是那个授权框。
+  现在新增 `scripts/create-signing-identity.sh`，一次性创建一把固定的自签名
+  codeSigning 证书；`build-app.sh` 检测到它就用它签名，指定要求从
+  `cdhash H"…"` 变成 `identifier "…" and certificate leaf = H"…"`，**跨构建稳定**。
+  装完实测：守护 60 秒一轮正常写日志、`fresh=true`、GUI 正常出窗。
+  （换身份后**还会再弹一次** —— 旧条目记的是老的 ad-hoc 指纹。点「始终允许」即可。）
+
+- **`create-signing-identity.sh` 自己的两个坑**（都在编写过程中实测踩到并修掉）：
+  ① 不能用 PKCS#12 —— OpenSSL 3.x 默认 SHA-256 MAC + AES PBE 导出，超出 macOS
+  `security` 的解析能力，报 `MAC verification failed during PKCS12 import`；
+  加 `-macalg sha1` 也不够（本机 OpenSSL 3.6.4 实测仍失败）。改为**证书与私钥
+  分别以 PEM 导入**。
+  ② 检测身份不能用 `security find-identity -v` —— 自签名证书**不受系统信任**，
+  `-v` 只列「有效」身份，永远返回 0 个，会把已存在的身份误判成「没有」。
+  改用 `security find-certificate -c "<CN>"`（`build-app.sh` 里的检测同步改掉）。
+  另外导入时加 `-A` 即可免掉 `set-key-partition-list`，整个流程**无需输入任何密码**。
+
+- **三个 shell 脚本里的同一个陷阱：`$变量` 后面紧跟中文，变量名被吞掉**。
+  本机 bash 在 `LANG=C.UTF-8` 下会把紧跟其后的多字节字符当成变量名的一部分，
+  于是 `"$NAME」，无需重建"` 里的变量名变成 `NAME」`，在 `set -u` 下直接
+  `unbound variable` 中止脚本。修掉的三处：
+
+  | 文件 | 原写法 | 触发条件 |
+  |---|---|---|
+  | `scripts/create-signing-identity.sh` | `"…「$NAME」，…"` | 身份已存在时的幂等分支 |
+  | `scripts/build-app.sh` | `"…$SIGN_IDENTITY（…"` | **每次用稳定身份签名后**，会中止整个构建 |
+  | `scripts/install-quota-guard.sh` | `"未找到 $APP_BIN，…"` | App 未打包时的自动打包分支 |
+
+  统一改成 `"${NAME}」"` 这类带花括号的写法。仓库内已用正则全量扫过，无同类残留。
+
+- **会话复活会被 GUI 静默覆盖，脚本却照报成功**（第五类静默失效）。
+  `store.json` 是**整份覆写**：GUI 与额度守护 `--daemon-check` 是两个独立进程，
+  各持一份内存 `state`，`save()` 时整份落盘，**没有任何合并或写前重读**。
+  于是复活脚本刚写进去的新会话，撞上其中任何一个进程的一次落盘就被还原 ——
+  而脚本仍会打印「✓ 已写回账号池」，官方接口那一刻也真的验证通过，人却用不了。
+  实测（2026-09-30）：17 个账号复活后只剩 5 个还在，且活下来的恰好**每 3 个一个**
+  （#5/#8/#11/#14/#17），正是覆写周期的指纹；退出 GUI 后 `store.json` 的 mtime
+  连续 65 秒纹丝不动，确认它就是覆盖者。
+  现在 `scripts/revive-account-sessions.js` 补两道护栏：① **开工前检查并发写者**
+  （GUI 在跑 / 守护已加载就拒绝开工，并打印停止与恢复的确切命令；`--force` 可越过）；
+  ② **收尾回读账号池校验落盘**，逐账号比对写回内容是否还在，被覆盖就点名报出。
+  同一原因也解释了为什么「复活成功数」和「实际可用数」会对不上。
 
 ---
 

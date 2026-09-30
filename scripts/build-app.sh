@@ -108,9 +108,12 @@ if command -v codesign >/dev/null 2>&1; then
   # 换成固定证书后，指定要求变成「bundle id + 证书」，跨构建稳定，不再重复授权。
   # 一次性创建：./scripts/create-signing-identity.sh
   SIGN_IDENTITY="${TYPELESS_SIGN_IDENTITY:-TypelessSwitchboard Local}"
-  if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
-    codesign --force --deep --sign "$SIGN_IDENTITY" "$STAGE" >/dev/null
-    echo "已用稳定身份签名：$SIGN_IDENTITY（钥匙串不会重复要授权）"
+  SIGN_KEYCHAIN="${TYPELESS_SIGN_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
+  # 检测用 find-certificate 而不是 find-identity -v：自签名证书**不受系统信任**，
+  # `-v` 只列「有效」身份 ⇒ 会永远返回 0 个，把已有身份误判成「没有」。
+  if security find-certificate -c "$SIGN_IDENTITY" >/dev/null 2>&1; then
+    codesign --force --deep --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$STAGE" >/dev/null
+    echo "已用稳定身份签名：${SIGN_IDENTITY}（钥匙串不会重复要授权）"
   else
     codesign --force --deep --sign - "$STAGE" >/dev/null
     echo "WARN: 未找到代码签名身份，已退回 ad-hoc 签名 —— 每次重装 app 都会要求钥匙串授权。" >&2

@@ -17,9 +17,9 @@ import Foundation
 
 public enum AppVersion {
     /// 对外版本号（CFBundleShortVersionString）。
-    public static let short = "2.6.2"
+    public static let short = "2.6.3"
     /// 构建号（CFBundleVersion），每次打包递增。
-    public static let build = "12"
+    public static let build = "13"
 
     /// 完整版本串，例如 "2.5.6 (9)"。日志与配置包用这个。
     public static var full: String {

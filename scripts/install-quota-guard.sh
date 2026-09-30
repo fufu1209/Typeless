@@ -26,7 +26,7 @@ EOF
 
 ensure_app() {
   if [[ ! -x "$APP_BIN" ]]; then
-    echo "未找到 $APP_BIN，正在打包…"
+    echo "未找到 ${APP_BIN}，正在打包…"
     ./scripts/build-app.sh
   fi
   if [[ ! -x "$APP_BIN" ]]; then

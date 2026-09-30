@@ -16,12 +16,19 @@
 //
 // **会重启 Typeless**：请在不用电脑时跑。脚本结束时会把你原来的活跃账号恢复回去。
 //
+// 🔴 **跑之前必须退出 GUI 并停掉额度守护** —— 脚本会自动检查，不满足就拒绝开工。
+//    原因：store.json 是**整份覆写**（GUI 与守护各持一份内存 state，save() 时整份落盘，
+//    没有任何合并），谁后写谁赢。脚本写回的复活结果撞上它们的一次落盘就被静默还原，
+//    而脚本照报「已写回账号池」且官方接口验证通过 —— 2026-09-30 实测：
+//    17 个账号复活后只剩 5 个还在，且活下来的恰好每 3 个一个，正是覆写周期的指纹。
+//
 // 用法：
 //   node scripts/revive-account-sessions.js --dry-run          # 只看哪些账号能复活
 //   node scripts/revive-account-sessions.js --limit 1          # 先拿 1 个试水
 //   node scripts/revive-account-sessions.js                    # 全量复活
 //   node scripts/revive-account-sessions.js --email a@b.c      # 只复活指定账号
 //   node scripts/revive-account-sessions.js --keep-last        # 结束时不停留在原账号（留给下一个账号）
+//   node scripts/revive-account-sessions.js --force            # 明知有并发写者仍强行跑（会覆盖，慎用）
 //
 // 退出码：0 = 全部处理完毕（含个别失败）；1 = 前置条件不满足
 
@@ -58,7 +65,7 @@ function decodeJwtPayload(token) {
 }
 
 function parseArgs(argv) {
-  const out = { dryRun: false, limit: 0, email: '', keepLast: false, verbose: true };
+  const out = { dryRun: false, limit: 0, email: '', keepLast: false, verbose: true, force: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--dry-run') out.dryRun = true;
@@ -66,11 +73,78 @@ function parseArgs(argv) {
     else if (a === '--email') out.email = String(argv[++i] || '');
     else if (a === '--keep-last') out.keepLast = true;
     else if (a === '--quiet') out.verbose = false;
+    else if (a === '--force') out.force = true;
   }
   return out;
 }
 
 function log(...args) { console.log(...args); }
+
+// ─────────────────────── 并发写者防护（2026-09-30） ───────────────────────
+
+function runningGuiProcesses() {
+  const hit = spawnSync('/usr/bin/pgrep', ['-f', 'TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard'], { encoding: 'utf8' });
+  const pids = String(hit.stdout || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  // --daemon-check 是一次性进程（跑几秒就退），不算常驻写者；GUI 才算。
+  return pids.filter((pid) => {
+    const cmd = spawnSync('/bin/ps', ['-o', 'command=', '-p', pid], { encoding: 'utf8' });
+    return !String(cmd.stdout || '').includes('--daemon-check');
+  });
+}
+
+function isGuardLoaded() {
+  const label = `gui/${process.getuid()}/local.typeless.switchboard.quota-guard`;
+  return spawnSync('/bin/launchctl', ['print', label], { stdio: 'ignore' }).status === 0;
+}
+
+/// 开工前检查有没有别的进程会整份覆写账号池。
+function preflightWriterGuard(force) {
+  const gui = runningGuiProcesses();
+  const guard = isGuardLoaded();
+  if (!gui.length && !guard) return true;
+  if (force) {
+    log('⚠️ --force：检测到并发写者，仍继续 —— 复活结果可能被覆盖。');
+    return true;
+  }
+  log('🔴 检测到会整份覆写账号池的进程，已中止：');
+  if (gui.length) log(`   · Typeless Switchboard GUI 正在运行（pid ${gui.join(', ')}）`);
+  if (guard) log('   · 额度守护 LaunchAgent 已加载（每 60 秒跑一次 --daemon-check，也会落盘）');
+  log('');
+  log('  它们与本脚本各持一份 store.json 的内存副本，落盘时整份覆写：');
+  log('  脚本会照报「已写回账号池」，数据却被还原 —— 静默假成功。');
+  log('');
+  log('  先执行：');
+  log('    osascript -e \'tell application "TypelessSwitchboard" to quit\'');
+  log('    launchctl bootout "gui/$(id -u)/local.typeless.switchboard.quota-guard"');
+  log('  跑完再恢复（忘了也不要紧，打开 App 会自愈）：');
+  log('    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.typeless.switchboard.quota-guard.plist');
+  log('');
+  log('  确认无并发写者后重跑；确实要强行继续：加 --force。');
+  return false;
+}
+
+/// 收尾时回读账号池，确认写回真的还在。
+function verifyPersistence(results) {
+  const written = results.filter((r) => r.ok && r.writtenPayload);
+  if (!written.length) return true;
+  let store;
+  try { store = JSON.parse(fs.readFileSync(STORE, 'utf8')); }
+  catch (_) { log('\n⚠️ 落盘校验：账号池读不回来，无法确认写回是否还在。'); return false; }
+  const byEmail = new Map((store.accounts || []).map((a) => [String(a.email), a]));
+  const lost = written.filter((r) => {
+    const a = byEmail.get(String(r.email));
+    return !a || String(a.rawUserDataPayload || '') !== String(r.writtenPayload);
+  });
+  if (!lost.length) {
+    log(`\n✓ 落盘校验通过：${written.length} 个账号的会话都还在账号池里。`);
+    return true;
+  }
+  log(`\n🔴 落盘校验失败：${lost.length} / ${written.length} 个账号的会话已被别的进程覆盖。`);
+  for (const r of lost) log(`     · ${r.email}`);
+  log('    成因：GUI 与额度守护各持一份整份 state，落盘时整份覆写，没有合并。');
+  log('    处置：退出 GUI、停掉守护后重跑（本脚本开工会自动检查）。');
+  return false;
+}
 
 // ─────────────────────────── Typeless 进程控制 ───────────────────────────
 
@@ -257,6 +331,8 @@ async function main() {
     return;
   }
 
+  if (!preflightWriterGuard(args.force === true)) process.exit(1);
+
   // 备份
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupDir = path.join(APP_SUPPORT, 'TypelessSwitchboard/Logs/revive-backups', stamp);
@@ -272,7 +348,8 @@ async function main() {
     const account = candidates[i];
     try {
       const r = await reviveOne(account, i + 1, candidates.length, backupDir);
-      results.push({ email: account.email, ...r });
+      const entry = { email: account.email, ...r };
+      results.push(entry);
       if (r.ok) {
         // 写回账号池
         const fresh = JSON.parse(fs.readFileSync(STORE, 'utf8'));
@@ -283,6 +360,7 @@ async function main() {
           fresh.accounts[idx].monthlyLimit = r.limit;
           fresh.accounts[idx].lastSyncedAt = new Date().toISOString();
           fs.writeFileSync(STORE, JSON.stringify(fresh, null, 2));
+          entry.writtenPayload = r.raw;
           log('  ✓ 已写回账号池');
         }
       }
@@ -291,6 +369,8 @@ async function main() {
       results.push({ email: account.email, ok: false, reason: err.message });
     }
   }
+
+  verifyPersistence(results);
 
   // 恢复原活跃账号
   if (!args.keepLast && original) {

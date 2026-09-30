@@ -219,7 +219,7 @@ open /Applications/TypelessSwitchboard.app
 | 脚本 | 用途 | 是否写数据 |
 | --- | --- | --- |
 | `scripts/audit-account-pool.js` | 逐账号问官方「本周还剩多少字」，给出 verdict（`usable` / `exhausted` / `token-expired` / `dead` / `no-session` / `device-limit` …） | **只读** |
-| `scripts/revive-account-sessions.js` | 让静默会话过期的账号重新可用（借官方桌面端自己的刷新能力，外部进程刷不动）。**「换发成功」要过四关**：会话仍可解密 → token 确实换了新的 → `user_id` 与目标账号一致 → 新 token 未过期；最后仍以官方接口返回 200 为准 | 写会话与账号池 |
+| `scripts/revive-account-sessions.js` | 让静默会话过期的账号重新可用（借官方桌面端自己的刷新能力，外部进程刷不动）。**「换发成功」要过四关**：会话仍可解密 → token 确实换了新的 → `user_id` 与目标账号一致 → 新 token 未过期；最后仍以官方接口返回 200 为准。⚠️ **开工前必须退出 GUI 并停掉额度守护**（脚本会自动检查并拒绝开工）——`store.json` 是整份覆写，两个进程各持一份内存副本，脚本写回的复活结果会被静默还原；收尾还会回读账号池**校验落盘真的还在** | 写会话与账号池 |
 | `scripts/sync-account-quotas.js` | 把账号池里的 `monthlyLimit` / `usedCharacters` 刷成服务端真实值 | 写账号池 |
 | `scripts/verify-silent-switch.js` | 真机端到端验证「账号能不能正常更换」，逐个走一遍换号并记录耗时 | 写会话（结束会恢复原账号） |
 

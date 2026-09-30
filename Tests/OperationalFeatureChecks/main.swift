@@ -403,6 +403,7 @@ struct OperationalFeatureChecks {
         runStoreRecoveryChecks()
         runQuotaGuardLaunchAgentPlannerChecks()
         runQuotaGuardReloadSafetyChecks()
+        runReviveConcurrencyGuardChecks()
 
         // MARK: - v2.5.2：阈值边界 + 钥匙串缓存回归
         runThresholdBoundaryChecks()
@@ -2535,6 +2536,38 @@ struct OperationalFeatureChecks {
     /// 把自己所在的 job 一起停掉 → 紧随的 bootstrap 永远执行不到 → plist 还在、
     /// launchd 里空无一物，界面照样报「已安装」，守护静默失效 24 小时。
     /// 这一组断言把「不许自噬」和「不许说谎」钉死。
+    /// 会话复活的并发写者防护（v2.6.3）。
+    ///
+    /// 背景：`store.json` 是**整份覆写**，GUI 与额度守护各持一份内存 `state`，
+    /// 谁后写谁赢。复活脚本写回的会话会被静默还原，而脚本照报「已写回账号池」——
+    /// 2026-09-30 实测：17 个账号复活后只剩 5 个还在，且活下来的恰好每 3 个一个。
+    /// 这两道护栏就是不让同一件事再发生。
+    private static func runReviveConcurrencyGuardChecks() {
+        let path = "scripts/revive-account-sessions.js"
+        let src = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        check(!src.isEmpty, "复活防护：能读到 revive 脚本（路径变了要同步改这里）")
+
+        // 1. 两道护栏必须真的实现
+        check(src.contains("function preflightWriterGuard"),
+              "复活防护：必须有开工前的并发写者检查")
+        check(src.contains("function verifyPersistence"),
+              "复活防护：必须有收尾的落盘校验")
+        check(src.contains("runningGuiProcesses") && src.contains("isGuardLoaded"),
+              "复活防护：并发写者检查要同时覆盖 GUI 与额度守护")
+        check(src.contains("out.force = true"),
+              "复活防护：必须提供 --force 才允许越过检查（默认拒绝）")
+
+        // 2. 写了必须真的调 —— 定义了却不调等于没写
+        check(src.contains("if (!preflightWriterGuard(args.force === true)) process.exit(1)"),
+              "复活防护：并发写者检查必须在开工前真正生效并中止")
+        check(src.contains("verifyPersistence(results)"),
+              "复活防护：落盘校验必须在写回之后真正执行")
+
+        // 3. 校验要逐账号比对写回的 payload 本身，而不是只看「文件还在」
+        check(src.contains("writtenPayload") && src.contains("rawUserDataPayload"),
+              "复活防护：落盘校验要比对写回的 payload 本身")
+    }
+
     private static func runQuotaGuardReloadSafetyChecks() {
         let planner = QuotaGuardLaunchAgentPlanner.self
 

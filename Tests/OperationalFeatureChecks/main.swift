@@ -405,6 +405,7 @@ struct OperationalFeatureChecks {
         runQuotaGuardReloadSafetyChecks()
         runReviveConcurrencyGuardChecks()
         runQuotaPoolSummaryChecks()
+        runAccountExternalFieldMergeChecks()
 
         // MARK: - v2.5.2：阈值边界 + 钥匙串缓存回归
         runThresholdBoundaryChecks()
@@ -2590,12 +2591,72 @@ struct OperationalFeatureChecks {
               "额度汇总：可用 + 未计入 必须恰好等于「可选且有余量」的总额")
     }
 
-    /// 会话复活的并发写者防护（v2.6.3）。
+    /// 外部写入的合并规则（v2.6.5）。
     ///
-    /// 背景：`store.json` 是**整份覆写**，GUI 与额度守护各持一份内存 `state`，
-    /// 谁后写谁赢。复活脚本写回的会话会被静默还原，而脚本照报「已写回账号池」——
-    /// 2026-09-30 实测：17 个账号复活后只剩 5 个还在，且活下来的恰好每 3 个一个。
-    /// 这两道护栏就是不让同一件事再发生。
+    /// `store.json` 整份覆写 + GUI 常驻 ⇒ 脚本写回的结果会被 GUI 的落盘还原。
+    /// 合并规则必须做到「采纳外部改动」与「不覆盖 GUI 自己的改动」两者兼顾 ——
+    /// 尤其是换号：GUI 刚写进内存的 payload 绝不能被磁盘上的旧值顶掉。
+    private static func runAccountExternalFieldMergeChecks() {
+        let a = UUID()
+        let b = UUID()
+        func f(_ id: UUID, _ payload: String?, _ used: Int, _ limit: Int) -> AccountExternalFieldMerge.ExternalFields {
+            AccountExternalFieldMerge.ExternalFields(id: id, rawUserDataPayload: payload,
+                                                     usedCharacters: used, monthlyLimit: limit)
+        }
+
+        // 空池
+        check(AccountExternalFieldMerge.adoptions(disk: [], memory: [], baseline: []).isEmpty,
+              "外部合并：空池不产生任何采纳")
+
+        // ① 磁盘没变 → 无需采纳
+        let base = f(a, "old", 10, 2000)
+        check(AccountExternalFieldMerge.adoptions(disk: [base], memory: [base], baseline: [base]).isEmpty,
+              "外部合并：磁盘与基线一致时不采纳")
+
+        // ② 磁盘变了、内存没变 → 外部脚本改的，采纳
+        let diskChanged = f(a, "new-payload", 20, 23333)
+        let adopt = AccountExternalFieldMerge.adoptions(disk: [diskChanged], memory: [base], baseline: [base])
+        check(adopt[a] == diskChanged, "外部合并：磁盘相对基线变了、内存没变 ⇒ 采纳磁盘")
+
+        // ③ 磁盘变了、内存也变了 → GUI 自己改的（如刚换完号），不采纳
+        //    这一条是防回退的关键：采纳了就会把 GUI 的换号结果顶回旧值。
+        let memoryChanged = f(a, "gui-new-payload", 30, 2000)
+        check(AccountExternalFieldMerge.adoptions(disk: [diskChanged], memory: [memoryChanged], baseline: [base]).isEmpty,
+              "外部合并：磁盘与内存都变了 ⇒ 以内存为准，不采纳（否则换号被回退）")
+
+        // ④ 磁盘没变、内存变了 → 没有外部改动，不采纳
+        check(AccountExternalFieldMerge.adoptions(disk: [base], memory: [memoryChanged], baseline: [base]).isEmpty,
+              "外部合并：磁盘没变时不采纳")
+
+        // ⑤ 磁盘上基线里没有 → 外部新增的账号，不属于字段采纳
+        check(AccountExternalFieldMerge.adoptions(disk: [f(b, "x", 0, 2000)], memory: [], baseline: []).isEmpty,
+              "外部合并：外部新增账号不走字段采纳（另行追加）")
+
+        // ⑥ 内存里没有但基线里有 → 用户自己删了，不能拉回来
+        check(AccountExternalFieldMerge.adoptions(disk: [diskChanged], memory: [], baseline: [base]).isEmpty,
+              "外部合并：用户删掉的账号不得被拉回")
+
+        // ⑦ 外部新增判定：磁盘有、基线与内存都没有 ⇒ 追加
+        check(AccountExternalFieldMerge.externallyAddedIDs(disk: [a, b], baseline: [a], memory: [a]) == [b],
+              "外部合并：基线里没有的新账号要识别出来追加")
+        // ⑧ 基线里有、内存里没有 ⇒ 用户删的，不能复活
+        check(AccountExternalFieldMerge.externallyAddedIDs(disk: [a], baseline: [a], memory: []).isEmpty,
+              "外部合并：基线里有而内存没有 = 用户删除，不得复活")
+        // ⑨ 重复 id 只追加一次
+        check(AccountExternalFieldMerge.externallyAddedIDs(disk: [b, b], baseline: [], memory: []) == [b],
+              "外部合并：同一新账号出现多次只追加一次")
+    }
+
+    /// 维护脚本的并发改动防护（v2.6.3 起，v2.6.5 抽成共享实现）。
+    ///
+    /// 背景：维护脚本跑的时候如果 GUI / 额度守护还在，它们会同时动同一份状态，
+    /// 结果**看起来完全正常、实际是错的**：
+    ///   · `store.json` 是整份覆写 ⇒ 复活脚本写回的会话被静默还原
+    ///     （实测 17 个账号只剩 5 个，活下来的恰好每 3 个一个）；
+    ///   · GUI 会按额度自动换号 ⇒ 换号验证观察到一半，目标账号被它换走
+    ///     （实测 2/18 假失败）。
+    /// 现在两个脚本共用引擎模块里的 `preflightConcurrentWriterGuard`，
+    /// 不满足前置条件就拒绝开工。
     private static func runReviveConcurrencyGuardChecks() {
         let path = "scripts/revive-account-sessions.js"
         let src = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
@@ -2606,8 +2667,14 @@ struct OperationalFeatureChecks {
               "复活防护：必须有开工前的并发写者检查")
         check(src.contains("function verifyPersistence"),
               "复活防护：必须有收尾的落盘校验")
-        check(src.contains("runningGuiProcesses") && src.contains("isGuardLoaded"),
-              "复活防护：并发写者检查要同时覆盖 GUI 与额度守护")
+        // 守卫本体在共享引擎模块里 —— 两个脚本共用一份实现，各写一份必然分叉。
+        let enginePath = "Sources/TypelessSwitchboard/Resources/extract-active-session.js"
+        let engineSrc = (try? String(contentsOfFile: enginePath, encoding: .utf8)) ?? ""
+        check(!engineSrc.isEmpty, "复活防护：能读到共享引擎模块（路径变了要同步改这里）")
+        check(engineSrc.contains("function runningGuiProcesses") && engineSrc.contains("function isGuardLoaded"),
+              "复活防护：并发改动检查要同时覆盖 GUI 与额度守护")
+        check(engineSrc.contains("preflightConcurrentWriterGuard"),
+              "复活防护：守卫必须由共享模块导出，两个脚本共用一份实现")
         check(src.contains("out.force = true"),
               "复活防护：必须提供 --force 才允许越过检查（默认拒绝）")
 
@@ -2620,6 +2687,18 @@ struct OperationalFeatureChecks {
         // 3. 校验要逐账号比对写回的 payload 本身，而不是只看「文件还在」
         check(src.contains("writtenPayload") && src.contains("rawUserDataPayload"),
               "复活防护：落盘校验要比对写回的 payload 本身")
+
+        // 4. 换号验证脚本必须过同一道关。
+        //    实测（2026-09-30）：GUI 在跑时它按额度自动换号，把观察窗口里的目标账号换走
+        //    （bold.pixel 剩 118 < 阈值 120），18 个账号里出现 2 个「会话变成了 clean.paper」
+        //    的**假失败** —— 看着像换号坏了，其实换号成功了。
+        let verifyPath = "scripts/verify-silent-switch.js"
+        let verifySrc = (try? String(contentsOfFile: verifyPath, encoding: .utf8)) ?? ""
+        check(!verifySrc.isEmpty, "复活防护：能读到换号验证脚本（路径变了要同步改这里）")
+        check(verifySrc.contains("engine.preflightConcurrentWriterGuard({ force: opts.force === true, purpose: '换号验证' })"),
+              "复活防护：换号验证必须同样拒绝在 GUI / 守护运行时开工")
+        check(verifySrc.contains("out.force = true"),
+              "复活防护：换号验证也要有 --force 才允许越过")
     }
 
     private static func runQuotaGuardReloadSafetyChecks() {

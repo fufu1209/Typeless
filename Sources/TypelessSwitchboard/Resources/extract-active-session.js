@@ -17,6 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const https = require('https');
+const { spawnSync } = require('child_process');
 
 const APP_SUPPORT = path.join(process.env.HOME, 'Library/Application Support/Typeless');
 const API_HOST = 'api.typeless.com';
@@ -500,6 +501,67 @@ async function main() {
   console.log(JSON.stringify(out, null, 2));
 }
 
+// ─────────────────── 并发改动防护（2026-09-30） ───────────────────
+//
+// 维护脚本（会话复活、换号验证…）跑的时候，如果 GUI 或额度守护还在，
+// 它们会**同时动同一份状态**，结果看起来完全正常、实际是错的：
+//
+//   · GUI 与守护各持一份 `store.json` 的内存副本，`save()` 整份覆写、没有合并 ⇒
+//     脚本写回的复活结果被静默还原（实测 17 个账号只剩 5 个，活下来的恰好每 3 个一个）。
+//   · GUI 还会按额度**自动换号** ⇒ 换号验证正观察到一半，账号就被它换走了
+//     （实测 `bold.pixel` 剩 118 < 阈值 120，观察窗口结束后会话变成了 `clean.paper`，
+//      被误判成「换号失败」）。
+//
+// 所以这两个脚本开工前都要过这一关。放在这个共享模块里，避免两份实现再次分叉。
+
+/// 正在运行的 Switchboard GUI 进程（`--daemon-check` 是一次性进程，不算）。
+function runningGuiProcesses() {
+  const hit = spawnSync('/usr/bin/pgrep', ['-f', 'TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard'], { encoding: 'utf8' });
+  const pids = String(hit.stdout || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  return pids.filter((pid) => {
+    const cmd = spawnSync('/bin/ps', ['-o', 'command=', '-p', pid], { encoding: 'utf8' });
+    return !String(cmd.stdout || '').includes('--daemon-check');
+  });
+}
+
+/// 额度守护 LaunchAgent 是否已加载（每 60 秒跑一次 `--daemon-check`，也会落盘）。
+function isGuardLoaded() {
+  const label = `gui/${process.getuid()}/local.typeless.switchboard.quota-guard`;
+  return spawnSync('/bin/launchctl', ['print', label], { stdio: 'ignore' }).status === 0;
+}
+
+/// 开工前检查有没有别的进程会同时改动账号池 / 桌面端会话。
+/// 返回 true 表示可以开工；false 表示应当中止。
+function preflightConcurrentWriterGuard(options = {}) {
+  const purpose = options.purpose ? `（${options.purpose}）` : '';
+  const gui = runningGuiProcesses();
+  const guard = isGuardLoaded();
+  if (!gui.length && !guard) return true;
+  if (options.force === true) {
+    console.log(`⚠️ --force：检测到并发改动者，仍继续${purpose} —— 结果可能被覆盖或误判。`);
+    return true;
+  }
+  console.log(`🔴 检测到会在操作期间改动账号池 / 桌面端会话的进程，已中止${purpose}：`);
+  if (gui.length) {
+    console.log(`   · Typeless Switchboard GUI 正在运行（pid ${gui.join(', ')}）`);
+    console.log('       —— 它会按额度自动换号，把你正在操作的账号换走');
+    console.log('       —— 它还会整份覆写 store.json，把脚本写回的结果还原');
+  }
+  if (guard) {
+    console.log('   · 额度守护 LaunchAgent 已加载（每 60 秒跑一次 --daemon-check，同样会落盘）');
+  }
+  console.log('');
+  console.log('  先执行：');
+  console.log('    osascript -e \'tell application "TypelessSwitchboard" to quit\'');
+  console.log('    launchctl bootout "gui/$(id -u)/local.typeless.switchboard.quota-guard"');
+  console.log('  跑完再恢复（忘了也不要紧，打开 App 会自愈）：');
+  console.log('    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.typeless.switchboard.quota-guard.plist');
+  console.log('');
+  console.log('  确认无并发改动者后重跑；确实要强行继续：加 --force。');
+  return false;
+}
+
+
 module.exports = {
   decryptActiveSession,
   encryptSessionPayload,
@@ -515,7 +577,10 @@ module.exports = {
   sessionDerivedPassword,
   aesEncryptOpenSSL,
   API_HOST,
-  USAGE_PATH
+  USAGE_PATH,
+  runningGuiProcesses,
+  isGuardLoaded,
+  preflightConcurrentWriterGuard
 };
 
 if (require.main === module) {

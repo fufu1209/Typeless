@@ -81,46 +81,12 @@ function parseArgs(argv) {
 function log(...args) { console.log(...args); }
 
 // ─────────────────────── 并发写者防护（2026-09-30） ───────────────────────
+//
+// 实现在共享引擎模块里（`preflightConcurrentWriterGuard`）——
+// 换号验证脚本要用同一道关，各写一份必然分叉。
 
-function runningGuiProcesses() {
-  const hit = spawnSync('/usr/bin/pgrep', ['-f', 'TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard'], { encoding: 'utf8' });
-  const pids = String(hit.stdout || '').split('\n').map((x) => x.trim()).filter(Boolean);
-  // --daemon-check 是一次性进程（跑几秒就退），不算常驻写者；GUI 才算。
-  return pids.filter((pid) => {
-    const cmd = spawnSync('/bin/ps', ['-o', 'command=', '-p', pid], { encoding: 'utf8' });
-    return !String(cmd.stdout || '').includes('--daemon-check');
-  });
-}
-
-function isGuardLoaded() {
-  const label = `gui/${process.getuid()}/local.typeless.switchboard.quota-guard`;
-  return spawnSync('/bin/launchctl', ['print', label], { stdio: 'ignore' }).status === 0;
-}
-
-/// 开工前检查有没有别的进程会整份覆写账号池。
 function preflightWriterGuard(force) {
-  const gui = runningGuiProcesses();
-  const guard = isGuardLoaded();
-  if (!gui.length && !guard) return true;
-  if (force) {
-    log('⚠️ --force：检测到并发写者，仍继续 —— 复活结果可能被覆盖。');
-    return true;
-  }
-  log('🔴 检测到会整份覆写账号池的进程，已中止：');
-  if (gui.length) log(`   · Typeless Switchboard GUI 正在运行（pid ${gui.join(', ')}）`);
-  if (guard) log('   · 额度守护 LaunchAgent 已加载（每 60 秒跑一次 --daemon-check，也会落盘）');
-  log('');
-  log('  它们与本脚本各持一份 store.json 的内存副本，落盘时整份覆写：');
-  log('  脚本会照报「已写回账号池」，数据却被还原 —— 静默假成功。');
-  log('');
-  log('  先执行：');
-  log('    osascript -e \'tell application "TypelessSwitchboard" to quit\'');
-  log('    launchctl bootout "gui/$(id -u)/local.typeless.switchboard.quota-guard"');
-  log('  跑完再恢复（忘了也不要紧，打开 App 会自愈）：');
-  log('    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.typeless.switchboard.quota-guard.plist');
-  log('');
-  log('  确认无并发写者后重跑；确实要强行继续：加 --force。');
-  return false;
+  return engine.preflightConcurrentWriterGuard({ force, purpose: '会话复活' });
 }
 
 /// 收尾时回读账号池，确认写回真的还在。

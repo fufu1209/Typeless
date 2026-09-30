@@ -104,6 +104,10 @@ final class SwitchboardStore: ObservableObject {
             state = .empty
         }
         migrateDefaultsIfNeeded()
+        // 外部写入合并的基线：必须在**加载并迁移之后、任何 GUI 改动之前**采集。
+        // 采晚了会把 GUI 自己的换号结果当成基线，磁盘上的旧 payload 反而被判定为
+        // 「外部更新」而采纳回来 —— 换号被静默回退。
+        baselineAccounts = state.accounts
         // v2.5.5：周期时区必须在**所有运行模式**下生效，不能只挂在 GUI 的 AppDelegate 上。
         // LaunchAgent 守护（--daemon-check）是独立进程，它也要按同一个时区算周界，
         // 否则会出现「App 里显示该复活了，插件巡检却认为还没到点」。
@@ -300,6 +304,19 @@ final class SwitchboardStore: ObservableObject {
 
     /// 最近一次成功写盘的内容快照：UI 逐字符输入也会触发 save，内容未变时跳过编码与写盘。
     var lastSavedStateData: Data?
+
+    /// 账号池的**加载时基线**。磁盘相对它变了、而内存没变 ⇒ 是外部脚本改的，
+    /// 落盘前要采纳回来，否则整份覆写会把脚本的成果抹掉。详见 `AccountExternalFieldMerge`。
+    var baselineAccounts: [Account] = []
+
+    /// 最近一次我们自己写盘后的文件指纹（大小-修改时间）。落盘前先比一下，
+    /// 没变就说明没有外部写入，省掉一次读盘（`save()` 会被逐字符输入触发）。
+    var lastWrittenFileFingerprint: String?
+
+    /// 最近一次「落盘前采纳外部改动」的规模与时刻，供排查用
+    /// （明细另见 `Logs/external-merge.log`）。
+    var lastExternalAdoptionCount = 0
+    var lastExternalAdoptionAt: Date?
 
     /// 权限探测结果缓存，避免后台热备/巡检反复触发系统弹窗。
     var cachedAccessibilityTrusted: Bool?

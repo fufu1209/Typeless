@@ -258,10 +258,16 @@ extension SwitchboardStore {
     func save() {
         do {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            // v2.6.5：落盘前先采纳外部脚本对账号池的改动。
+            // store.json 是整份覆写，GUI 常驻数小时拿着旧副本 —— 不做这一步，
+            // 会话复活 / 额度同步的成果会被这次落盘整份还原（2026-09-30 实测）。
+            adoptExternalAccountUpdatesIfNeeded()
             let data = try JSONEncoder.appEncoder.encode(state)
             if data != lastSavedStateData {
                 try data.write(to: fileURL, options: [.atomic])
                 lastSavedStateData = data
+                baselineAccounts = state.accounts
+                lastWrittenFileFingerprint = currentStoreFileFingerprint()
             }
             
             if state.settings.isAutoRotateEnabled {

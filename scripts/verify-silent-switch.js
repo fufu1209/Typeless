@@ -79,7 +79,7 @@ function decodeJwtPayload(token) {
 }
 
 function parseArgs(argv) {
-  const out = { dryRun: false, full: false, limit: 0, email: '', keepLast: false, json: false, observe: DEFAULT_OBSERVE_MS };
+  const out = { dryRun: false, full: false, limit: 0, email: '', keepLast: false, json: false, observe: DEFAULT_OBSERVE_MS, force: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--dry-run') out.dryRun = true;
@@ -88,6 +88,7 @@ function parseArgs(argv) {
     else if (a === '--email') out.email = String(argv[++i] || '');
     else if (a === '--keep-last') out.keepLast = true;
     else if (a === '--json') out.json = true;
+    else if (a === '--force') out.force = true;
     else if (a === '--observe') out.observe = Math.min(Math.max(Number(argv[++i]) || DEFAULT_OBSERVE_MS, 5000), MAX_OBSERVE_MS);
   }
   return out;
@@ -368,6 +369,13 @@ async function main() {
     log('\n--dry-run，仅列出待验证账号：');
     for (const a of candidates) log(`  · ${a.email}`);
     return;
+  }
+
+  // 换号验证必须在「没有别人同时动账号」的前提下跑，否则会得到假失败。
+  // 实测（2026-09-30）：GUI 在跑时，它按额度自动换号，把观察窗口里的目标账号换走，
+  // 18 个账号里出现 2 个「会话变成了 clean.paper」的假失败。
+  if (!engine.preflightConcurrentWriterGuard({ force: opts.force === true, purpose: '换号验证' })) {
+    process.exit(1);
   }
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');

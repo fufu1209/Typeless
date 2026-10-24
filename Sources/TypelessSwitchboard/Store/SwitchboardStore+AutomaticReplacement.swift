@@ -456,24 +456,38 @@ extension SwitchboardStore {
         let requestedCount = arguments.indices.contains(countIndex + 1)
             ? (Int(arguments[countIndex + 1]) ?? 1)
             : 1
-        let count = min(max(requestedCount, 1), 5)
+        // v2.6.9：上限 5 → 100。旧上限是「批量测试别玩太大」的保守值，但账号池扩容
+        // （用户要求 50 个左右，承载高压测试）需要一次跑几十个；真正的安全阀是
+        // 「任一轮未完成就整体停」+ 用户显式传入的数量，不是这个硬帽。
+        let count = min(max(requestedCount, 1), 100)
         let domain = commandLineValue(for: "--auto-switch-domain", in: arguments)
             .ifEmpty(state.settings.domains.first ?? "example.com")
+        // v2.6.9：热备模式。默认 false（保持「批量换号测试」原语义：每轮切到新号）；
+        // 账号池扩容传 --auto-switch-preserve-current，只往池子里加号、不碰用户桌面登录态。
+        let preserveCurrent = arguments.contains("--auto-switch-preserve-current")
+        // v2.6.9：轮次间隔（秒）。默认 30。连续注册会对 MoeMail / Typeless 形成
+        // 注册速率压力，也给每轮的 Playwright 留出干净的退出时间。
+        let delaySeconds = max(0, Int(commandLineValue(for: "--auto-switch-delay-seconds", in: arguments)) ?? 30)
         let apiKey = resolveAPIKeyForCurrentMode()
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            fputs("TypelessSwitchboard CLI: MoeMail API Key missing in Keychain\n", stderr)
+            fputs("TypelessSwitchboard CLI: MoeMail API Key missing（边车/钥匙串里都没有）\n", stderr)
             return true
         }
 
-        print("TypelessSwitchboard CLI: starting \(count) automatic replacement run(s), domain=\(domain)")
+        print("TypelessSwitchboard CLI: starting \(count) automatic replacement run(s), domain=\(domain), preserveCurrent=\(preserveCurrent), delay=\(delaySeconds)s")
         for runIndex in 1...count {
-            let fromID = lastCompletedAutomationAccountID()
+            if runIndex > 1, delaySeconds > 0 {
+                print("TypelessSwitchboard CLI: waiting \(delaySeconds)s before run \(runIndex)/\(count)")
+                try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
+            }
+            let fromID = preserveCurrent ? nil : lastCompletedAutomationAccountID()
             let startedAt = Date()
             let resultID = await runOneClickAutomaticReplacement(
                 apiKey: apiKey,
                 domain: domain,
                 expiryTime: 0,
-                from: fromID
+                from: fromID,
+                preserveCurrentAccount: preserveCurrent
             )
             let elapsed = Date().timeIntervalSince(startedAt)
             let result = state.lastAutomationResult

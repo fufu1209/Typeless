@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.9-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.7.0-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -98,9 +98,12 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.6.9**（2026-10-25）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.7.0**（2026-10-25）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-最近的主要变化：**选号算法稳定化**（v2.6.9 —— 审查 7069 行守护日志证实算法本身不抖，
+最近的主要变化：**账号池扩容管线**（v2.7.0 —— CLI 批量注册上限 5→100，
+新增 `--auto-switch-preserve-current` 热备模式：只加号、不碰桌面登录态，
+轮次间隔默认 30 秒防速率压力；支撑「池子 50 个左右、承载高压测试」的运维需求）、
+**选号算法稳定化**（v2.6.9 —— 审查 7069 行守护日志证实算法本身不抖，
 「搞来搞去」实为注册无退避每分钟烧地址 + 往低于阈值的死号里硬切；现在注册失败指数
 退避 5→60 分钟，自治切换只切能越过阈值的备用号，手动换号保持原语义）、
 **守护进程不再卡死在钥匙串上**（v2.6.8 —— ad-hoc 签名重签后

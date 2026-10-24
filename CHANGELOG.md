@@ -1,6 +1,64 @@
 # 更新记录
 
-当前版本 **v2.6.7**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.6.8**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.6.8（2026-10-25）
+
+修一个比 JA3 更致命的静默失效：**守护进程卡死在钥匙串读取上，整个额度守护从 10-22 起就没再跑过一轮**。
+
+### 修复
+
+- **守护进程（LaunchAgent）全员卡死，launchd 却显示一切正常**
+
+  现象：`quota-guard-daemon.log` 最后一条正常巡检停在 `2026-10-22 05:39:45Z`，
+  此后 launchd 里 job 一直是 `state = running`、每分钟到点，`sample` 抓到的栈却是：
+  `runDaemonQuotaGuardOnceIfRequested → KeychainStore.readAPIKey →
+  SecItemCopyMatching → SecurityServer::ClientSession::decrypt → mach_msg` ——
+  每一轮都永久挂在等 securityd 回消息上。job 占着位不退出，后续轮次再也不跑。
+
+  根因：本 App 是 **ad-hoc 签名**（`codesign --sign -`）。钥匙串条目的 ACL 默认
+  只信任**创建时那个二进制**（按 designated requirement 匹配，ad-hoc 签名即 cdhash）。
+  v2.6.6 在 10-22 13:40 装上（重签 ⇒ cdhash 变了），当分钟起守护读 API Key
+  就要重新授权；而守护是 launchd 以 `ProcessType=Background` 拉起的**无界面进程**，
+  授权框弹不出来，`SecItemCopyMatching` 就永远等下去。
+  （对照组：账号密码条目用 `security` CLI 读同样挂死；API Key 条目却能秒读 ——
+  两条路径的 ACL 状态不同，但都不该由后台进程依赖。）
+
+  这与 v2.6.0 / v2.6.7 是**同一失效模式的第四次重演**：界面无异常、日志不再增长、
+  功能静默停摆。区别是前三次至少还留了「跳过换号决策」的日志，
+  这次连日志都没有 —— job 卡在第一行之前。
+
+  修复分三层：
+
+  1. **守护不再碰钥匙串**：新增 `DaemonSecretStore` 边车文件
+     （`~/Library/Application Support/TypelessSwitchboard/daemon-secrets.json`，0600），
+     存 API Key 与账号密码。GUI 仍以钥匙串为权威源，每次成功读取/保存都镜像进边车
+     （值已到手，镜像不引入新的授权面）；守护与 CLI 只读边车，
+     没有弹框问题，也没有「登录钥匙串睡眠锁定」问题。
+     边车缺失时守护降级为「仅静默切换」并明确记日志，不猜不骗。
+  2. **看门狗兜底**：守护启动即武装 20 分钟硬上限（正常巡检 1-2 秒，
+     最慢一次全自动注册 735 秒），到点直接记日志 `exit(70)`，
+     launchd 下一轮自然重启。看门狗走 detached Task + 直接写文件，
+     **不依赖 MainActor** —— 主线程可能卡在 Mach 消息里。
+  3. **密源解析按运行模式分流**：GUI 走钥匙串（可弹授权，读成功后自动镜像边车），
+     `daemonOnce` / `cliAutoSwitch` 走边车。原先是全局直接读钥匙串，
+     守护传空 Key 时还会在 `performAutoRotateCheck` 里二次踩雷。
+
+  ⚠️ 顺带排查并**放弃**了一个方案：给钥匙串条目设「无限定 ACL」
+  （`SecAccessCreate(desc, nil)`）让任何进程免授权读。沙箱内无法用第二个二进制
+  验证其语义（python3 读任何条目都挂，`security` CLI 又始终有特权），
+  而万一语义与预期相反（空列表 = 谁也不许读），新保存的密码将全部读不出 ——
+  风险不可接受，留待以后在有 GUI 授权的环境里验证。
+
+### 已知事项
+
+- 存量 21 个账号的密码仍只在钥匙串里（ACL 信任的是 10-22 之前的二进制）。
+  不影响自动换号主链路（静默切换不需要密码）；需要时打开一次 App 触发读取，
+  成功后即自动镜像进边车。
+- 设备重置路径会删 Typeless 官方 App 的钥匙串条目（`deleteTypelessDeviceCredentialsFromKeychain`），
+  与我们的签名无关，暂未改动；守护从未实测过该路径，列此备查。
 
 ---
 

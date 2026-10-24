@@ -50,7 +50,7 @@ struct DiagnosticsTabView: View {
                 Button {
                     isCheckingTypeless = true
                     Task {
-                        await store.runSetupDiagnostics(apiKey: KeychainStore.readAPIKey())
+                        await store.runSetupDiagnostics(apiKey: KeychainStore.readAPIKeyPreferringSidecar())
                         isCheckingTypeless = false
                     }
                 } label: {

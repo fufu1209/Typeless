@@ -19,7 +19,9 @@ struct RootView: View {
 
     @State private var selection: SwitchboardTab = .pool
     @State private var selectedAccountID: UUID?
-    @State private var apiKey = KeychainStore.readAPIKey()
+    // v2.6.8：边车优先。直接读钥匙串会在 ACL 不信任当前二进制时把主线程
+    // 冻死在授权框等待上（窗口都出不来），详见 KeychainStore.readAPIKeyPreferringSidecar。
+    @State private var apiKey = KeychainStore.readAPIKeyPreferringSidecar()
     @State private var commandLineAutomationStarted = false
 
     var body: some View {
@@ -170,7 +172,7 @@ private struct GlobalStatusBar: View {
             Button {
                 Task {
                     selectedAccountID = await store.runSmartSwitch(
-                        apiKey: KeychainStore.readAPIKey(),
+                        apiKey: KeychainStore.readAPIKeyPreferringSidecar(),
                         domain: store.state.settings.domains.first ?? "",
                         expiryTime: 0,
                         from: selectedAccountID,

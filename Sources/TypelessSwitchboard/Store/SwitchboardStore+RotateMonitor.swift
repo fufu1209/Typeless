@@ -98,7 +98,10 @@ extension SwitchboardStore {
         lastAutoRotateCheckAt = Date()
         autoRotateMonitorStatus = "正在同步额度…"
 
-        let key = (apiKey ?? KeychainStore.readAPIKey()).trimmingCharacters(in: .whitespacesAndNewlines)
+        // v2.6.8：apiKey 为 nil 时按运行模式解析。边车优先（两种模式都一样，
+        // 边车就是同一个值的镜像，读它没有授权面）；只有边车为空时 GUI 才走
+        // 钥匙串（首跑装 Key 之前条目不存在，秒返回空串，不会卡）。
+        let key = (apiKey ?? resolveAPIKeyForCurrentMode()).trimmingCharacters(in: .whitespacesAndNewlines)
         let domain = state.settings.domains.first ?? ""
         let allowCreate = state.settings.autoCreateWhenPoolEmpty && !key.isEmpty
 

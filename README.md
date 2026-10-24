@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.7-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.8-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -98,9 +98,12 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.6.7**（2026-10-25）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.6.8**（2026-10-25）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-最近的主要变化：**注册页点了终于真的会注册**（v2.6.7 —— 原来的「创建注册候选账号」
+最近的主要变化：**守护进程不再卡死在钥匙串上**（v2.6.8 —— ad-hoc 签名重签后
+钥匙串 ACL 失效，无界面守护弹不出授权框，`SecItemCopyMatching` 永久挂死，
+launchd 却显示一切正常；现在守护只读 0600 边车密源，另加 20 分钟看门狗兜底）、
+**注册页点了终于真的会注册**（v2.6.7 —— 原来的「创建注册候选账号」
 只建资料不跑流程，全仓库没有 UI 入口能调到 Playwright；现在补上「一键注册新账号」，
 走完整 12 步链路、热备模式不打断你正在用的号）、
 **额度接口失效后自动换号不再停摆**（v2.6.7 —— Typeless 服务端 10-14 起对

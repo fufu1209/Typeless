@@ -116,9 +116,14 @@ extension SwitchboardStore {
         }
 
         var account = state.accounts[index]
-        let password = KeychainStore.readAccountPassword(accountID: account.id)
+        // v2.6.8：无界面进程只读边车。正常注册流程里密码是刚才本进程刚保存的，
+        // 命中进程缓存不碰钥匙串；缓存未命中时（如换机恢复的旧账号）GUI 走钥匙串
+        // （可弹授权），守护/CLI 读边车，读不到就明确失败，绝不挂死。
+        let password = resolveAccountPasswordForCurrentMode(accountID: account.id)
         guard !password.isEmpty else {
-            log.append("Keychain 中没有读取到账户密码")
+            log.append(runMode == .gui
+                ? "Keychain 中没有读取到账户密码"
+                : "边车密源中没有这个账号的密码（旧账号请打开一次 App 同步密钥），无法继续自动化")
             state.lastAutomationResult = RegistrationAutomationResult(
                 previousAccountID: previousAccount?.id,
                 previousAccountEmail: previousAccount?.email,
@@ -352,6 +357,11 @@ extension SwitchboardStore {
         return .gui
     }
 
+    /// 守护看门狗时长（秒）。正常巡检 1-2 秒；最慢的一次全自动注册实测 735 秒
+    /// （Playwright 全流程）。20 分钟 = 最慢合法巡检的 1.6 倍，留足余量又不至于
+    /// 让卡死的 job 占用太久。到点强制 exit，launchd 下一轮自然重启。
+    static let daemonWatchdogSeconds: TimeInterval = 1200
+
     /// LaunchAgent / 定时任务入口：同步额度 → 低额度自动换号 → 可选补热备 → 退出。
     /// 不启动 GUI、不常驻循环。
     func runDaemonQuotaGuardOnceIfRequested() async -> Bool {
@@ -364,15 +374,28 @@ extension SwitchboardStore {
         print("TypelessSwitchboard daemon: quota guard check starting")
         autoRotateMonitorStatus = "daemon：正在单次巡检额度…"
 
+        // v2.6.8 看门狗：守护是 launchd 单次进程，任何一步挂住都会让这个 job
+        // 永远占着位、后续轮次再也不跑（2026-10-22 起实测卡死在读钥匙串，
+        // 停摆三天无人察觉 —— 界面无异常，只有 daemon 日志不再增长）。
+        // 正常巡检 1-2 秒，最慢的一次全自动注册 735 秒（Playwright 全流程）；
+        // 20 分钟硬上限到点直接记日志并 exit，launchd 下一轮自然重启。
+        // 主线程可能卡在 C 调用里（Mach 消息、Security 框架），所以看门狗
+        // 绝不依赖 MainActor：detached Task + 直接写文件。
+        armDaemonWatchdog(seconds: SwitchboardStore.daemonWatchdogSeconds)
+
         // 单次巡检：忽略 GUI 的 isAutoRotateEnabled 开关（Agent 本身就是用户选择的守护方式）。
         // 但仍尊重阈值、热备、池空自动注册配置。
         let previousAutoRotate = state.settings.isAutoRotateEnabled
         let previousCreate = state.settings.autoCreateWhenPoolEmpty
         state.settings.isAutoRotateEnabled = true
         // 无 API Key 时 performAutoRotateCheck 仍可做静默池切换，但无法全自动注册。
-        let apiKey = KeychainStore.readAPIKey().trimmingCharacters(in: .whitespacesAndNewlines)
+        //
+        // v2.6.8：守护**只读边车文件，绝不碰钥匙串**。ad-hoc 签名每次重签都让
+        // 钥匙串 ACL 失效，无界面进程弹不出授权框，SecItemCopyMatching 会永久
+        // 挂在 SecurityServer 的 mach_msg 上 —— 这就是 10-22 以来守护全灭的原因。
+        let apiKey = DaemonSecretStore.readAPIKey()
         if apiKey.isEmpty {
-            print("TypelessSwitchboard daemon: warning — MoeMail API Key missing; silent switch only, no auto-register")
+            print("TypelessSwitchboard daemon: warning — 边车中没有 MoeMail API Key（请打开一次 App 同步密钥）；本轮仅静默切换，不自动注册")
         }
 
         let resultID = await performAutoRotateCheck(apiKey: apiKey.isEmpty ? nil : apiKey)
@@ -432,7 +455,7 @@ extension SwitchboardStore {
         let count = min(max(requestedCount, 1), 5)
         let domain = commandLineValue(for: "--auto-switch-domain", in: arguments)
             .ifEmpty(state.settings.domains.first ?? "example.com")
-        let apiKey = KeychainStore.readAPIKey()
+        let apiKey = resolveAPIKeyForCurrentMode()
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             fputs("TypelessSwitchboard CLI: MoeMail API Key missing in Keychain\n", stderr)
             return true
@@ -476,6 +499,60 @@ extension SwitchboardStore {
             line: "[\(stamp)] remaining=\(remaining.map(String.init) ?? "-") email=\(email.ifEmpty("-")) result=\(resultID?.uuidString ?? "-") \(reason)",
             to: logURL
         )
+    }
+
+    // MARK: - 无界面进程的密源与看门狗（v2.6.8）
+
+    /// API Key 解析：先边车后钥匙串（两种模式都一样）。
+    ///
+    /// 为什么 GUI 也边车优先：边车里就是同一个值（GUI 保存/读取成功时都会镜像），
+    /// 读它没有授权面、没有弹框、不会把主线程冻在 mach_msg 上。只有边车为空
+    /// （首跑装 Key 之前，或边车被手工删了）才走钥匙串 —— 那种情况下条目要么
+    /// 不存在（秒返回空串），要么由用户主动操作时承担一次授权。
+    func resolveAPIKeyForCurrentMode() -> String {
+        let sidecar = DaemonSecretStore.readAPIKey()
+        if !sidecar.isEmpty { return sidecar }
+        switch runMode {
+        case .gui:
+            return KeychainStore.readAPIKey()
+        case .daemonOnce, .cliAutoSwitch:
+            return ""
+        }
+    }
+
+    /// 账号密码解析：同上。GUI 读钥匙串成功后会自动镜像进边车。
+    func resolveAccountPasswordForCurrentMode(accountID: UUID) -> String {
+        switch runMode {
+        case .gui:
+            return KeychainStore.readAccountPassword(accountID: accountID)
+        case .daemonOnce, .cliAutoSwitch:
+            return DaemonSecretStore.readAccountPassword(accountID: accountID)
+        }
+    }
+
+    /// 启动守护看门狗：到点未退出就记日志并 `exit`，绝不让 launchd job 卡死。
+    ///
+    /// 历史教训：守护卡在 `SecItemCopyMatching`（钥匙串 ACL 失效 + 后台弹不出
+    /// 授权框）三天，launchd 里 job 一直显示 running，额度守护静默停摆。
+    /// 看门狗是兜底中的兜底 —— 真正的修复是守护不碰钥匙串（`DaemonSecretStore`）。
+    ///
+    /// 实现约束：主线程可能卡在 Mach 消息里，MainActor 不可用 ⇒ 看门狗必须跑在
+    /// detached task 里，且**只捕获 Sendable 值**（日志 URL），绝不碰 Store。
+    func armDaemonWatchdog(seconds: TimeInterval) {
+        guard runMode == .daemonOnce else { return }
+        let logURL = fileURL.deletingLastPathComponent()
+            .appendingPathComponent("Logs/quota-guard-daemon.log")
+        let startedStamp = ISO8601DateFormatter().string(from: Date())
+        Task.detached {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            LogFileRotator.append(
+                line: "[\(stamp)] remaining=- email=- result=- ⚠️ 守护看门狗触发：巡检开始于 \(startedStamp)，超过 \(Int(seconds)) 秒未结束，强制退出等 launchd 下一轮重启",
+                to: logURL
+            )
+            fputs("TypelessSwitchboard daemon: watchdog fired after \(Int(seconds))s, forcing exit\n", stderr)
+            exit(70)
+        }
     }
 
     /// v2.5.5：守护日志的轮转。launchd 的 stdout / stderr 由 launchd 自己持有 fd，

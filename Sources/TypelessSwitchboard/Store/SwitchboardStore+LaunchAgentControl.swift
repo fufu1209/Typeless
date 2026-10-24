@@ -20,6 +20,21 @@ extension SwitchboardStore {
     /// 见 `QuotaGuardLaunchAgentPlanner` 的「重载安全」注释）。
     func refreshLaunchAgentStatus() {
         if QuotaGuardLaunchAgent.isInstalled {
+            // v2.6.8 配置自愈：装了开机插件，App 内循环守护就必须是关的。
+            //
+            // 历史上这条不变量只由 `installQuotaGuardLaunchAgent()`（UI 安装入口）
+            // 维护；而 `scripts/install-quota-guard.sh` / build-app.sh --install
+            // 是**直接装 plist**的，绕过了 UI 入口，于是留下「双开巡检」：
+            // LaunchAgent 每分钟跑一轮，GUI 循环也照样跑，对官方额度接口的
+            // 调用量翻倍。更糟的是 GUI 这一轮在 `performAutoRotateCheck` 里
+            // 读钥匙串，ACL 不信任当前二进制时直接把**主线程冻死**在
+            // SecItemCopyMatching 上（2026-10-25 实测，窗口出得来但点不动）。
+            if state.settings.isAutoRotateEnabled {
+                state.settings.isAutoRotateEnabled = false
+                stopRotateMonitor()
+                autoRotateMonitorStatus = "已改用开机轻量插件（LaunchAgent），App 内循环守护已关"
+                save()
+            }
             if !QuotaGuardLaunchAgent.isLoaded {
                 if QuotaGuardLaunchAgent.ensureLoaded() {
                     appendDaemonLog(
@@ -84,7 +99,8 @@ extension SwitchboardStore {
     func runQuotaGuardOnceFromUI() async {
         statusMessage = "正在执行与开机插件相同的单次额度巡检…"
         autoRotateMonitorStatus = "手动：单次 daemon 巡检中…"
-        let apiKey = KeychainStore.readAPIKey().trimmingCharacters(in: .whitespacesAndNewlines)
+        // v2.6.8：边车优先，避免钥匙串授权框把主线程冻在 mach_msg 上。
+        let apiKey = resolveAPIKeyForCurrentMode().trimmingCharacters(in: .whitespacesAndNewlines)
         let resultID = await performAutoRotateCheck(apiKey: apiKey.isEmpty ? nil : apiKey)
         if !apiKey.isEmpty, state.settings.autoCreateWhenPoolEmpty {
             await ensureHotSpareIfNeeded(apiKey: apiKey, domain: state.settings.domains.first ?? "")

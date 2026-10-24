@@ -7,6 +7,46 @@ import Darwin
 import TypelessSwitchboardCore
 
 extension SwitchboardStore {
+    // MARK: - 额度 API 降级判定（v2.6.7）
+    //
+    // 相关的三个 @Published 状态（quotaAPIConsecutiveFailures / isQuotaAPIDegraded /
+    // quotaDegradedReason）声明在 SwitchboardStore.swift 主类里，与其它运行状态放在一起。
+
+    /// 距上次成功拉到额度超过这个分钟数，就判定「API 持续不可用」，降级到本地估算驱动换号。
+    ///
+    /// ⚠️ 为什么用**时间**而不是「连续失败次数」：守护是 launchd 拉起的**单次进程**
+    /// （`--daemon-check` 跑完就退），内存里的失败计数每次重启归零，永远攒不到阈值。
+    /// 而 `lastQuotaSyncAt` 是持久化字段（v2.6.6 加入 `PersistedState`），
+    /// 天然跨进程累积 —— 「多久没拿到新鲜数据」正是这句话的本意。
+    /// 10 分钟 ≈ 守护默认 1 分钟一轮的 10 轮，足够排除偶发抖动。
+    static let quotaDegradedStaleMinutes = 10.0
+
+    /// 降级模式下换号阈值的放大倍数。
+    /// 本地 remaining 是上次成功同步的快照，此后的真实消耗没有记录 ⇒ 会**高估**剩余，
+    /// 所以阈值必须放大：宁可早换，不可该换不换。
+    static let quotaDegradedThresholdMultiplier = 3
+
+    /// 官方额度数据是否已陈旧到需要降级（跨进程判据：距上次成功同步的分钟数）。
+    var isQuotaDataStaleBeyondDegradeThreshold: Bool {
+        guard let last = lastQuotaSyncAt else { return true }
+        return Date().timeIntervalSince(last) >= Self.quotaDegradedStaleMinutes * 60
+    }
+
+    /// 官方额度 API 成功：清零失败计数并退出降级模式。
+    func noteQuotaAPISuccess() {
+        quotaAPIConsecutiveFailures = 0
+        if isQuotaAPIDegraded {
+            isQuotaAPIDegraded = false
+            quotaDegradedReason = "官方额度 API 已恢复，退出估算模式"
+        }
+    }
+
+    /// 官方额度 API 失败：累加计数（仅用于展示；降级判定走时间，见
+    /// `isQuotaDataStaleBeyondDegradeThreshold`）。
+    func noteQuotaAPIFailure() {
+        quotaAPIConsecutiveFailures += 1
+    }
+
     func syncActiveAppSessionAndQuota(localOnly: Bool = false) async -> UUID? {
         isSyncingSession = true
         lastSyncHitDeviceUserLimit = false
@@ -123,6 +163,7 @@ extension SwitchboardStore {
                         lastQuotaMonthlyLimit = max(limit, 1)
                         lastQuotaSyncAt = Date()
                         lastQuotaSyncFresh = true
+                        noteQuotaAPISuccess()
                         liveRemainingCharacters = state.accounts[i].remainingCharacters
                         liveAccountEmail = state.accounts[i].email
                         let remaining = state.accounts[i].remainingCharacters
@@ -142,12 +183,14 @@ extension SwitchboardStore {
                 if let errorMsg = res.error {
                     if lastSyncHitClientNotSupported {
                         lastQuotaSyncFresh = false
+                        noteQuotaAPIFailure()
                         syncStatusMessage = "⚠️ Typeless 拒绝本客户端（客户端指纹已过期），本周额度读不到：\(errorMsg)"
                     } else if lastSyncHitDeviceUserLimit {
                         syncStatusMessage = "已读到账号「\(email)」，但设备登录用户数已超限：\(errorMsg)"
                     } else {
                         // 登录态在，但本周额度 API 失败：保留旧 used/limit，明确标陈旧。
                         lastQuotaSyncFresh = false
+                        noteQuotaAPIFailure()
                         syncStatusMessage = "已读到账号「\(email)」，但本周额度 API 失败（数字可能陈旧）：\(errorMsg)"
                     }
                 } else if quotaFresh {
@@ -159,6 +202,7 @@ extension SwitchboardStore {
                     syncStatusMessage = "本地校验：当前桌面会话账号「\(email)」"
                 } else {
                     lastQuotaSyncFresh = false
+                    noteQuotaAPIFailure()
                     syncStatusMessage = "已读到账号「\(email)」，但未拿到完整本周额度字段"
                 }
                 save()
@@ -180,6 +224,7 @@ extension SwitchboardStore {
                     lastQuotaMonthlyLimit = newAcc.monthlyLimit
                     lastQuotaSyncAt = Date()
                     lastQuotaSyncFresh = true
+                    noteQuotaAPISuccess()
                     liveRemainingCharacters = newAcc.remainingCharacters
                     liveAccountEmail = email
                     newAcc.notes = "本周额度：已用 \(newAcc.usedCharacters)/\(newAcc.monthlyLimit)，剩余 \(newAcc.remainingCharacters) · 官方同步 \(Self.shortClock(Date()))"
@@ -189,6 +234,7 @@ extension SwitchboardStore {
                     newAcc.notes = "从官方 App 自动导入（本周额度待刷新）"
                     if !localOnly {
                         lastQuotaSyncFresh = false
+                        noteQuotaAPIFailure()
                     }
                 }
                 if res.error == nil {

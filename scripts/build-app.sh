@@ -46,7 +46,12 @@ if [[ -z "${SDKROOT:-}" && ! -d "/Applications/Xcode.app" ]]; then
   done
 fi
 
-swift build -c release
+# `--disable-sandbox`：SwiftPM 默认用 sandbox-exec 编译 Package.swift 的 manifest，
+# 而在本机（以及部分受限 shell / Agent 环境）里 sandbox-exec 会直接失败：
+#   sandbox-exec: sandbox_apply: Operation not permitted
+# 这不是代码问题，是构建环境不允许再套一层沙箱。加这个 flag 只是让 SwiftPM
+# 别自建沙箱，不影响产物。
+swift build -c release --disable-sandbox
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE_ROOT"

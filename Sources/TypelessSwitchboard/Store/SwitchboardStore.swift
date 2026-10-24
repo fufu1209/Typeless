@@ -41,6 +41,31 @@ final class SwitchboardStore: ObservableObject {
     /// 当前官方账号剩余字数（菜单栏展示用）。
     @Published var liveRemainingCharacters: Int?
     @Published var liveAccountEmail = ""
+
+    // MARK: - 额度 API 降级（v2.6.7）
+    //
+    // 背景：Typeless 服务端 2026-10-14 起对 `/user/usage_stats` 上线 JA3/TLS 指纹白名单
+    // （HTTP 418 / code 101010100 / ja3_tls_code），Node 与 Chromium 的握手指纹都不在
+    // 名单内，整条额度读取链路失效。
+    //
+    // 而 `performAutoRotateCheck` 的旧逻辑是「API 不新鲜就跳过换号决策」——
+    // 这在 API **偶尔**抖动时是对的（避免陈旧数字误触发），但 API **持续**失效时
+    // 会让自动换号永久停摆：本机实测从 2026-10-14 停到 10-24，3182 条
+    // 「跳过换号决策」，用户额度用完也只能手动点「智能换号」。
+    //
+    // 现在区分两种情形：偶发失败继续保守跳过；**连续失败达到阈值**就降级到
+    // 本地缓存估算驱动换号，并在 UI 上明确标注「估算模式」，不再静默停摆。
+    //
+    // ⚠️ 降级模式的口径必须比正常模式**保守**：本地 `remainingCharacters` 是上次
+    // 成功同步（本机为 10-14）的快照，此后的真实消耗没有记录 ⇒ 本地值会**高估**
+    // 剩余。所以降级时把换号阈值按 `quotaDegradedThresholdMultiplier` 放大，
+    // 宁可早换，不可该换不换。
+    /// 官方额度 API 连续失败次数（成功即归零）。
+    @Published var quotaAPIConsecutiveFailures = 0
+    /// 是否已进入「本地估算」降级模式。
+    @Published var isQuotaAPIDegraded = false
+    /// 最近一次进入 / 退出降级模式的说明（UI 展示）。
+    @Published var quotaDegradedReason = ""
     /// 开机自启 LaunchAgent 状态摘要（侧栏展示）。
     @Published var launchAgentStatusMessage = ""
 

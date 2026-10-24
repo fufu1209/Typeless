@@ -19,6 +19,7 @@ struct RegistrationTabView: View {
     @State private var isLoadingEmails = false
     @State private var isGeneratingEmail = false
     @State private var isCreatingRegistration = false
+    @State private var isRegistering = false
     @State private var isLoadingMessages = false
     @State private var generatedName = "typeless"
     @State private var generatedDomain = ""
@@ -224,6 +225,58 @@ struct RegistrationTabView: View {
             .controlSize(.small)
             .disabled(isCreatingRegistration || generatedDomain.isEmpty)
 
+            // MARK: 一键注册（v2.6.7 修）
+            //
+            // 用户报障：「点击打开注册页之后，它没有自动去注册相关的账号」。
+            //
+            // 根因：上面这个「创建注册候选账号」只走完整链路的第 4 步 ——
+            // `createMoeMailRegistrationCandidate` 建好候选账号就返回了，
+            // 后面 8 步（准备 Node/npm/Playwright、清理旧会话、生成注册脚本、
+            // 启动 Playwright、轮询 MoeMail 验证码、写桥接文件、等浏览器结果、
+            // 固化静默会话缓存）一步都没走。而 `runPlaywrightScript` 全仓库只有
+            // 「自动换号补充」和守护两处调用，UI 上没有任何入口。
+            //
+            // 现在补上真正的入口：热备模式（preserveCurrentAccount: true）
+            // 注册，**不切换用户当前正在用的账号**，只往池子里加新号。
+            Button {
+                guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    store.statusMessage = "请先填写 MoeMail API Key 再注册"
+                    return
+                }
+                isRegistering = true
+                Task {
+                    _ = await store.runOneClickAutomaticReplacement(
+                        apiKey: apiKey,
+                        domain: generatedDomain,
+                        expiryTime: generatedExpiry,
+                        from: nil,
+                        preserveCurrentAccount: true,
+                        interactive: true
+                    )
+                    isRegistering = false
+                }
+            } label: {
+                Label(
+                    isRegistering ? "正在自动注册…" : "一键注册新账号（全自动）",
+                    systemImage: "bolt.circle"
+                )
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .disabled(isRegistering || isCreatingRegistration || generatedDomain.isEmpty)
+            .help("自动完成：生成邮箱 → 写强密码到钥匙串 → Playwright 打开并填写注册页 → 自动收取验证码 → 固化静默会话。不会打断你当前正在用的账号。")
+
+            if store.isRunningAutomaticReplacement {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(store.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+
             Divider()
 
             Button {
@@ -301,7 +354,7 @@ struct RegistrationTabView: View {
     }
 
     private var footnote3: String {
-        "「创建注册候选账号」会用随机档案生成邮箱、写入钥匙串强密码，并把账号放进兜底确认队列等待注册核验。"
+        "「创建注册候选账号」只把账号资料放进池子；「一键注册新账号」才会真正跑完整自动注册流程（Playwright 填表 + 自动收验证码 + 固化静默会话）。"
     }
 
 }

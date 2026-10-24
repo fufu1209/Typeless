@@ -138,27 +138,57 @@ extension SwitchboardStore {
         }
 
         liveAccountEmail = state.accounts[currentIndex].email
-        // 本周额度 API 未成功时：只展示缓存，绝不据此自动换号（避免陈旧数字误触发）。
+
+        // 本周额度 API 未成功时的处置。
+        //
+        // v2.6.7 起区分「偶发失败」与「持续失效」，不再一律跳过换号决策：
+        //
+        //   偶发失败（数据还不太陈旧）→ 继续保守跳过。一两次网络抖动就换号，
+        //     等于用陈旧数字做决策，正是 v2.6.0 要避免的。
+        //
+        //   持续失效（距上次成功同步 ≥ 10 分钟）→ 降级用**本地缓存估算**继续决策。
+        //     旧逻辑在这里 `return`，而 API 一旦长期不可用，自动换号就永久停摆：
+        //     本机实测 2026-10-14 起 Typeless 服务端对 /user/usage_stats 上线
+        //     JA3/TLS 指纹白名单（HTTP 418 / ja3_tls_code），到 10-24 已停摆 11 天、
+        //     3182 条「跳过换号决策」，用户额度用完只能手动点「智能换号」。
+        //
+        //     判据用**时间**而非失败次数：守护是 launchd 拉起的单次进程
+        //     （--daemon-check 跑完就退），内存计数每次重启归零，永远攒不到阈值；
+        //     而 lastQuotaSyncAt 是持久化字段，天然跨进程累积。
+        //
+        // ⚠️ 降级口径必须保守：本地 remaining 是上次成功同步的快照，此后的真实
+        //    消耗没有记录 ⇒ 会**高估**剩余。所以阈值按 quotaDegradedThresholdMultiplier
+        //    放大，宁可早换，不可该换不换。
+        var degradedEstimate = false
         if !lastQuotaSyncFresh {
-            // v2.6.0：把「客户端指纹失效」和「网络抖动」分开报。
-            // 前者重试一万次也不会好，必须让人看见，而不是混在「跳过换号决策」里被忽略
-            // —— Typeless 2.4.0 → 2.7.0 就是这么让自动换号静默停摆两周的：
-            // 日志每分钟一行「跳过换号决策」，看起来一切正常。
+            // 客户端指纹被拒是「本地无解、必须升级 App」的状态，与网络问题分开报，
+            // 不能靠降级掩盖 —— 降级只会让用户以为还在自动保护中。
             if lastSyncHitClientNotSupported {
                 lastAutoRotateDecisionReason = "Typeless 已拒绝本客户端（客户端指纹过期），自动换号停摆：请升级 Typeless Switchboard"
                 autoRotateMonitorStatus = "⚠️ 自动换号已停摆：Typeless 拒绝本客户端指纹，需要新版本 App 适配"
+                return currentID
+            }
+            if isQuotaDataStaleBeyondDegradeThreshold {
+                degradedEstimate = true
+                isQuotaAPIDegraded = true
+                let staleMinutes = lastQuotaSyncAt.map { Int(Date().timeIntervalSince($0) / 60) } ?? -1
+                quotaDegradedReason = "官方额度 API 已 \(staleMinutes) 分钟未返回新鲜数值，降级用本地缓存估算驱动换号（阈值已放大）"
+                lastAutoRotateDecisionReason = quotaDegradedReason
             } else {
                 lastAutoRotateDecisionReason = "本周额度 API 未刷新成功，跳过换号决策（避免陈旧数字）"
                 autoRotateMonitorStatus = "巡检完成：\(weeklyQuotaSummaryLine)；本轮不换号"
+                return currentID
             }
-            return currentID
         }
 
         let remaining = state.accounts[currentIndex].remainingCharacters
         lastKnownRemainingForInterval = remaining
         liveRemainingCharacters = remaining
 
-        let threshold = SmartSwitchPolicy.normalizeThreshold(state.settings.autoRotateRemainingThreshold)
+        let baseThreshold = SmartSwitchPolicy.normalizeThreshold(state.settings.autoRotateRemainingThreshold)
+        let threshold = degradedEstimate
+            ? max(baseThreshold * SwitchboardStore.quotaDegradedThresholdMultiplier, baseThreshold)
+            : baseThreshold
         let candidates = smartSwitchCandidates(excluding: currentID)
         let decision = SmartSwitchPolicy.decide(
             currentRemaining: remaining,
@@ -176,6 +206,7 @@ extension SwitchboardStore {
             // 额度 ≥ 阈值：只监控、不换号；同时后台补热备，保证真到阈值时能秒切。
             autoRotateMonitorStatus = SmartSwitchPolicy.monitorIdleStatus(remaining: remaining, threshold: threshold)
                 + " · \(weeklyQuotaSummaryLine)"
+                + (degradedEstimate ? " · ⚠️ 估算模式（官方额度 API 不可用，阈值为正常 \(SwitchboardStore.quotaDegradedThresholdMultiplier) 倍）" : "")
             if allowCreate {
                 await ensureHotSpareIfNeeded(apiKey: key, domain: domain)
             }

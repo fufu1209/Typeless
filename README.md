@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.6.6-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.7-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -98,10 +98,16 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.6.6**（2026-09-30）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.6.7**（2026-10-25）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-最近的主要变化：**会话复活**（Token 过期的账号一键恢复可用，不必重新注册）、
-适配 **Typeless 2.8.1** 的新签名协议（密钥按形状从 App 现场提取，跨版本不再硬编码）、
+最近的主要变化：**注册页点了终于真的会注册**（v2.6.7 —— 原来的「创建注册候选账号」
+只建资料不跑流程，全仓库没有 UI 入口能调到 Playwright；现在补上「一键注册新账号」，
+走完整 12 步链路、热备模式不打断你正在用的号）、
+**额度接口失效后自动换号不再停摆**（v2.6.7 —— Typeless 服务端 10-14 起对
+`/user/usage_stats` 上线 JA3/TLS 指纹白名单，HTTP 418；连续失败达阈值即降级用
+本地缓存估算驱动换号，阈值放大 3 倍并在界面标注「估算模式」）、
+**会话复活**（Token 过期的账号一键恢复可用，不必重新注册）、
+适配 **Typeless 2.8.x** 的新签名协议（密钥按形状从 App 现场提取，跨版本不再硬编码）、
 额度口径改为**每周 2000 字**并重算换号阈值（默认 120）、周期口径改为**实测观测**（不再靠猜）、
 界面「可用账号 / 剩余额度」口径与选号逻辑对齐（v2.6.4）、
 **GUI 落盘不再还原维护脚本的成果**（v2.6.5，见下方「账号池运维脚本」）、

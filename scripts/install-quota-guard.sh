@@ -5,7 +5,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
-APP_BIN="$ROOT/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard"
+# 默认用仓库目录里的 .app；装到 /Applications 后用 TYPELESS_SWITCHBOARD_APP_BIN 指过去。
+# （v2.6.7：本机 App 实际装在 /Applications/TypelessSwitchboard.app，
+#  仓库目录里没有 .app，脚本原先会因此触发一次多余的打包。）
+APP_BIN="${TYPELESS_SWITCHBOARD_APP_BIN:-$ROOT/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard}"
 LABEL="local.typeless.switchboard.quota-guard"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 LOG_DIR="$HOME/Library/Application Support/TypelessSwitchboard/Logs"

@@ -177,6 +177,23 @@ struct PersistedState: Codable, Equatable, Sendable {
     /// 重启后还没验证过新鲜度，落盘一个 `true` 就是谎报。
     var lastQuotaSyncAt: Date?
 
+    /// 最近一次**自动注册尝试**（自治路径：额度巡检里的补热备 / 降级注册）的时刻。
+    ///
+    /// v2.6.9 新增，配 `autoRegistrationConsecutiveFailures` 做指数退避。
+    /// 没有它之前，注册失败后守护会**每分钟重试一次全自动注册**：每轮都新建一个
+    /// MoeMail 地址、跑一遍 Playwright —— 一天 1440 个废地址和 1440 次浏览器会话。
+    /// 用户明确要求过「别过度占用资源」，这就是最直接的一处违规。
+    ///
+    /// 可选类型：旧 store.json 缺这个键 → nil，不挡解码。
+    var lastAutoRegistrationAttemptAt: Date?
+
+    /// 自动注册**连续失败**次数。成功一次即归零。
+    ///
+    /// 退避时长 = min(5 × 2^(n−1), 60) 分钟：5 → 10 → 20 → 40 → 60 封顶。
+    /// 瞬时故障 5 分钟后就恢复重试；持续故障（MoeMail 挂 / Typeless 拒绝注册）
+    /// 最多一小时一次，绝不会把资源烧成火焰山。
+    var autoRegistrationConsecutiveFailures: Int?
+
     static let empty = PersistedState(
         accounts: [],
         settings: .defaults,
@@ -186,7 +203,9 @@ struct PersistedState: Codable, Equatable, Sendable {
         deviceReport: nil,
         lastAutomationResult: nil,
         appliedMigrations: [],
-        lastQuotaSyncAt: nil
+        lastQuotaSyncAt: nil,
+        lastAutoRegistrationAttemptAt: nil,
+        autoRegistrationConsecutiveFailures: nil
     )
 }
 

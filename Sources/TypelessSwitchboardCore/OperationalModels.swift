@@ -1774,6 +1774,40 @@ public enum SmartSwitchPolicy {
         silentReadyCount(in: candidates) < max(target, 0)
     }
 
+    /// 自动注册退避时长（秒）。`consecutiveFailures <= 0` 或没有尝试记录 → 0（不退避）。
+    ///
+    /// v2.6.9 新增。背景：注册失败后旧逻辑没有任何退避，守护**每分钟重试一次**
+    /// 全自动注册 —— 每轮新建一个 MoeMail 地址、跑一遍 Playwright，一天 1440 个
+    /// 废地址 + 1440 次浏览器会话。用户明确要求过「别过度占用资源」。
+    ///
+    /// 退避曲线：5 → 10 → 20 → 40 → 60 分钟封顶（`2^(n−1) × 5`）。
+    /// 瞬时故障 5 分钟后就恢复重试；持续故障最多一小时一次。
+    public static func registrationCooldownSeconds(
+        consecutiveFailures: Int,
+        lastAttemptAt: Date?,
+        now: Date = Date()
+    ) -> TimeInterval {
+        let failures = max(consecutiveFailures, 0)
+        guard failures > 0, let last = lastAttemptAt else { return 0 }
+        let minutes = min(5.0 * pow(2.0, Double(failures - 1)), 60.0)
+        return max(0, minutes * 60 - now.timeIntervalSince(last))
+    }
+
+    /// 退避中的状态文案（含剩余分钟数）；不在退避期返回空串。
+    public static func registrationCooldownStatus(
+        consecutiveFailures: Int,
+        lastAttemptAt: Date?,
+        now: Date = Date()
+    ) -> String {
+        let remaining = registrationCooldownSeconds(
+            consecutiveFailures: consecutiveFailures,
+            lastAttemptAt: lastAttemptAt,
+            now: now
+        )
+        guard remaining > 0 else { return "" }
+        return "自动注册连续失败 \(max(consecutiveFailures, 0)) 次，退避中（约 \(Int(remaining / 60) + 1) 分钟后重试）"
+    }
+
     /// - Parameters:
     ///   - forceSwitch: 用户主动点换号时为 true，忽略“额度仍充足”。
     ///   - allowFullAutomaticReplacement: 监测场景在无 API Key / 关闭自动创建时可关掉全自动注册。
@@ -1803,7 +1837,21 @@ public enum SmartSwitchPolicy {
                 return $0.remainingCharacters > $1.remainingCharacters
             }
 
-        if let best = silentReady.first {
+        // v2.6.9：**自治**切换只切到能越过阈值的备用号。
+        //
+        // 旧逻辑是「有就切」：当前号剩 90、备用号剩 100 也切。问题是一次切换并不免费 ——
+        // 要轮换设备身份、重写桌面会话、等桌面端读盘（热启动 5～10 秒，冷启动实测到过
+        // 120 秒），期间用户正在听写。为一个「同样低于阈值」的目标付这些代价，
+        // 只是把问题搬了个家，还会把原账号标记成 exhausted 白烧额度。
+        //
+        // 整个池都探不过阈值时，正确动作是**注册一个新号**（fullAutomaticReplacement），
+        // 而不是在死账号之间搬运。手动换号（forceSwitch）保持原语义：用户显式要求切换，
+        // 「有个能用的」比「没有」好，由用户自己承担代价。
+        let switchTarget = forceSwitch
+            ? silentReady.first
+            : silentReady.first(where: { $0.remainingCharacters >= normalizedThreshold })
+
+        if let best = switchTarget {
             return SmartSwitchDecision(
                 path: .silentPoolSwitch,
                 targetAccountID: best.id,
@@ -1821,7 +1869,9 @@ public enum SmartSwitchPolicy {
                 targetEmail: nil,
                 reason: forceSwitch
                     ? "账号池没有可静默注入的会话，执行全自动注册换号"
-                    : "额度偏低且没有可静默注入的备用号，自动创建并切换新账号"
+                    : (!silentReady.isEmpty
+                        ? "池内可注入备用号剩余额度都低于阈值 \(normalizedThreshold)，切换无收益，自动创建并切换新账号"
+                        : "额度偏低且没有可静默注入的备用号，自动创建并切换新账号")
             )
         }
 
@@ -1832,6 +1882,17 @@ public enum SmartSwitchPolicy {
                 targetAccountID: nil,
                 targetEmail: nil,
                 reason: "池中有 \(usableWithoutPayload.count) 个可用账号但缺少桌面会话缓存；请先「同步官方 App 登录与额度」，或开启自动创建新号"
+            )
+        }
+
+        // v2.6.9：有备用号但都探不过阈值、又不允许自动注册时，说清楚「为什么不切」。
+        // 旧逻辑在这里会静默换成其中最满的那个，用户看到的就是「搞来搞去却越来越没额度」。
+        if !silentReady.isEmpty {
+            return SmartSwitchDecision(
+                path: .none,
+                targetAccountID: nil,
+                targetEmail: nil,
+                reason: "池内 \(silentReady.count) 个可注入备用号剩余额度都低于阈值 \(normalizedThreshold)（最高 \(silentReady[0].remainingCharacters)），切换无收益；可开启自动创建新号，或手动「智能换号」强制切换"
             )
         }
 

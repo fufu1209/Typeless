@@ -1637,6 +1637,66 @@ struct OperationalFeatureChecks {
         )
         check(forced.path == .silentPoolSwitch, "decide: forceSwitch=true 跳过额度判定，直接走静默池")
 
+        // v2.6.9：自治切换只切到能越过阈值的备用号（切换有代价，不搬问题）
+        let belowThresholdCandidates = [
+            SmartSwitchCandidate(id: UUID(), email: "low@x.com", remainingCharacters: 150, hasSilentSessionPayload: true),
+            SmartSwitchCandidate(id: UUID(), email: "lower@x.com", remainingCharacters: 100, hasSilentSessionPayload: true)
+        ]
+        let belowThresholdAuto = SmartSwitchPolicy.decide(
+            currentRemaining: 90, threshold: 200, forceSwitch: false,
+            candidates: belowThresholdCandidates,
+            allowFullAutomaticReplacement: true
+        )
+        check(belowThresholdAuto.path == .fullAutomaticReplacement,
+              "decide: 自治 + 备用号都低于阈值 + 允许全自动 → .fullAutomaticReplacement（不在死号之间搬运）")
+        check(belowThresholdAuto.reason.contains("低于阈值"),
+              "decide: 全自动理由说明为什么不走静默池：\(belowThresholdAuto.reason)")
+
+        let belowThresholdBlocked = SmartSwitchPolicy.decide(
+            currentRemaining: 90, threshold: 200, forceSwitch: false,
+            candidates: belowThresholdCandidates,
+            allowFullAutomaticReplacement: false
+        )
+        check(belowThresholdBlocked.path == .none,
+              "decide: 自治 + 备用号都低于阈值 + 不允许全自动 → .none（不白烧账号）")
+        check(belowThresholdBlocked.reason.contains("切换无收益"),
+              "decide:  blocked 理由必须解释为什么不切：\(belowThresholdBlocked.reason)")
+
+        // v2.6.9：手动换号保持原语义 —— 用户显式要求，有个能用的就切
+        let belowThresholdForced = SmartSwitchPolicy.decide(
+            currentRemaining: 90, threshold: 200, forceSwitch: true,
+            candidates: belowThresholdCandidates,
+            allowFullAutomaticReplacement: false
+        )
+        check(belowThresholdForced.path == .silentPoolSwitch,
+              "decide: forceSwitch=true + 备用号低于阈值 → 仍走静默池（用户显式要求）")
+        check(belowThresholdForced.targetEmail == "low@x.com",
+              "decide: forceSwitch 选剩余最多的那个（150 > 100）")
+
+        // v2.6.9：自动注册退避曲线（5 → 10 → 20 → 40 → 60 分钟封顶）
+        let now = Date()
+        check(SmartSwitchPolicy.registrationCooldownSeconds(consecutiveFailures: 0, lastAttemptAt: now, now: now) == 0,
+              "退避: 0 次失败 → 不退避")
+        check(SmartSwitchPolicy.registrationCooldownSeconds(consecutiveFailures: 3, lastAttemptAt: nil, now: now) == 0,
+              "退避: 没有尝试记录 → 不退避")
+        check(abs(SmartSwitchPolicy.registrationCooldownSeconds(consecutiveFailures: 1, lastAttemptAt: now, now: now) - 300) < 1,
+              "退避: 第 1 次失败 → 5 分钟")
+        check(abs(SmartSwitchPolicy.registrationCooldownSeconds(consecutiveFailures: 2, lastAttemptAt: now, now: now) - 600) < 1,
+              "退避: 第 2 次失败 → 10 分钟")
+        check(abs(SmartSwitchPolicy.registrationCooldownSeconds(consecutiveFailures: 3, lastAttemptAt: now, now: now) - 1200) < 1,
+              "退避: 第 3 次失败 → 20 分钟")
+        check(abs(SmartSwitchPolicy.registrationCooldownSeconds(consecutiveFailures: 4, lastAttemptAt: now, now: now) - 2400) < 1,
+              "退避: 第 4 次失败 → 40 分钟")
+        check(abs(SmartSwitchPolicy.registrationCooldownSeconds(consecutiveFailures: 10, lastAttemptAt: now, now: now) - 3600) < 1,
+              "退避: 第 10 次失败 → 60 分钟封顶")
+        let sixMinutesAgo = now.addingTimeInterval(-6 * 60)
+        check(SmartSwitchPolicy.registrationCooldownSeconds(consecutiveFailures: 1, lastAttemptAt: sixMinutesAgo, now: now) == 0,
+              "退避: 超过 5 分钟 → 已冷却完毕，放行")
+        check(SmartSwitchPolicy.registrationCooldownStatus(consecutiveFailures: 0, lastAttemptAt: now, now: now).isEmpty,
+              "退避: 不在退避期 → 状态文案为空")
+        check(SmartSwitchPolicy.registrationCooldownStatus(consecutiveFailures: 2, lastAttemptAt: now, now: now).contains("退避中"),
+              "退避: 退避期 → 状态文案说明原因与剩余时间")
+
         // 设备用户数超限识别（各种文案变体 + 缺空格变体）
         check(SmartSwitchPolicy.isDeviceUserLimitError("The number of users logged into this device has exceeded the limit"),
               "isDeviceUserLimitError: 完整英文文案")

@@ -399,9 +399,13 @@ extension SwitchboardStore {
         }
 
         let resultID = await performAutoRotateCheck(apiKey: apiKey.isEmpty ? nil : apiKey)
-        // 额度充足且本周数字新鲜时才补热备。
+        // 额度充足且本周数字新鲜时才补热备（v2.6.9：尊重注册退避）。
         if lastQuotaSyncFresh, !apiKey.isEmpty, state.settings.autoCreateWhenPoolEmpty {
-            await ensureHotSpareIfNeeded(apiKey: apiKey, domain: state.settings.domains.first ?? "")
+            await ensureHotSpareIfNeeded(
+                apiKey: apiKey,
+                domain: state.settings.domains.first ?? "",
+                respectCooldown: true
+            )
         }
 
         // v2.6.2：**守护不再改写 launchd 任务**。
@@ -528,6 +532,43 @@ extension SwitchboardStore {
         case .daemonOnce, .cliAutoSwitch:
             return DaemonSecretStore.readAccountPassword(accountID: accountID)
         }
+    }
+
+    // MARK: - 自动注册退避（v2.6.9）
+
+    /// 自治路径（额度巡检里的补热备 / 降级注册）调用全自动注册前的冷却剩余秒数；0 = 可以立即尝试。
+    ///
+    /// 为什么需要：注册失败后旧逻辑没有任何退避，守护**每分钟重试一次**全自动注册 ——
+    /// 每轮新建一个 MoeMail 地址、跑一遍 Playwright，一天就是 1440 个废地址 +
+    /// 1440 次浏览器会话。用户明确要求过「别过度占用资源」。
+    /// 算法在 Core（`SmartSwitchPolicy.registrationCooldownSeconds`），可被测试直接覆盖。
+    func autoRegistrationCooldownRemainingSeconds(now: Date = Date()) -> TimeInterval {
+        SmartSwitchPolicy.registrationCooldownSeconds(
+            consecutiveFailures: state.autoRegistrationConsecutiveFailures ?? 0,
+            lastAttemptAt: state.lastAutoRegistrationAttemptAt,
+            now: now
+        )
+    }
+
+    var isAutoRegistrationCoolingDown: Bool {
+        autoRegistrationCooldownRemainingSeconds() > 0
+    }
+
+    /// 冷却中的状态文案（含剩余分钟数），供 UI / 日志用。
+    var autoRegistrationCooldownStatus: String {
+        SmartSwitchPolicy.registrationCooldownStatus(
+            consecutiveFailures: state.autoRegistrationConsecutiveFailures ?? 0,
+            lastAttemptAt: state.lastAutoRegistrationAttemptAt
+        )
+    }
+
+    /// 记录一次自动注册尝试的结果：成功归零，失败累加（推进退避）。
+    func noteAutoRegistrationAttempt(success: Bool, now: Date = Date()) {
+        state.lastAutoRegistrationAttemptAt = now
+        state.autoRegistrationConsecutiveFailures = success
+            ? 0
+            : (state.autoRegistrationConsecutiveFailures ?? 0) + 1
+        save()
     }
 
     /// 启动守护看门狗：到点未退出就记日志并 `exit`，绝不让 launchd job 卡死。

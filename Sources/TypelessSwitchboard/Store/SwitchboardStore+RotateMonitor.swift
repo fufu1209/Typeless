@@ -117,6 +117,13 @@ extension SwitchboardStore {
                 autoRotateMonitorStatus = "巡检完成：设备超限但其它换号进行中"
                 return nil
             }
+            // v2.6.9：设备超限的重置+注册同样受退避约束 —— 这条路径失败时
+            // （MoeMail 不可用、注册被拒）旧逻辑会每分钟重烧一次地址。
+            if isAutoRegistrationCoolingDown {
+                let hint = autoRegistrationCooldownStatus
+                autoRotateMonitorStatus = "巡检完成：设备超限待重置 · \(hint)"
+                return nil
+            }
             autoRotateMonitorStatus = "设备用户数超限，自动重置设备并注册中…"
             isRunningSmartSwitch = true
             defer { isRunningSmartSwitch = false }
@@ -126,6 +133,7 @@ extension SwitchboardStore {
                 expiryTime: 0,
                 from: syncedID
             )
+            noteAutoRegistrationAttempt(success: newID != nil)
             autoRotateMonitorStatus = newID != nil ? "守护中：已因设备超限完成重置换号" : "巡检完成：设备超限后的自动注册失败"
             return newID
         }
@@ -211,7 +219,7 @@ extension SwitchboardStore {
                 + " · \(weeklyQuotaSummaryLine)"
                 + (degradedEstimate ? " · ⚠️ 估算模式（官方额度 API 不可用，阈值为正常 \(SwitchboardStore.quotaDegradedThresholdMultiplier) 倍）" : "")
             if allowCreate {
-                await ensureHotSpareIfNeeded(apiKey: key, domain: domain)
+                await ensureHotSpareIfNeeded(apiKey: key, domain: domain, respectCooldown: true)
             }
 
         case .silentPoolSwitch:
@@ -234,9 +242,17 @@ extension SwitchboardStore {
                 autoRotateMonitorStatus = "守护中：已静默切换并轮换设备身份，继续监测"
                 resultID = targetID
                 if allowCreate {
-                    await ensureHotSpareIfNeeded(apiKey: key, domain: domain)
+                    await ensureHotSpareIfNeeded(apiKey: key, domain: domain, respectCooldown: true)
                 }
             } else if allowCreate {
+                // v2.6.9：注册退避。失败后不立刻重试，否则守护每分钟烧一个
+                // MoeMail 地址 + 一轮 Playwright（用户明确要求别过度占资源）。
+                if isAutoRegistrationCoolingDown {
+                    let hint = autoRegistrationCooldownStatus
+                    statusMessage = "静默切换失败（\(lastSilentSwitchFailureReason.ifEmpty("未知原因"))）；\(hint)"
+                    autoRotateMonitorStatus = "巡检完成：静默切换失败 · \(hint)"
+                    break
+                }
                 autoRotateMonitorStatus = SmartSwitchPolicy.isDeviceUserLimitError(lastSilentSwitchFailureReason)
                     ? "静默命中设备限制，自动注册中…"
                     : "静默失败，自动注册中…"
@@ -248,6 +264,7 @@ extension SwitchboardStore {
                     expiryTime: 0,
                     from: currentID
                 )
+                noteAutoRegistrationAttempt(success: newID != nil)
                 autoRotateMonitorStatus = newID != nil ? "守护中：已注册并切换" : "巡检完成：自动注册失败"
                 resultID = newID ?? currentID
             } else {
@@ -256,6 +273,12 @@ extension SwitchboardStore {
             }
 
         case .fullAutomaticReplacement:
+            // v2.6.9：同上，注册退避。
+            if isAutoRegistrationCoolingDown {
+                let hint = autoRegistrationCooldownStatus
+                autoRotateMonitorStatus = "巡检完成：待自动注册 · \(hint)"
+                break
+            }
             autoRotateMonitorStatus = "剩余 \(remaining) < \(threshold) 且无备用会话，自动注册中…"
             isRunningSmartSwitch = true
             defer { isRunningSmartSwitch = false }
@@ -265,12 +288,13 @@ extension SwitchboardStore {
                 expiryTime: 0,
                 from: currentID
             )
+            noteAutoRegistrationAttempt(success: newID != nil)
             autoRotateMonitorStatus = (newID != nil && newID != currentID)
                 ? "守护中：已注册并切换"
                 : "巡检完成：自动注册未完成"
             resultID = newID ?? currentID
             if allowCreate, newID != nil {
-                await ensureHotSpareIfNeeded(apiKey: key, domain: domain)
+                await ensureHotSpareIfNeeded(apiKey: key, domain: domain, respectCooldown: true)
             }
         }
 
@@ -278,9 +302,17 @@ extension SwitchboardStore {
     }
 
     /// 后台补齐热备：额度充足时静默注册 1 个可注入会话的备用号，不切换当前使用号。
-    func ensureHotSpareIfNeeded(apiKey: String, domain: String) async {
+    ///
+    /// - Parameter respectCooldown: 自治路径（额度巡检）传 true —— 注册失败后退避中
+    ///   就跳过，不重复烧 MoeMail 地址；用户主动发起的路径传 false，立即执行。
+    func ensureHotSpareIfNeeded(
+        apiKey: String,
+        domain: String,
+        respectCooldown: Bool = false
+    ) async {
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard !isRunningAutomaticReplacement else { return }
+        if respectCooldown, isAutoRegistrationCoolingDown { return }
 
         let target = SmartSwitchPolicy.normalizeHotSpareTarget(state.settings.hotSpareTargetCount)
         guard target > 0 else { return }
@@ -300,6 +332,7 @@ extension SwitchboardStore {
             from: nil,
             preserveCurrentAccount: true
         )
+        noteAutoRegistrationAttempt(success: spareID != nil)
         if let spareID, let index = accountIndex(id: spareID) {
             let hasPayload = !(state.accounts[index].rawUserDataPayload?.isEmpty ?? true)
             autoRotateMonitorStatus = hasPayload

@@ -1,6 +1,43 @@
 # 更新记录
 
-当前版本 **v2.7.2**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.7.3**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.7.3（2026-10-25）
+
+换号后桌面端「没登录好」 —— **根治设备重置误删浏览器会话目录**。
+
+### 背景（用户报障「为什么没有登录好啊」）
+
+v2.7.2 部署后，用户发现 Typeless 桌面端显示未登录。排查守护日志时间线：
+
+- 13:33 之前 Typeless 登录着（`clear.line.461126`）；
+- 13:36 v2.7.2 的「额度 API 不可用 → 强制轮换」触发，把会话覆盖成 `prime.pixel.108940` 并重拉；
+- 13:40 起守护再也读不到登录态（"无法读取官方 App 登录态，本轮巡检跳过"）。
+
+**根因**：静默换号的「重置设备身份」步骤（`resetTypelessDeviceIdentityForAutomaticReplacement`）
+在清理 `device.cache` / keychain / `app-storage.json` 的 userData 之外，**还无差别删除了
+`Local Storage` / `Cookies` / `Session Storage` / `Network` 这些 Chromium 浏览器会话目录**。
+而 Typeless 2.8.3 的**真实登录态就挂在那些目录上**。删掉它们、只写回 `user-data.json` 再重拉，
+2.8.3 读不到会话 → 显示为未登录，把本来登录着的账号弄掉线。
+
+**实测验证**：退出 Typeless → 仅注入 `clear.line` 的 `user-data.json`（不重置设备）→ 重拉 →
+2.8.3 原封不动接受会话（`--local-only` 读回 `clear.line.461126@8888891.xyz`，
+`app-storage.json` 被填回 `userData`）。证明注入格式 2.8.3 完全认，坏就坏在设备重置的无差别清理。
+
+### 改动
+
+- **删除误删逻辑**：`SwitchboardStore+DeviceReset.swift` 里清理那四个 Chromium 浏览器会话目录的
+  for 循环已整体移除。设备身份只认 `device.cache` + keychain + `app-storage.json` 的 userData，
+  与浏览器会话目录无关，删它们纯属误伤。
+- 保留 `device.cache` / keychain / `app-storage.json` 的清理 —— 既达成「轮换设备身份避免
+  服务端设备号上限」的目的，又不再破坏登录态。
+
+### 影响
+
+- 静默换号（正常切换 + v2.7.1 强制轮换）之后，桌面端仍能保持登录，不再误退到未登录。
+- 已对用户端执行受控救回：纯注入把 `clear.line` 登录态还原，浏览器会话目录完好。
 
 ---
 

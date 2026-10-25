@@ -79,17 +79,16 @@ extension SwitchboardStore {
                 }
             }
 
-            for subdirectory in ["Local Storage", "Network", "Cookies", "Session Storage"] {
-                let url = dataDirectory.appendingPathComponent(subdirectory, isDirectory: true)
-                if FileManager.default.fileExists(atPath: url.path) {
-                    do {
-                        try FileManager.default.removeItem(at: url)
-                        log.append("已清理 Typeless Electron 残留目录 \(subdirectory)：\(url.path)")
-                    } catch {
-                        log.append("清理 Typeless Electron 残留目录失败 \(subdirectory)：\(error.localizedDescription)")
-                    }
-                }
-            }
+            // v2.7.3：删除「设备身份」时**不再**清理 Local Storage / Cookies /
+            // Session Storage / Network 这些 Chromium 浏览器会话目录。
+            //
+            // 根因（2026-10-25 实测，Typeless 2.8.3）：这几个目录里存放着 Electron 的
+            // 真实登录态。静默换号在「重置设备身份」这一步把它们连同 user-data.json 一起删掉，
+            // 再只写回 user-data.json 并重拉 Typeless —— 结果 2.8.3 读不到会话、显示为未登录，
+            // 把本来登录着的账号弄掉线（守护日志 13:36 的强制轮换即此坑）。
+            // 设备身份只认 device.cache + keychain + app-storage 的 userData，与浏览器会话目录无关，
+            // 删它们纯属误伤。去掉之后，轮换设备身份（避免服务端设备号上限）与「换号后仍能登录」
+            // 两者才能兼得。
         }
 
         if log.isEmpty {

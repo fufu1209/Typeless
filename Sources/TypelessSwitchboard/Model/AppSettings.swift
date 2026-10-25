@@ -177,6 +177,22 @@ struct PersistedState: Codable, Equatable, Sendable {
     /// 重启后还没验证过新鲜度，落盘一个 `true` 就是谎报。
     var lastQuotaSyncAt: Date?
 
+    /// 最近一次**因额度 API 不可用而强制轮换**（降级模式：池内静默换到新鲜号）的时刻。
+    ///
+    /// v2.7.1 新增。背景：Typeless 在 2026-10-14 起对 `/user/usage_stats` 上线
+    /// Cloudflare 指纹白名单（HTTP 418 / ja3_tls_code），Node / curl_cffi / Playwright
+    /// 等**所有外部客户端**都被拦，只有 Typeless 官方 App 自己的浏览器上下文能过。
+    /// 官方 App 又不把周额度落盘、二进制启动器还拒绝 `--remote-debugging-port`，
+    /// 所以「外部主动读额度」这条路彻底走不通（`quotaFresh` 永远为 false）。
+    ///
+    /// 老逻辑在「额度陈旧」时仍用**最后一次成功同步的冻结剩余值**做决策，这个值不会
+    /// 递减 ⇒ 永远 ≥ 阈值 ⇒ 永不换号，用户额度用完只能手动点「智能换号」。
+    ///
+    /// 新逻辑：额度 API 持续不可用时，不再迷信冻结值，而是周期性轮换到池内一个
+    /// 新鲜号（与手动「智能换号」等价），保证用户**永远不会卡在已耗尽的号上**。
+    /// 用持久化时刻做退避，避免守护每分钟烧一轮（用户明确要求别过度占资源）。
+    var lastForcedRotationAt: Date?
+
     /// 最近一次**自动注册尝试**（自治路径：额度巡检里的补热备 / 降级注册）的时刻。
     ///
     /// v2.6.9 新增，配 `autoRegistrationConsecutiveFailures` 做指数退避。
@@ -204,6 +220,7 @@ struct PersistedState: Codable, Equatable, Sendable {
         lastAutomationResult: nil,
         appliedMigrations: [],
         lastQuotaSyncAt: nil,
+        lastForcedRotationAt: nil,
         lastAutoRegistrationAttemptAt: nil,
         autoRegistrationConsecutiveFailures: nil
     )

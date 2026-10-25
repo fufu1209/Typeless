@@ -1,6 +1,44 @@
 # 更新记录
 
-当前版本 **v2.7.0**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.7.1**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.7.1（2026-10-25）
+
+额度耗尽不自动切换 —— **根因定位 + 降级模式兜底修复**。
+
+### 根因（实测，已闭环）
+
+Typeless 在 2026-10-14 起给 `/user/usage_stats` 上线 Cloudflare 指纹白名单
+（HTTP 418 / `ja3_tls_code: 101010100`）。实测确认**所有外部客户端都被拦**：
+
+- Node `https` 直连 → 418；
+- `curl_cffi`（`impersonate='chrome'`，browserleaks 验证 JA3 是合法 Chrome，且能过
+  cloudflare.com）→ 仍 418；
+- Playwright 真 Chromium（注册链路能过 Cloudflare）→ 在该敏感路由被 bot 检测，仍 418；
+- 官方 App 自己的浏览器上下文能过，但**不把周额度落盘**，且**二进制启动器拒绝
+  `--remote-debugging-port` 等 Chrome 旗标** ⇒ 无法从外部或本地缓存读额度。
+
+后果：守护每次同步都拿不到新鲜额度 ⇒ `lastQuotaSyncAt` 永远不更新 ⇒ 一直停在
+降级分支；而降级分支用「最后一次成功同步的冻结 remaining」做决策，冻结值不递减 ⇒
+永远 ≥ 阈值 ⇒ 永不换号，用户额度用完只能手动点「智能换号」。
+
+### 修复
+
+- **降级模式不再冻结**：额度 API 长期不可用（现在已是常态）时，若池内有「可静默注入会话」
+  的新鲜号且距上次强制轮换已超过冷却（默认 90 分钟），则轮换过去（与手动「智能换号」等价），
+  保证用户**永远不会卡在已耗尽的号上**。冷却避免守护每分钟烧一轮（用户明确要求别过度占资源）。
+- 新增持久化字段 `lastForcedRotationAt` 做退避，向后兼容（旧 store.json 缺该键 → nil）。
+- `extract-active-session.js` 新增 `--emit-headers` 模式（只做会话解密 + 签名头输出，不发包），
+  为将来接 JA3 仿真传输层预留接口。
+
+### 仍待确认（非阻断）
+
+精确「额度耗尽即换」目前无法靠外部读取实现（被 Cloudflare 堵死）。若要恢复精确触发，
+可行路径是**读官方 App 屏幕上显示的周额度**（App 自身是可信源，已在显示给用户看），
+即由 Switchboard 用 Accessibility 抓取 App 窗口里的「剩余 X / 已用 Y」，作为额度来源接入
+`syncActiveAppSessionAndQuota`。该路径需要结合正在运行的 App UI 验证，列为下一步。
 
 ---
 

@@ -201,13 +201,23 @@ extension SwitchboardStore {
             ? max(baseThreshold * SwitchboardStore.quotaDegradedThresholdMultiplier, baseThreshold)
             : baseThreshold
         let candidates = smartSwitchCandidates(excluding: currentID)
-        let decision = SmartSwitchPolicy.decide(
-            currentRemaining: remaining,
-            threshold: threshold,
-            forceSwitch: false,
-            candidates: candidates,
-            allowFullAutomaticReplacement: allowCreate
-        )
+
+        // v2.7.1：降级模式（额度 API 长期不可用，现在是常态）下，冻结的 remaining 永远 ≥ 阈值，
+        // 常规 decide 必走 .none。改为：池内有新鲜备用号且冷却已过，则强制轮换过去，
+        // 让用户不卡在已耗尽号上（与手动「智能换号」等价）。
+        var decision: SmartSwitchDecision
+        if degradedEstimate, let forced = makeForcedRotationDecision(candidates: candidates) {
+            decision = forced
+            lastAutoRotateDecisionReason = forced.reason
+        } else {
+            decision = SmartSwitchPolicy.decide(
+                currentRemaining: remaining,
+                threshold: threshold,
+                forceSwitch: false,
+                candidates: candidates,
+                allowFullAutomaticReplacement: allowCreate
+            )
+        }
         lastAutoRotateDecisionReason = decision.reason
 
         var resultID: UUID? = currentID
@@ -452,7 +462,37 @@ extension SwitchboardStore {
         }
     }
 
-    @discardableResult
+    /// 降级模式下「额度 API 长期不可用」时的强制轮换决策。
+    ///
+    /// 背景：Typeless 给 `/user/usage_stats` 上了 Cloudflare 指纹白名单，Node / curl_cffi /
+    /// Playwright 等**所有外部客户端**都被拦（HTTP 418 / ja3_tls_code），只有官方 App 自己的
+    /// 浏览器上下文能过；而官方 App 不落盘周额度、二进制启动器还拒绝 `--remote-debugging-port`，
+    /// 所以「外部主动读额度」这条路彻底走不通 —— `quotaFresh` 永远为 false，lastQuotaSyncAt 也
+    /// 永远不更新 ⇒ 一直停在降级分支。
+    ///
+    /// 老逻辑在降级分支里仍用「最后一次成功同步的冻结 remaining」做决策，冻结值不会递减 ⇒
+    /// 永远 ≥ 阈值 ⇒ 永不换号，用户额度用完只能手动点「智能换号」。
+    ///
+    /// 这里改为：池内有「可静默注入会话」的新鲜号、且距上次强制轮换算起已超冷却，就轮换过去
+    /// （与手动「智能换号」等价），保证用户**永远不会卡在已耗尽的号上**。冷却避免守护每分钟烧一轮。
+    static let quotaDegradedForceRotationCooldownMinutes = 90.0
+
+    func makeForcedRotationDecision(candidates: [SmartSwitchCandidate]) -> SmartSwitchDecision? {
+        let eligible = candidates.filter { $0.hasSilentSessionPayload }
+        guard !eligible.isEmpty else { return nil }
+        let cooldown = Self.quotaDegradedForceRotationCooldownMinutes * 60
+        if let last = state.lastForcedRotationAt, Date().timeIntervalSince(last) < cooldown {
+            return nil
+        }
+        let best = eligible.max(by: { $0.remainingCharacters < $1.remainingCharacters })
+        state.lastForcedRotationAt = Date()
+        return SmartSwitchDecision(
+            path: .silentPoolSwitch,
+            targetAccountID: best?.id,
+            targetEmail: best?.email,
+            reason: "额度 API 长期不可用（Typeless 已封锁所有外部客户端）：轮换到池内新鲜号「\(best?.email ?? "")」（冷却 \(Int(Self.quotaDegradedForceRotationCooldownMinutes)) 分钟后再次轮换）"
+        )
+    }
 
     func smartSwitchCandidates(excluding currentID: UUID?) -> [SmartSwitchCandidate] {
         state.accounts.compactMap { account in

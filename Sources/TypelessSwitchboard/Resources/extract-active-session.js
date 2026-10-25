@@ -463,6 +463,29 @@ async function main() {
     return;
   }
 
+  // v2.7.1：只做「会话解密 + 签名头」并原样输出 JSON，不发任何网络请求。
+  // 官方额度 API 现在被 Cloudflare JA3（ja3_tls_code 101010100）拦掉，Node 的 https
+  // 指纹过不了；真正能过的是带 Chrome TLS 指纹的客户端。本模式把签名头交出去，
+  // 由调用方用 JA3 仿真的传输层（curl_cffi）发出，绕过 JA3 又复用同一套签名。
+  if (argv.includes('--emit-headers')) {
+    const s = decryptActiveSession();
+    if (!s.success) {
+      console.log(JSON.stringify({ success: false, error: s.error }));
+      return;
+    }
+    const profile = resolveClientProfile();
+    const headers = buildSignedHeaders(s.credentials, profile, USAGE_PATH);
+    console.log(JSON.stringify({
+      success: true,
+      url: 'https://' + API_HOST + USAGE_PATH,
+      headers,
+      email: s.credentials.email,
+      profileSource: profile.source,
+      profileAppVersion: profile.appVersion
+    }));
+    return;
+  }
+
   const session = decryptActiveSession();
   if (!session.success) {
     console.log(JSON.stringify(session));

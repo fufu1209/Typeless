@@ -1,6 +1,24 @@
 # 更新记录
 
-当前版本 **v2.7.3**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.7.4**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.7.4（2026-10-25）
+
+自动换号阈值调回 200（按用户要求「剩余 < 200 即切换」）。
+
+### 改动
+- `SmartSwitchPolicy.defaultRemainingThreshold` 由 120 调回 **200**。安全不变式仍成立
+  （200 × (urgentMultiplier−1)=600 ≥ 200 字/分语速），不会在听写中途撞 0；代价是预留占比
+  回到 10%，用户主动接受该取舍。
+- 新增迁移 `bumpAutoRotateThresholdTo200_v2_7_4`：存量 store 里仍是旧默认 120 的提到 200，
+  手改过的阈值不碰。
+
+### 重要说明（非阻断）
+官方额度 API 自 2026-10-14 起被 Cloudflare 指纹墙挡死（HTTP 418），App 读不到实时剩余 ⇒
+降级模式阈值按 3 倍放大（200→600）且走 90 分钟定时轮换，阈值本身不触发。要让「<200 就切」真正
+精准生效，需接 Accessibility 读屏取 Typeless 官方窗口上的真实周额度（下一步，尚未实现）。
 
 ---
 

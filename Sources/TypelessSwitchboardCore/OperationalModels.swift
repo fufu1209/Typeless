@@ -1628,17 +1628,16 @@ public enum LegacyQuotaRescale {
 public enum SmartSwitchPolicy {
     /// 剩余字数低于该值时立刻静默换号。
     ///
-    /// v2.6.0 从 200 下调到 120。注意：这个值**不由周额度决定，而由「消耗速度 × 巡检间隔」决定** ——
-    /// 它的唯一职责是「别在听写中途撞到 0」，所以要挡住的是「两次巡检之间最多会烧掉多少字」。
+    /// v2.6.0 从 200 下调到 120；**v2.7.4 按用户明确要求（"低于 200 就切换"）调回 200**。
     ///
-    /// 本机实测平均语速 200 字/分（官方 `avg_wpm`），常规巡检 1 分钟 ⇒ 两次巡检之间最多 200 字。
-    /// 设紧急巡检倍率 M、阈值 T，则常规带里 R ≥ M·T；最坏情况一次常规巡检后落到 M·T − 200，
-    /// 要保证那时还没跌破 T（否则就来不及进紧急档）：T(M − 1) ≥ 200。
-    /// 取 M = 4 ⇒ T ≥ 67，留到 120 可覆盖到 360 字/分的语速。
+    /// 安全不变式仍成立：`defaultRemainingThreshold × (urgentRemainingMultiplier − 1) ≥
+    /// assumedDictationWordsPerMinute` ⇒ 200 × 3 = 600 ≥ 200 ✓，不会在听写中途撞到 0。
+    /// 代价是预留占比回到 200/2000 = 10%（白扔的额度变多），这是用户主动接受的取舍。
     ///
-    /// 顺带把占比从 200/2000 = 10% 降到 120/2000 = 6%：
-    /// 周额度从 8000 砍到 2000 之后，同样 200 字的绝对预留等于白扔 10% 的额度。
-    public static let defaultRemainingThreshold = 120
+    /// 注意：官方额度 API 自 2026-10-14 起被 Cloudflare 指纹墙挡死（HTTP 418），App 读不到
+    /// 实时剩余 ⇒ 降级模式下阈值按 `quotaDegradedThresholdMultiplier` 放大（×3 = 600）且走
+    /// 90 分钟定时轮换，阈值本身不触发。要让"<200 就切"真正生效，需接 Accessibility 读屏取真实剩余。
+    public static let defaultRemainingThreshold = 200
     /// 常规巡检间隔（分钟）；额度接近阈值时会自动加速。
     public static let defaultCheckIntervalMinutes = 1
     /// App 启动后首次巡检等待：尽量短，让菜单栏尽快显示真实剩余字数。

@@ -229,6 +229,16 @@ final class SwitchboardStore: ObservableObject {
             state.appliedMigrations = appliedMigrations + [LegacyQuotaRescale.migrationKey]
         }
 
+        // v2.7.4：用户明确要求「剩余 < 200 即切换」。
+        // 旧默认阈值是 v2.6.0 从 200 下调到 120 的；把存量 store 里仍是旧默认 120 的提到 200。
+        // 只动「恰好等于旧默认 120」的——用户手改过的一律不碰（沿用 LegacyQuotaRescale 的口径）。
+        let thresholdMigrationKey = "bumpAutoRotateThresholdTo200_v2_7_4"
+        if !(state.appliedMigrations ?? []).contains(thresholdMigrationKey),
+           state.settings.autoRotateRemainingThreshold == 120 {
+            state.settings.autoRotateRemainingThreshold = 200
+            state.appliedMigrations = (state.appliedMigrations ?? []) + [thresholdMigrationKey]
+        }
+
         if state.settings.autoRotateCheckIntervalMinutes <= 0 {
             state.settings.autoRotateCheckIntervalMinutes = SmartSwitchPolicy.defaultCheckIntervalMinutes
         }

@@ -498,12 +498,11 @@ extension SwitchboardStore {
         state.accounts.compactMap { account in
             guard account.id != currentID else { return nil }
             guard account.isUsable, account.remainingCharacters > 0 else { return nil }
-            let payload = account.rawUserDataPayload?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return SmartSwitchCandidate(
                 id: account.id,
                 email: account.email.ifEmpty(account.name),
                 remainingCharacters: account.remainingCharacters,
-                hasSilentSessionPayload: !payload.isEmpty
+                hasSilentSessionPayload: account.isSilentlySwitchable
             )
         }
     }

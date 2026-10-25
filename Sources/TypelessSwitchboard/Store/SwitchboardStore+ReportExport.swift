@@ -41,6 +41,11 @@ extension SwitchboardStore {
             .filter { $0.monthlyLimit > 0 && Double($0.remainingCharacters) / Double($0.monthlyLimit) <= 0.15 }
             .sorted { $0.remainingCharacters < $1.remainingCharacters }
 
+        let sessionHealthy = state.accounts.filter { $0.hasSwitchableSession && $0.sessionHealth == .healthy }.count
+        let sessionRefreshable = state.accounts.filter { $0.hasSwitchableSession && $0.sessionHealth == .refreshable }.count
+        let sessionDead = state.accounts.filter { $0.hasSwitchableSession && $0.sessionHealth == .dead }.count
+        let noSession = state.accounts.filter { !$0.hasSwitchableSession }.count
+
         var lines = [
             "Typeless Switchboard 账号池体检",
             "总账号：\(state.accounts.count)",
@@ -49,6 +54,12 @@ extension SwitchboardStore {
             "本月已用完：\(exhausted.count)",
             "重复邮箱：\(duplicates.count)",
             "未填写邮箱：\(missingEmail.count)",
+            "",
+            "会话令牌健康：",
+            "  可秒切（access 有效）：\(sessionHealthy)",
+            "  仅刷新令牌有效（桌面端续期）：\(sessionRefreshable)",
+            "  会话已失效（僵尸号）：\(sessionDead)",
+            "  无会话缓存：\(noSession)",
             ""
         ]
 

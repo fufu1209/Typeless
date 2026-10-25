@@ -1,6 +1,43 @@
 # 更新记录
 
-当前版本 **v2.7.1**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.7.2**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.7.2（2026-10-25）
+
+会话令牌健康度 —— **让「能不能切过去」从黑盒变透明，并堵死僵尸号**。
+
+### 背景（实测发现）
+
+排查 v2.7.1 强制轮换时，解了全池 50 个号的 JWT，发现一个关键事实：
+
+- Typeless 的 `access_token` 寿命约 **1 天**（30 个有效令牌全部当天过期）；
+- 但 `refresh_token` 寿命约 **9 个月～1 年**（47/50 个号都有 refresh_token，且全部有效，
+  过期日分布在 2027-07 至 2027-10）。
+
+静默换号把 `access_token` + `refresh_token` 一起写进桌面端 `user-data.json`，桌面端启动时会用
+`refresh_token` 续发新的 `access_token`。所以真正决定「切过去能不能用」的是 **refresh_token 是否还有效**，
+而不是 access_token 当天是否过期——之前「30 个号今天到期」的担心是虚惊。
+
+### 改动
+
+- **Account 模型新增令牌健康度计算**（纯 computed property，不增存储字段）：
+  解出 `access_token` / `refresh_token` 的 `exp`，给出三态 `sessionHealth`
+  —— `healthy`（access 有效）/ `refreshable`（仅 refresh 有效，桌面端续期）/ `dead`（无可用令牌）。
+  派生 `isSilentlySwitchable`（令牌未全死）作为静默换号候选的真实判据。
+- **静默换号候选判定包含令牌健康度**：`smartSwitchCandidates` 与 `quotaSnapshot` 的
+  `hasSilentSessionPayload` 改为 `isSilentlySwitchable`。`SmartSwitchPolicy.decide()` 本来就只把
+  `hasSilentSessionPayload && 剩余 > 0` 的号当可切候选，于是**正常切换与 v2.7.1 的强制轮换都不再会
+  挑到 refresh 已死的僵尸号**；若全池都死了，则如实降级到「自动注册新号」。
+- **UI 可见**：账号列表行新增会话健康徽章（绿/橙/红）；账号详情新增「会话令牌健康」面板，
+  列出 access / refresh 到期时间与续期说明；「复制体检报告」增加健康度分布
+  （可秒切 / 仅刷新令牌有效 / 已失效 / 无会话缓存）。
+
+### 影响
+
+- 不改变既有换号行为：当前 47 个有效 refresh_token 全部健康，候选集与之前一致。
+- 只是把「僵尸号」从候选里剔除，并在 UI 上让用户一眼看清每个号的会话状态。
 
 ---
 

@@ -20,7 +20,7 @@ extension Account {
             monthlyLimit: monthlyLimit,
             lastResetAt: lastResetAt,
             createdAt: createdAt,
-            hasSilentSessionPayload: hasSilentSessionPayload
+            hasSilentSessionPayload: isSilentlySwitchable
         )
     }
 

@@ -23,6 +23,7 @@ struct AccountDetailView: View {
                 header
                 complianceNotice
                 quotaPanel
+                sessionPanel
                 editorPanel
                 registrationPanel
                 actionPanel
@@ -131,6 +132,52 @@ struct AccountDetailView: View {
                 }
             }
             .buttonStyle(.bordered)
+        }
+        .panelStyle()
+    }
+
+    private var sessionPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("会话令牌健康", systemImage: "key.icloud")
+                .font(.headline)
+
+            if account.hasSwitchableSession {
+                HStack(spacing: 6) {
+                    Image(systemName: account.sessionHealth == .healthy
+                          ? "checkmark.shield"
+                          : account.sessionHealth == .refreshable ? "arrow.clockwise" : "xmark.shield")
+                        .foregroundStyle(account.sessionHealthColor)
+                    Text(account.sessionHealthTitle)
+                        .font(.callout)
+                        .foregroundStyle(account.sessionHealthColor)
+                }
+
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    GridRow {
+                        Text("Access Token 到期")
+                            .foregroundStyle(.secondary)
+                        Text(account.accessTokenExpiresAt
+                              .map { $0.formatted(date: .abbreviated, time: .shortened) }
+                              ?? "无 / 已失效")
+                    }
+                    GridRow {
+                        Text("Refresh Token 到期")
+                            .foregroundStyle(.secondary)
+                        Text(account.refreshTokenExpiresAt
+                              .map { $0.formatted(date: .abbreviated, time: .shortened) }
+                              ?? "无 / 已失效")
+                    }
+                }
+                .font(.callout)
+
+                Text("说明：Typeless 的 access_token 寿命约 1 天，refresh_token 约 9 个月～1 年。静默换号会把两个令牌一起交给桌面端，桌面端用 refresh_token 续发新的 access_token——所以只要 refresh_token 还有效，切换即可生效；若 refresh 也已失效，则切过去会失败，需要重新注册。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            } else {
+                Text("这个账号没有捕获到桌面会话缓存，无法静默换号，只能重新注册 / 登录。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
         }
         .panelStyle()
     }

@@ -65,6 +65,18 @@ struct AccountRow: View {
                         .foregroundStyle(account.effectiveReviewState.color)
                         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
                 }
+
+                // v2.7.2：会话令牌健康度。有捕获过会话的号才显示，没捕获过的不标
+                // （它们本来就没有会话可言）。三态：绿=可用 / 橙=需 refresh 续期 / 红=僵尸号。
+                if account.hasSwitchableSession {
+                    Text(account.sessionHealthTitle)
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(account.sessionHealthColor.opacity(0.14))
+                        .foregroundStyle(account.sessionHealthColor)
+                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                }
             }
 
             // v2.5.3：QuotaCycleEngine 的周期能力早就有了，但 UI 从未接线，

@@ -427,6 +427,12 @@ public enum MacPermissionChecklist {
             isRequiredForOneClickSwitch: true
         ),
         MacPermissionChecklistItem(
+            title: "屏幕录制（本 App 读屏取额度）",
+            detail: "给 **TypelessSwitchboard** 自身打开屏幕录制权限：官方额度接口被 Cloudflare 挡死后，App 靠截图 + OCR 读取 Typeless 窗口上显示的活额度，才能实现「剩余 < 200 精准切换」。未授权则只能退回每 90 分钟盲轮。",
+            settingsPaneIdentifier: "Privacy_ScreenCapture",
+            isRequiredForOneClickSwitch: false
+        ),
+        MacPermissionChecklistItem(
             title: "通知 Notifications",
             detail: "给 Typeless.app 打开通知权限，方便接收登录、转写和后台状态提醒。",
             settingsPaneIdentifier: "Privacy_Notifications",

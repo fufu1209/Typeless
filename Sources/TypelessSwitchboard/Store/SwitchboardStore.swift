@@ -21,6 +21,10 @@ final class SwitchboardStore: ObservableObject {
     @Published var lastAutoRotateCheckAt: Date?
     @Published var lastAutoRotateDecisionReason = ""
     @Published var autoRotateMonitorStatus = "守护未开启"
+    /// v2.7.5：读屏取额度（截图 + Vision OCR）的原始识别文本，用于排错与调参。
+    @Published var lastScreenQuotaRawText = ""
+    /// v2.7.5：读屏解析出的「本周剩余字数」；取不到为 nil。
+    @Published var lastScreenQuotaParsed: Int?
     /// 最近一次静默换号失败原因（含设备用户数超限等），供 UI / 降级决策使用。
     @Published var lastSilentSwitchFailureReason = ""
     /// 最近一次同步官方会话时是否命中「设备登录用户数超限」。

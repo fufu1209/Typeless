@@ -1,6 +1,32 @@
 # 更新记录
 
-当前版本 **v2.7.4**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.7.5**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.7.5（2026-10-25）
+
+读屏取额度（截图 + Vision OCR）—— 让「剩余 < 200 精准切换」真正生效。
+
+### 背景（用户要求"灵敏度"）
+官方额度 API 自 2026-10-14 被 Cloudflare 指纹墙挡死（HTTP 418），App 读不到实时剩余；
+又经排查确认 Typeless **没有把额度缓存在任何本地文件**（app-storage/app-settings/typeless.db 均无
+周额度字段）。而 Typeless 自己的浏览器内核能过墙，界面上显示的是**活**的剩余。Electron 的
+Accessibility 对 Web 内容暴露极差，故改用「窗口截图 + Vision OCR」取数。
+
+### 改动
+- 新增 `SwitchboardStore+QuotaScreenReader.swift`：定位 owner="Typeless" 的窗口 →
+  `CGWindowListCreateImage` 截图 → `VNRecognizeTextRequest`（中英 + 语言纠错）OCR → 启发式解析
+  本周剩余字数。原始识别文本存 `lastScreenQuotaRawText`、解析结果存 `lastScreenQuotaParsed`，供排错调参。
+- 接入 `performAutoRotateCheck` 降级分支：API 不可用时**先尝试读屏取额度**；读到则把它当剩余字数、
+  走正常阈值决策（阈值不再 ×3，剩余 < 200 精准触发静默换号）；读不到再退回 90 分钟时间轮换（旧行为，不回归）。
+- 权限清单新增「屏幕录制（本 App 读屏取额度）」条目，引导给 TypelessSwitchboard 自身授权。
+
+### 重要说明（需用户配合 + 待调参）
+- **必须授予 TypelessSwitchboard「屏幕录制」权限**，且 Typeless 窗口需可见（不被最小化到不可见），
+  否则截图为空、OCR 取不到，自动退回盲轮。
+- OCR 解析是按常见中文/英文额度文案写的启发式（"本周剩余/剩余/可用/额度" + "X/Y" 比例式），
+  首次实跑后需对照 `lastScreenQuotaRawText` 里真实识别到的文案微调关键词。这一步依赖用户端真实界面。
 
 ---
 

@@ -179,7 +179,16 @@ extension SwitchboardStore {
                 autoRotateMonitorStatus = "⚠️ 自动换号已停摆：Typeless 拒绝本客户端指纹，需要新版本 App 适配"
                 return currentID
             }
-            if isQuotaDataStaleBeyondDegradeThreshold {
+            // v2.7.5：官方额度 API 被墙时，先尝试读屏取 Typeless 界面上的活额度。
+            // 读到就用它当剩余字数、走正常阈值决策（<200 可精准触发）；读不到再降级到时间轮换。
+            if let screenRemaining = await readTypelessOnScreenQuota() {
+                // remainingCharacters 是只读计算属性（max(monthlyLimit - usedCharacters, 0)），
+                // 要注入读屏得到的活剩余，只能改写 usedCharacters，保持 monthlyLimit 不变。
+                let acct = state.accounts[currentIndex]
+                state.accounts[currentIndex].usedCharacters = max(acct.monthlyLimit - screenRemaining, 0)
+                liveRemainingCharacters = screenRemaining
+                lastAutoRotateDecisionReason = "额度取 Typeless 界面（API 被墙·读屏兜底），剩余 \(screenRemaining)"
+            } else if isQuotaDataStaleBeyondDegradeThreshold {
                 degradedEstimate = true
                 isQuotaAPIDegraded = true
                 let staleMinutes = lastQuotaSyncAt.map { Int(Date().timeIntervalSince($0) / 60) } ?? -1

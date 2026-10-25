@@ -138,13 +138,28 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
                 store.lastAutoRotateDecisionReason.isEmpty ? nil : store.lastAutoRotateDecisionReason
             ].compactMap { $0 }.joined(separator: "\n")
         } else if store.state.settings.isAutoRotateEnabled || QuotaGuardLaunchAgent.isInstalled {
-            button.title = store.lastQuotaSyncFresh ? "监控" : "?"
-            button.toolTip = [
-                "本周额度守护已开，等待读到官方本周剩余字数",
-                store.weeklyQuotaSummaryLine,
-                "换号阈值：本周剩余 < \(threshold) 且数字新鲜才自动换号",
-                store.autoRotateMonitorStatus
-            ].joined(separator: "\n")
+            // v2.7.5：官方额度 API 被墙后，菜单栏唯一的活数据来源是「读屏取额度」。
+            // 若读屏也没取到（未授屏录 / Typeless 窗口不可见 / 解析失败），给出可操作提示，
+            // 避免用户误以为「悬浮窗坏了 / 没了」——它还在，只是缺数据源。
+            if !store.lastQuotaSyncFresh, store.lastScreenQuotaParsed == nil {
+                button.title = "需屏录"
+                button.toolTip = [
+                    "官方额度接口被 Cloudflare 挡死，且屏幕读取尚未取到额度。",
+                    "请：① 系统设置 → 隐私与安全性 → 屏幕录制，勾选 TypelessSwitchboard；",
+                    "② 保持 Typeless 窗口可见（不要最小化到完全不可见）。",
+                    store.lastScreenQuotaRawText.isEmpty
+                        ? nil : "最近一次读屏原始文本：\(store.lastScreenQuotaRawText)",
+                    "授权并可见后，菜单栏将显示实时剩余（低于阈值 \(threshold) 时带 ↓）。"
+                ].compactMap { $0 }.joined(separator: "\n")
+            } else {
+                button.title = store.lastQuotaSyncFresh ? "监控" : "?"
+                button.toolTip = [
+                    "本周额度守护已开，等待读到官方本周剩余字数",
+                    store.weeklyQuotaSummaryLine,
+                    "换号阈值：本周剩余 < \(threshold) 且数字新鲜才自动换号",
+                    store.autoRotateMonitorStatus
+                ].joined(separator: "\n")
+            }
         } else {
             button.title = "关闭"
             button.toolTip = "本周额度守护未开启（可安装开机轻量插件）"

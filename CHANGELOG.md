@@ -4,6 +4,23 @@
 
 ---
 
+## v2.7.6（2026-10-25）
+
+菜单栏状态项 clarity：额度读不到时给出可操作提示，避免误以为「悬浮窗没了」。
+
+### 背景（用户反馈）
+v2.7.5 上线后，菜单栏状态项在官方 API 被墙、屏幕读取又尚未取到额度时，只显示
+ cryptic 的 `"监控"` / `"?"`，用户以为「状态栏那个悬浮窗没有了 / 不更新了」。
+
+### 改动
+- `AppDelegate.refreshStatusItemTitle`：当 `!lastQuotaSyncFresh` 且 `lastScreenQuotaParsed == nil`
+  （即官方接口被墙、屏幕读取也没拿到数）时，菜单栏标题改为 **"需屏录"**，tooltip 明确告知：
+  ① 给 TypelessSwitchboard 授屏幕录制；② 保持 Typeless 窗口可见；并附最近一次读屏原始文本。
+- 状态项本身**未被移除**（每次启动 `bind → installStatusItemIfNeeded` 都会安装）；
+  若连图标都看不到，多半是 macOS 菜单栏项过多被自动隐藏（Control-点击菜单栏可显隐）。
+
+---
+
 ## v2.7.5（2026-10-25）
 
 读屏取额度（截图 + Vision OCR）—— 让「剩余 < 200 精准切换」真正生效。

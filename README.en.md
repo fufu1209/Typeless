@@ -6,7 +6,7 @@ multiple accounts when the free **2,000 words/week** quota runs low.
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.8.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.8.1-blue.svg)](CHANGELOG.md)
 
 > 🌏 [中文版 README](README.md) — the Chinese one is more detailed.
 
@@ -27,7 +27,7 @@ You register a pool of accounts once. When the active account's quota gets low, 
 - **Quota guard** — a lightweight LaunchAgent watches the quota even when the app is closed
 - **Batch signup** — creates accounts automatically using a self-hosted catch-all email service
 - **Weekly quota tracking** — shows how much is left and when it refills
-- **Live quota via CDP (v2.8.0)** — Typeless's `/user/usage_stats` is now gated by both a client
+- **Live quota via CDP (v2.8.0+, 2.8.1)** — Typeless's `/user/usage_stats` is now gated by both a client
   signature and a JA3/TLS fingerprint allow-list, so Node/curl always get HTTP 418. The app now
   talks to Typeless's own DevTools port and asks **its own API client** (inside the renderer) to
   make the call: signature, cookies and TLS fingerprint are the official ones. Exact server-side

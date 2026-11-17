@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.8.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.8.1-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -99,9 +99,11 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.8.0**（2026-11-17）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.8.1**（2026-11-17）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-最近的主要变化：**额度直读（CDP）**（v2.8.0 —— 官方 `/user/usage_stats` 同时被
+最近的主要变化：**启动即直读**（v2.8.1 —— 修掉「链路正常但菜单栏显示『需直读』」：
+App 启动后先异步读一次额度，0.2–0.8 秒，不写会话、不换号）、
+**额度直读（CDP）**（v2.8.0 —— 官方 `/user/usage_stats` 同时被
 客户端签名和 JA3/TLS 指纹墙挡着，Node 直连必然 418。现在改为连 Typeless 自己的
 DevTools 端口，在渲染进程里用**它自己的 API 客户端**发请求：两道门一起过，
 读到的是服务端原值，不需要屏幕录制权限。实测一次读取 0.2–0.8 秒；

@@ -371,7 +371,11 @@ node scripts/probe-quota-cdp.js --json
 `no-client`），不会静默降级成「看起来还在监控」。读不到时额度守护会自动退回
 读屏 OCR 与本地缓存估算，行为与 v2.7.6 一致。
 
-> ⚠️ 两个容易踩的点：
+> ⚠️ 重启 Mac 之后：如果 Typeless 是被它自己的登录项拉起的（不带调试端口），
+> 直读会读不到 —— 点一次「带端口重启 Typeless」即可恢复；从本 App 里「打开 Typeless」
+> 也会自动带端口。
+>
+> ⚠️ 另外两个容易踩的点：
 > ① 从自带 `ELECTRON_RUN_AS_NODE=1` 的终端（很多 IDE / Agent 环境会设）里启动
 > Typeless，会退化成 node 解释器并拒绝 `--remote-debugging-port` —— 这不是启动器
 > 的限制，去掉该环境变量即可；

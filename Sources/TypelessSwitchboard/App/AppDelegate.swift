@@ -55,6 +55,18 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
         store.startOnboardingGuardIfNeeded()
         // v2.8.0：GUI 常驻时旁听 Typeless 自己的额度刷新（零额外请求）。
         store.startLiveQuotaWatcherIfNeeded()
+
+        // v2.8.1：启动后先直读一次。
+        //
+        // 没有这一步时，「无感守护」关着、Typeless 也没刷新过额度的机器上，
+        // 菜单栏会一直显示「需直读」——明明链路是通的，看起来却像坏了。
+        // 读一次只要 0.2–0.8 秒，且不写任何会话。
+        Task { @MainActor in
+            if let snapshot = await store.readQuotaViaCDPBridge() {
+                store.applyQuotaSnapshotToMatchingAccount(snapshot)
+                self.refreshStatusItemTitle()
+            }
+        }
         statusCancellable = store.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in

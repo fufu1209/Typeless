@@ -2,4 +2,5 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-swift run TypelessSwitchboard
+source "$(dirname "$0")/lib-sdk-fallback.sh"
+swift run --disable-sandbox TypelessSwitchboard

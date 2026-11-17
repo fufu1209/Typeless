@@ -31,3 +31,25 @@
 16. 只有浏览器结果证明注册完成时，才把新账号标记为可用并把当前账号标记为本周用完；如果页面无需验证码或浏览器已进入 Dashboard/Workspace，也以浏览器完成结果为准，不会因为 Swift 端没有提取到验证码而误退回兜底确认。
 17. 注册完成后会把 Google Chrome 的 Typeless 网页会话同步到新账号，并打开 Typeless handoff；如果 Chrome 弹出“要打开 Typeless.app 吗？”，工具会先勾选“始终允许 www.typeless.com...”，再点击“打开 Typeless.app”。成功路径不会自动打开账号专属 Playwright/Chromium 额外浏览器；该 profile 只保留用于右侧“打开新账号会话”手动排查。桌面端新手引导会尽量自动完成或跳过；自动化结果会记录被替换的旧账号，旧账号会标记为本周已用完。
 18. 如果结果仍停在注册/验证/错误页面，旧账号状态不变，新账号保留为待兜底确认，并在右侧“最近自动换号”里保存账号 ID、状态、验证码、脚本路径、验证码桥接文件、浏览器结果 JSON、浏览器登录态目录和日志；点击“重试最近自动化”可复用同一账号和脚本继续执行。
+
+---
+
+## 额度读取（v2.8.0 起）
+
+换号决策依赖「本周还剩多少字」。这条链路的优先级是：
+
+```
+CDP 直读（首选） → 官方接口（历史路径） → 读屏 OCR → 本地缓存估算
+```
+
+- **CDP 直读**：连 Typeless 自己的 DevTools 端口，在渲染进程里用**App 自己的 API 客户端**
+  请求 `/user/usage_stats`。签名、Cookie、TLS 指纹都是官方的，两道服务端门禁一起过。
+  前提是 Typeless 带 `--remote-debugging-port=9333` 启动（本 App 拉起时会自动带；
+  已在跑的实例需要点一次「带端口重启 Typeless」）。详见 [CDP-QUOTA.md](CDP-QUOTA.md)。
+- **官方接口**：`extract-active-session.js` 用 Node 直连。2026-10 起被 JA3/TLS 指纹白名单
+  挡住（HTTP 418 / `ja3_tls_code`），签名算对也没用 —— 保留它只为「服务端将来放开」。
+- **读屏 OCR**：截图 + Vision，解析器在 `TypelessSwitchboardCore.QuotaScreenTextParser`。
+- **本地缓存估算**：最后一道，阈值会放大 3 倍，宁可早换。
+
+直读失败**不会**改变原有行为，只是少一条更快更准的路径。失败原因可以在
+「额度守护 → 额度直读」卡片里看到，或跑 `--probe-quota` 拿一行 JSON。

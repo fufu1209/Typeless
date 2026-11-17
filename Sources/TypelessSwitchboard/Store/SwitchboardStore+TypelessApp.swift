@@ -25,9 +25,16 @@ extension SwitchboardStore {
     }
 
     func openInstalledTypelessApp() {
-        if let path = typelessAppPath() {
-            NSWorkspace.shared.open(URL(fileURLWithPath: path))
-            statusMessage = "已打开本机 Typeless App"
+        if typelessAppPath() != nil {
+            // v2.8.0：走统一入口，顺手带上调试端口，让「手动打开」的 Typeless
+            // 也能被额度直读读到；否则用户手动打开一次就把直读链路弄丢了。
+            launchTypelessInBackground(
+                activate: true,
+                quotaDebugPort: isCDPQuotaEnabled ? cdpQuotaPort : nil
+            )
+            statusMessage = isCDPQuotaEnabled
+                ? "已打开本机 Typeless App（额度直读端口 \(cdpQuotaPort)）"
+                : "已打开本机 Typeless App"
             return
         }
 

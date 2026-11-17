@@ -55,6 +55,17 @@ enum TypelessSwitchboardMain {
         if CommandLine.arguments.contains("--skip-onboarding") {
             runStandaloneOnboardingPatchAndExit()
         }
+        // v2.8.0：无界面读一次额度（走 CDP 直读），用于排障与脚本化监控。
+        //   TypelessSwitchboard --probe-quota [--port 9333]
+        // 成功打印一行 JSON 并 exit 0；失败打印原因并 exit 1。
+        if CommandLine.arguments.contains("--probe-quota") {
+            runStandaloneQuotaProbeAndExit()
+        }
+        // v2.8.0：实时监听一段时间（CDP Network 事件），用于验证 / 观察。
+        //   TypelessSwitchboard --watch-quota [--seconds 30] [--port 9333]
+        if CommandLine.arguments.contains("--watch-quota") {
+            runStandaloneQuotaWatchAndExit()
+        }
         // v2.5.6：无界面导出配置包，供脚本化备份 / 换机迁移使用。
         //   --export-full-bundle    真实邮箱 + 完整设置（自用，别外传）
         //   --export-public-bundle  脱敏版（可分享 / 发 GitHub）
@@ -92,6 +103,75 @@ enum TypelessSwitchboardMain {
                 }
             }
         }
+    }
+
+    /// v2.8.0：`--probe-quota` 的实现。
+    ///
+    /// 这是「额度直读」的最小可验证入口：不打开 GUI、不写 store、不碰账号池，
+    /// 只连 `127.0.0.1:<port>` 的 DevTools，问一次 `usage_stats` 就把结果打成 JSON。
+    /// 用户排障时可以把它贴进 issue，脚本也可以直接消费。
+    @MainActor
+    private static func runStandaloneQuotaProbeAndExit() -> Never {
+        let port = Int(value(of: "--port") ?? "") ?? TypelessQuotaBridge.defaultPort
+        print("TypelessSwitchboard: probing quota via CDP on port \(port)…")
+        Task { @MainActor in
+            let reader = TypelessCDPQuotaReader(port: port)
+            if let snapshot = await reader.readQuota() {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                if let data = try? encoder.encode(snapshot),
+                   let text = String(data: data, encoding: .utf8) {
+                    print(text)
+                } else {
+                    print("直读成功但序列化失败：\(snapshot.summary)")
+                }
+                exit(0)
+            }
+            let reason = await reader.lastFailureDescription ?? "未知原因"
+            print("直读失败：\(reason)")
+            exit(1)
+        }
+        RunLoop.main.run()
+        exit(0)
+    }
+
+    /// v2.8.0：`--watch-quota` 的实现。
+    ///
+    /// 旁听 Typeless 自己的 `usage_stats` 响应（不额外发请求）。适合验证
+    /// 「实时监听到底通不通」：启动它，然后打开/刷新 Typeless 主窗口，应当立刻打印一行。
+    @MainActor
+    private static func runStandaloneQuotaWatchAndExit() -> Never {
+        let port = Int(value(of: "--port") ?? "") ?? TypelessQuotaBridge.defaultPort
+        let seconds = max(Int(value(of: "--seconds") ?? "") ?? 30, 5)
+        print("TypelessSwitchboard: watching quota via CDP on port \(port) for \(seconds)s…")
+        let watcher = TypelessQuotaLiveWatcher(port: port)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+
+        Task { @MainActor in
+            let stream = await watcher.start()
+            // 3 秒后报一次连接状态：没连上（Typeless 没带端口 / 端口被占）时不至于静默空等。
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            let connected = await watcher.isConnected
+            if !connected {
+                let reason = await watcher.lastFailureDescription ?? "未知原因"
+                print("⚠️ 监听未连上：\(reason)")
+            } else {
+                print("已连上 Typeless DevTools，等待额度刷新事件…")
+            }
+            for await snapshot in stream {
+                print("[\(formatter.string(from: snapshot.capturedAt))] \(snapshot.summary)")
+            }
+        }
+        // 无论有没有事件，到点都退出（避免 CI / 脚本里挂死）。
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(seconds)) {
+            Task { await watcher.stop() }
+            print("TypelessSwitchboard: watch finished")
+            exit(0)
+        }
+        RunLoop.main.run()
+        exit(0)
     }
 
     /// 独立跑一遍引导补丁并退出。供终端排障使用，也可以在 App 卡住时兜底。

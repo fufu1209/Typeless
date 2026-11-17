@@ -47,7 +47,42 @@ extension SwitchboardStore {
         quotaAPIConsecutiveFailures += 1
     }
 
+    /// 同步「官方 App 登录态 + 本周额度」。
+    ///
+    /// v2.8.0 起拆成两层：
+    ///   * 先走 **CDP 直读**（Typeless 渲染进程自己的 API 客户端，签名/TLS 都是 App 的）；
+    ///   * 再走原来的 node 脚本（读会话 payload）。直读成功时脚本加 `--local-only`，
+    ///     不再去撞那面 418 的墙（省一次必然失败的请求，也少一条误导性报错）。
+    ///
+    /// 直读拿到的数字优先级**高于**脚本结果：脚本那边只负责 `rawUserDataPayload`。
     func syncActiveAppSessionAndQuota(localOnly: Bool = false) async -> UUID? {
+        // 直读也要算「同步中」：否则按钮在 CDP 那 0.5 秒里仍可点，用户会连点两次
+        // （两次 node 进程 + 两次 WS，结果互相覆盖）。内层函数还会再置一次，
+        // 这里用 defer 兜底把它复位。
+        let wasSyncing = isSyncingSession
+        isSyncingSession = true
+        defer { isSyncingSession = wasSyncing }
+
+        var snapshot = await readQuotaViaCDPBridge()
+        let syncedID = await syncActiveAppSessionAndQuotaNode(localOnly: localOnly || snapshot != nil)
+
+        // 极少数情况：额度读到了，但 `auth:get-current` 那一步失败（渲染进程刚 reload 之类），
+        // 于是 snapshot 没有邮箱。这时用脚本刚解出来的账号补上，别把已经到手的数字丢掉
+        // —— 丢掉的代价是下一轮又要退回读屏/缓存，等于白读。
+        if snapshot?.email == nil,
+           let id = syncedID,
+           let index = accountIndex(id: id) {
+            snapshot?.email = state.accounts[index].email
+        }
+
+        if let snapshot, let id = applyQuotaSnapshotToMatchingAccount(snapshot) {
+            return id
+        }
+        return syncedID
+    }
+
+    /// 原来的实现（node 脚本 + 官方额度接口）。保留原名语义，供上面那层包装调用。
+    func syncActiveAppSessionAndQuotaNode(localOnly: Bool = false) async -> UUID? {
         isSyncingSession = true
         lastSyncHitDeviceUserLimit = false
         lastSyncHitClientNotSupported = false
@@ -64,7 +99,6 @@ extension SwitchboardStore {
         syncStatusMessage = localOnly
             ? "正在本地校验 Typeless 登录态..."
             : "正在读取本地 Typeless 登录状态并向云端同步本周额度..."
-        statusMessage = syncStatusMessage
         statusMessage = syncStatusMessage
         
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -163,6 +197,7 @@ extension SwitchboardStore {
                         lastQuotaMonthlyLimit = max(limit, 1)
                         lastQuotaSyncAt = Date()
                         lastQuotaSyncFresh = true
+                        lastQuotaSource = .officialAPI
                         noteQuotaAPISuccess()
                         liveRemainingCharacters = state.accounts[i].remainingCharacters
                         liveAccountEmail = state.accounts[i].email
@@ -224,6 +259,7 @@ extension SwitchboardStore {
                     lastQuotaMonthlyLimit = newAcc.monthlyLimit
                     lastQuotaSyncAt = Date()
                     lastQuotaSyncFresh = true
+                    lastQuotaSource = .officialAPI
                     noteQuotaAPISuccess()
                     liveRemainingCharacters = newAcc.remainingCharacters
                     liveAccountEmail = email
@@ -288,7 +324,8 @@ extension SwitchboardStore {
         let clock = lastQuotaSyncAt.map(Self.shortClock) ?? "—"
         if let used, let limit, let remaining {
             let freshness = lastQuotaSyncFresh ? "新鲜" : "可能陈旧"
-            return "本周：已用 \(used)/\(limit)，剩余 \(remaining) · \(freshness) · \(clock)"
+            let source = lastQuotaSource?.displayName ?? "来源未知"
+            return "本周：已用 \(used)/\(limit)，剩余 \(remaining) · \(freshness) · \(source) · \(clock)"
         }
         if let remaining {
             return "本周剩余约 \(remaining)（待官方刷新）· \(clock)"

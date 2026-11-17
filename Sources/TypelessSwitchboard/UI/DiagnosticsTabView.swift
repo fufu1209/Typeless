@@ -265,9 +265,43 @@ struct DiagnosticsTabView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!result.canRetry || store.isRunningAutomaticReplacement)
+
+                    // v2.8.0：注册卡住时的现场证据（整页截图 + DOM 快照）。
+                    // 以前只有一行 status/detail，页面改版只能靠猜。
+                    if let evidence = evidencePayload(for: result) {
+                        HStack(spacing: 8) {
+                            if let shot = evidence.screenshotPath {
+                                Button {
+                                    NSWorkspace.shared.open(URL(fileURLWithPath: shot))
+                                } label: {
+                                    Label("打开失败截图", systemImage: "photo")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                            if let dom = evidence.domSnapshotPath {
+                                Button {
+                                    NSWorkspace.shared.open(URL(fileURLWithPath: dom))
+                                } label: {
+                                    Label("打开 DOM 快照", systemImage: "doc.text.magnifyingglass")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                        .controlSize(.small)
+                    }
                 }
             }
         }
+    }
+
+    /// 读取最近一次自动化结果的现场证据（截图 / DOM）。读不到就返回 nil，不弹错误。
+    private func evidencePayload(for result: RegistrationAutomationResult) -> BrowserAutomationResultPayload? {
+        guard let path = result.browserResultFilePath else { return nil }
+        guard let payload = store.readAutomationResult(from: URL(fileURLWithPath: path)) else { return nil }
+        guard payload.screenshotPath != nil || payload.domSnapshotPath != nil else { return nil }
+        return payload
     }
 
     private var footnote1: String {

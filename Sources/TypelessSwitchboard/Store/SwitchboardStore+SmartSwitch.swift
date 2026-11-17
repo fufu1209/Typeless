@@ -132,7 +132,33 @@ extension SwitchboardStore {
         return smartSwitchCandidates(excluding: currentID)
     }
 
+    /// 静默换号（带历史记录的外层入口）。
+    ///
+    /// v2.8.0：真正的实现挪到 `performSilentSwitch`，这一层只负责
+    /// 「计时 + 记一条换号历史」—— 这样历史不会因为某个早退分支被漏记。
     func switchActiveAccountSilently(
+        to accountID: UUID,
+        markPreviousExhausted previousID: UUID? = nil,
+        activateTypeless: Bool = false,
+        trigger: SwitchTrigger = .manual
+    ) async -> Bool {
+        let started = Date()
+        let succeeded = await performSilentSwitch(
+            to: accountID,
+            markPreviousExhausted: previousID,
+            activateTypeless: activateTypeless
+        )
+        recordSwitchHistory(
+            trigger: trigger,
+            fromID: previousID,
+            toID: accountID,
+            succeeded: succeeded,
+            startedAt: started
+        )
+        return succeeded
+    }
+
+    private func performSilentSwitch(
         to accountID: UUID,
         markPreviousExhausted previousID: UUID? = nil,
         activateTypeless: Bool = false
@@ -305,13 +331,21 @@ extension SwitchboardStore {
             appendOnboardingPatchLog("无感换号写引导标记异常：\(patchLog.joined(separator: "；"))")
         }
 
-        launchTypelessInBackground(activate: activateTypeless)
+        launchTypelessInBackground(
+            activate: activateTypeless,
+            quotaDebugPort: state.settings.isCDPQuotaEnabled ? cdpQuotaPort : nil
+        )
         // 这里**不再**死等固定秒数：等待逻辑交给调用方轮询「本地会话是否已解出目标账号」。
         // 理由见 `SmartSwitchPolicy.silentInjectSettleSeconds` 的注释。
         return true
     }
 
-    func launchTypelessInBackground(activate: Bool) {
+    /// 拉起 Typeless。
+    ///
+    /// v2.8.0：`quotaDebugPort` 非 nil 时带上 `--remote-debugging-port`，
+    /// 这样守护下一次巡检就能用 CDP 直接问渲染进程要真实额度（见 `TypelessQuotaBridge`）。
+    /// 传 nil 表示「这一次不要调试端口」（用于需要在干净环境下复现问题的场景）。
+    func launchTypelessInBackground(activate: Bool, quotaDebugPort: Int? = nil) {
         guard let path = typelessAppPath() else {
             if activate { openInstalledTypelessApp() }
             return
@@ -319,6 +353,9 @@ extension SwitchboardStore {
         let url = URL(fileURLWithPath: path)
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = activate
+        if let quotaDebugPort {
+            configuration.arguments = ["--remote-debugging-port=\(TypelessQuotaBridge.normalizePort(quotaDebugPort))"]
+        }
         NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, _ in }
     }
 }

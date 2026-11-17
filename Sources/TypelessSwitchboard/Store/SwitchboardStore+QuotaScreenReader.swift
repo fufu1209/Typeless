@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import Vision
+import TypelessSwitchboardCore
 
 /// v2.7.5：读屏取 Typeless 官方窗口上的「本周剩余字数」。
 ///
@@ -41,25 +42,47 @@ extension SwitchboardStore {
             return nil
         }
 
-        // 4) 启发式解析本周剩余。保留原始文本供排错/调参。
+        // 4) 解析本周剩余（v2.8.0：解析器搬到 Core，纯函数、可被测试直接覆盖）。
+        //    保留原始文本与命中行，供排错/调参。
         let joined = texts.joined(separator: "\n")
-        let parsed = Self.parseWeeklyRemaining(from: texts)
+        let parsed = QuotaScreenTextParser.parse(from: texts)
         lastScreenQuotaRawText = joined.isEmpty ? "(OCR 未识别出任何文本)" : joined
-        lastScreenQuotaParsed = parsed
-        return parsed
+        lastScreenQuotaParsed = parsed?.remaining
+        if let parsed {
+            lastScreenQuotaRawText += "\n[解析] 剩余 \(parsed.remaining)"
+                + (parsed.total.map { " / 上限 \($0)" } ?? "")
+                + " · 置信度 \(String(format: "%.2f", parsed.confidence))"
+                + " · 命中：\(parsed.matchedText)"
+        }
+        return parsed?.remaining
     }
 
     /// 在屏幕上找到 owner 名为 "Typeless" 的窗口 ID。
+    ///
+    /// v2.8.0：不再「拿到第一个就用」。Typeless 同时会有浮动条、欢迎页、主窗口等多个
+    /// 窗口，浮条上根本没有额度数字 —— 旧逻辑一旦先命中浮条，OCR 只会读到模型名，
+    /// 于是永远解析失败。现在只认「普通窗口层 + 面积最大」的那个。
     private static func typelessWindowID() -> CGWindowID? {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
                 as? [[String: Any]] else { return nil }
+        var best: (id: CGWindowID, area: Double)?
         for dict in list {
             let owner = dict[kCGWindowOwnerName as String] as? String ?? ""
-            if owner == "Typeless", let num = dict[kCGWindowNumber as String] as? Int {
-                return CGWindowID(num)
+            guard owner == "Typeless" else { continue }
+            let layer = dict[kCGWindowLayer as String] as? Int ?? 0
+            guard layer == 0 else { continue }
+            guard let num = dict[kCGWindowNumber as String] as? Int else { continue }
+            let boundsDict = dict[kCGWindowBounds as String] as? [String: Any] ?? [:]
+            let width = (boundsDict["Width"] as? Double) ?? 0
+            let height = (boundsDict["Height"] as? Double) ?? 0
+            let area = width * height
+            // 太小的窗口（浮条 / 提示气泡）直接排除。
+            guard width >= 320, height >= 240 else { continue }
+            if best == nil || area > best!.area {
+                best = (CGWindowID(num), area)
             }
         }
-        return nil
+        return best?.id
     }
 
     /// 对 CGImage 跑 Vision 文本识别，返回每个观测的最优候选文本。
@@ -72,69 +95,5 @@ extension SwitchboardStore {
         try handler.perform([request])
         guard let observations = request.results else { return [] }
         return observations.compactMap { $0.topCandidates(1).first?.string }
-    }
-
-    /// 从 OCR 文本里挑「本周剩余字数」。
-    ///
-    /// 优先级：
-    /// 1. 带额度关键字的行里的数字（本周/剩余/可用/额度…），关键字越靠前权重越高；
-    /// 2. 「X / Y」「X of Y」比例式里的 X（剩余），要求 X ≤ Y；
-    /// 3. 整屏只有一个数字时取它。
-    /// 都取不到返回 nil（调用方回退）。原始文本已存入 lastScreenQuotaRawText 供调参。
-    private static func parseWeeklyRemaining(from texts: [String]) -> Int? {
-        let keywords = [
-            "本周剩余", "剩余", "还剩", "可用", "本周可用", "本周额度", "周额度", "额度",
-            "本周", "left", "remaining", "available", "quota", "week", "used",
-        ]
-
-        // 1) 关键字近邻数字（行内）。
-        var best: (value: Int, score: Int)?
-        for line in texts {
-            let ln = line.replacingOccurrences(of: " ", with: "")
-            guard let num = firstInt(in: ln) else { continue }
-            var score = 0
-            for (idx, kw) in keywords.enumerated() {
-                if ln.contains(kw) {
-                    // 越靠前的关键字权重越高（剩余/可用 优先于 额度/本周）。
-                    score = max(score, keywords.count - idx)
-                }
-            }
-            if score > 0, best == nil || score > best!.score {
-                best = (num, score)
-            }
-        }
-        if let best { return best.value }
-
-        // 2) 比例式 X / Y（去空格后匹配，避免误伤日期「2026/10/25」——其 X>Y 会被下面 ≤Y 过滤）。
-        let joinedNoSpace = texts.joined(separator: "").replacingOccurrences(of: " ", with: "")
-        if let ratio = firstRatio(in: joinedNoSpace), ratio.remaining <= ratio.total {
-            return ratio.remaining
-        }
-
-        // 3) 全屏恰只有一个数字。
-        let allNums = texts.compactMap { firstInt(in: $0.replacingOccurrences(of: " ", with: "")) }
-        if allNums.count == 1 { return allNums[0] }
-
-        return nil
-    }
-
-    /// 取字符串里第一个整数（自动去掉千分位逗号，如 "1,234" → 1234）。
-    private static func firstInt(in s: String) -> Int? {
-        let digits = s.filter { $0.isNumber }
-        return digits.isEmpty ? nil : Int(digits)
-    }
-
-    /// 匹配第一个「剩余/总量」比例对，返回 (remaining, total)。
-    private static func firstRatio(in s: String) -> (remaining: Int, total: Int)? {
-        // 形如 1234/2000 或 1234of2000；容错千分位。
-        let pattern = #"(\d{1,3}(?:,\d{3})*)\s*[/／]\s*(\d{1,4}(?:,\d{3})*)"#
-        guard let re = try? NSRegularExpression(pattern: pattern),
-              let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
-              let rRange = Range(m.range(at: 1), in: s),
-              let tRange = Range(m.range(at: 2), in: s) else { return nil }
-        let rStr = String(s[rRange]).filter { $0.isNumber }
-        let tStr = String(s[tRange]).filter { $0.isNumber }
-        guard let r = Int(rStr), let t = Int(tStr) else { return nil }
-        return (r, t)
     }
 }

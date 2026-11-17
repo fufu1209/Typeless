@@ -38,7 +38,49 @@ extension SwitchboardStore {
             detail: appExists ? "已找到本机 Typeless App" : "未找到本机 App，会改用官网入口",
             level: appExists ? .ok : .warning
         ))
+        // v2.8.0：把本机 Typeless 版本也报出来。
+        // 「额度直读」是按渲染层结构发现客户端的，跨小版本通常不需要改代码；
+        // 但排障时第一个要确认的就是「用户到底装的是哪一版」。
+        if let appPath = typelessAppPath() {
+            let plistPath = appPath + "/Contents/Info.plist"
+            if let plist = NSDictionary(contentsOfFile: plistPath),
+               let version = plist["CFBundleShortVersionString"] as? String {
+                results.append(DiagnosticItem(
+                    title: "Typeless 版本",
+                    detail: "本机 \(version)（直读按结构发现客户端，跨小版本不用改代码；大改版看 docs/CDP-QUOTA.md）",
+                    level: .ok
+                ))
+            }
+        }
+
         appendMacPermissionDiagnostics(to: &results)
+
+        // v2.8.0：额度直读（CDP）自检。
+        // 这一项决定了「守护能不能看到真实剩余字数」，比任何权限项都关键，
+        // 所以放在最前面、紧挨着 Typeless App 检查。
+        if state.settings.isCDPQuotaEnabled {
+            let reader = TypelessCDPQuotaReader(port: cdpQuotaPort)
+            if let snapshot = await reader.readQuota() {
+                results.append(DiagnosticItem(
+                    title: "额度直读（CDP）",
+                    detail: "正常：\(snapshot.summary)；客户端 \(snapshot.clientChunk ?? "未知")",
+                    level: .ok
+                ))
+            } else {
+                let reason = await reader.lastFailureDescription ?? "未知原因"
+                results.append(DiagnosticItem(
+                    title: "额度直读（CDP）",
+                    detail: "未连通：\(reason)。Typeless 需要以 --remote-debugging-port=\(cdpQuotaPort) 启动（额度守护页有「带端口重启」）",
+                    level: .warning
+                ))
+            }
+        } else {
+            results.append(DiagnosticItem(
+                title: "额度直读（CDP）",
+                detail: "已关闭；会退回读屏 OCR / 本地缓存估算",
+                level: .warning
+            ))
+        }
 
         if let url = URL(string: state.settings.typelessLoginURL) {
             var request = URLRequest(url: url)

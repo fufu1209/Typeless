@@ -172,27 +172,32 @@ extension SwitchboardStore {
         //    放大，宁可早换，不可该换不换。
         var degradedEstimate = false
         if !lastQuotaSyncFresh {
-            // 客户端指纹被拒是「本地无解、必须升级 App」的状态，与网络问题分开报，
-            // 不能靠降级掩盖 —— 降级只会让用户以为还在自动保护中。
-            if lastSyncHitClientNotSupported {
-                lastAutoRotateDecisionReason = "Typeless 已拒绝本客户端（客户端指纹过期），自动换号停摆：请升级 Typeless Switchboard"
-                autoRotateMonitorStatus = "⚠️ 自动换号已停摆：Typeless 拒绝本客户端指纹，需要新版本 App 适配"
-                return currentID
-            }
-            // v2.7.5：官方额度 API 被墙时，先尝试读屏取 Typeless 界面上的活额度。
-            // 读到就用它当剩余字数、走正常阈值决策（<200 可精准触发）；读不到再降级到时间轮换。
+            // v2.8.0：CDP 直读已经在 `syncActiveAppSessionAndQuota` 里试过一次了。
+            // 这一步读屏是**第二条**兜底（Typeless 没带调试端口启动时才用得上）。
+            //
+            // 顺序调整（v2.8.0）：先试读屏，再喊「客户端被拒」。
+            // v2.7.5 的顺序是反的 —— 一旦服务端返回 20006，读屏永远不会被尝试，
+            // 而读屏本来是不依赖网络的，白白废掉一条链路。
             if let screenRemaining = await readTypelessOnScreenQuota() {
                 // remainingCharacters 是只读计算属性（max(monthlyLimit - usedCharacters, 0)），
                 // 要注入读屏得到的活剩余，只能改写 usedCharacters，保持 monthlyLimit 不变。
                 let acct = state.accounts[currentIndex]
                 state.accounts[currentIndex].usedCharacters = max(acct.monthlyLimit - screenRemaining, 0)
                 liveRemainingCharacters = screenRemaining
-                lastAutoRotateDecisionReason = "额度取 Typeless 界面（API 被墙·读屏兜底），剩余 \(screenRemaining)"
+                lastQuotaSource = .screenOCR
+                lastAutoRotateDecisionReason = "额度取 Typeless 界面（直读不可用·读屏兜底），剩余 \(screenRemaining)"
+            } else if lastSyncHitClientNotSupported {
+                // 客户端指纹被拒是「本地无解、必须升级 App」的状态，与网络问题分开报，
+                // 不能靠降级掩盖 —— 降级只会让用户以为还在自动保护中。
+                lastAutoRotateDecisionReason = "Typeless 已拒绝本客户端（客户端指纹过期），自动换号停摆：请升级 Typeless Switchboard"
+                autoRotateMonitorStatus = "⚠️ 自动换号已停摆：Typeless 拒绝本客户端指纹，需要新版本 App 适配"
+                return currentID
             } else if isQuotaDataStaleBeyondDegradeThreshold {
                 degradedEstimate = true
                 isQuotaAPIDegraded = true
                 let staleMinutes = lastQuotaSyncAt.map { Int(Date().timeIntervalSince($0) / 60) } ?? -1
-                quotaDegradedReason = "官方额度 API 已 \(staleMinutes) 分钟未返回新鲜数值，降级用本地缓存估算驱动换号（阈值已放大）"
+                lastQuotaSource = .cached
+                quotaDegradedReason = "已 \(staleMinutes) 分钟没有拿到新鲜额度（直读/接口/读屏都失败），降级用本地缓存估算驱动换号（阈值已放大）"
                 lastAutoRotateDecisionReason = quotaDegradedReason
             } else {
                 lastAutoRotateDecisionReason = "本周额度 API 未刷新成功，跳过换号决策（避免陈旧数字）"
@@ -254,7 +259,8 @@ extension SwitchboardStore {
             let success = await switchActiveAccountSilently(
                 to: targetID,
                 markPreviousExhausted: currentID,
-                activateTypeless: false
+                activateTypeless: false,
+                trigger: degradedEstimate ? .degradedForced : .automatic
             )
             if success {
                 statusMessage = "无感换号完成 → \(decision.targetEmail ?? "")"
@@ -473,11 +479,13 @@ extension SwitchboardStore {
 
     /// 降级模式下「额度 API 长期不可用」时的强制轮换决策。
     ///
-    /// 背景：Typeless 给 `/user/usage_stats` 上了 Cloudflare 指纹白名单，Node / curl_cffi /
-    /// Playwright 等**所有外部客户端**都被拦（HTTP 418 / ja3_tls_code），只有官方 App 自己的
-    /// 浏览器上下文能过；而官方 App 不落盘周额度、二进制启动器还拒绝 `--remote-debugging-port`，
-    /// 所以「外部主动读额度」这条路彻底走不通 —— `quotaFresh` 永远为 false，lastQuotaSyncAt 也
-    /// 永远不更新 ⇒ 一直停在降级分支。
+    /// 背景：Typeless 给 `/user/usage_stats` 上了 JA3/TLS 指纹白名单，Node 等外部客户端的握手
+    /// 一律被拒（HTTP 418 / ja3_tls_code）；2026-11 起还叠加了客户端签名（code 20006）。
+    ///
+    /// **v2.8.0 更正**：当时认定「二进制启动器拒绝 --remote-debugging-port，所以外部读额度彻底
+    /// 走不通」是误判（终端里带了 `ELECTRON_RUN_AS_NODE=1`）。现在 CDP 直读能把额度读出来，
+    /// 这条强制轮换只在「直读 + 接口 + 读屏」全部失败时才会被触发 —— 它是最后的保险，
+    /// 不是日常路径。
     ///
     /// 老逻辑在降级分支里仍用「最后一次成功同步的冻结 remaining」做决策，冻结值不会递减 ⇒
     /// 永远 ≥ 阈值 ⇒ 永不换号，用户额度用完只能手动点「智能换号」。

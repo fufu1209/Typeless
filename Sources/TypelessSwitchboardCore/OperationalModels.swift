@@ -1194,6 +1194,39 @@ public enum BrowserAutomationScriptBuilder {
             detectedPreviousAccountEmail,
             timestamp: new Date().toISOString()
           };
+          // v2.8.0：失败时留证据。
+          //
+          // 以前「注册卡住了」只留一行 status/detail，排查全靠用户口述截图。
+          // 现在把**整页截图 + DOM 快照 + 可见输入框清单 + 可见文本**一起落盘：
+          // 页面改版、多语言、验证码框换结构，都能事后一眼看出卡在哪一步。
+          if (status !== 'completed') {
+            try {
+              const path = require('path');
+              const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+              const baseDir = path.dirname(automationResultFilePath);
+              const screenshotPath = path.join(baseDir, 'failure-' + stamp + '.png');
+              await page.screenshot({ path: screenshotPath, fullPage: true });
+              payload.screenshotPath = screenshotPath;
+
+              const domSnapshotPath = path.join(baseDir, 'failure-' + stamp + '.html');
+              fs.writeFileSync(domSnapshotPath, await page.content());
+              payload.domSnapshotPath = domSnapshotPath;
+
+              payload.visibleText = await page.evaluate(() => {
+                const text = document.body ? document.body.innerText : '';
+                return String(text || '').replace(/\\s+/g, ' ').slice(0, 800);
+              }).catch(() => '');
+              payload.visibleInputs = await page.evaluate(() => Array.from(document.querySelectorAll('input')).map((input) => ({
+                type: input.type || '',
+                name: input.name || '',
+                id: input.id || '',
+                placeholder: input.placeholder || '',
+                visible: !!(input.offsetWidth || input.offsetHeight)
+              })).slice(0, 40)).catch(() => []);
+            } catch (evidenceError) {
+              payload.evidenceError = String((evidenceError && evidenceError.message) || evidenceError).slice(0, 200);
+            }
+          }
           fs.writeFileSync(automationResultFilePath, JSON.stringify(payload, null, 2));
         }
 
@@ -1468,14 +1501,21 @@ public struct BrowserAutomationResultPayload: Codable, Equatable, Sendable {
     public var title: String
     public var detectedPreviousAccountEmail: String?
     public var timestamp: String
+    /// v2.8.0：失败时落盘的整页截图 / DOM 快照（脚本写入，老结果里没有 → nil）。
+    public var screenshotPath: String?
+    public var domSnapshotPath: String?
+    public var evidenceError: String?
 
-    public init(status: String, detail: String, url: String, title: String, detectedPreviousAccountEmail: String? = nil, timestamp: String) {
+    public init(status: String, detail: String, url: String, title: String, detectedPreviousAccountEmail: String? = nil, timestamp: String, screenshotPath: String? = nil, domSnapshotPath: String? = nil, evidenceError: String? = nil) {
         self.status = status
         self.detail = detail
         self.url = url
         self.title = title
         self.detectedPreviousAccountEmail = detectedPreviousAccountEmail
         self.timestamp = timestamp
+        self.screenshotPath = screenshotPath
+        self.domSnapshotPath = domSnapshotPath
+        self.evidenceError = evidenceError
     }
 
     public var summary: String {

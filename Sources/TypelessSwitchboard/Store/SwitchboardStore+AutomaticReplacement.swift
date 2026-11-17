@@ -7,7 +7,41 @@ import Darwin
 import TypelessSwitchboardCore
 
 extension SwitchboardStore {
+    /// 全自动注册换号（带历史记录的外层入口）。
+    ///
+    /// v2.8.0：实现挪到 `performOneClickAutomaticReplacement`。这一层只记历史 ——
+    /// 注意**热备注册不记**：它不切换当前使用号，记进去会把「换号次数」灌水。
     func runOneClickAutomaticReplacement(
+        apiKey: String,
+        domain: String,
+        expiryTime: Int,
+        from currentID: UUID?,
+        preserveCurrentAccount: Bool = false,
+        interactive: Bool = false
+    ) async -> UUID? {
+        let started = Date()
+        let result = await performOneClickAutomaticReplacement(
+            apiKey: apiKey,
+            domain: domain,
+            expiryTime: expiryTime,
+            from: currentID,
+            preserveCurrentAccount: preserveCurrentAccount,
+            interactive: interactive
+        )
+        if !preserveCurrentAccount {
+            let switched = result != nil && result != currentID
+            recordSwitchHistory(
+                trigger: .registration,
+                fromID: currentID,
+                toID: switched ? result : nil,
+                succeeded: switched,
+                startedAt: started
+            )
+        }
+        return result
+    }
+
+    private func performOneClickAutomaticReplacement(
         apiKey: String,
         domain: String,
         expiryTime: Int,

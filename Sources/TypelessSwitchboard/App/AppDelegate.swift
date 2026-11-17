@@ -53,6 +53,8 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
         }
         // v2.5.5：常驻巡检。覆盖「App 连开好几天，期间 Typeless 升级把引导标记重置了」。
         store.startOnboardingGuardIfNeeded()
+        // v2.8.0：GUI 常驻时旁听 Typeless 自己的额度刷新（零额外请求）。
+        store.startLiveQuotaWatcherIfNeeded()
         statusCancellable = store.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -104,6 +106,7 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "打开主窗口", action: #selector(showMainWindow), keyEquivalent: "o"))
         menu.addItem(NSMenuItem(title: "立即巡检额度", action: #selector(runCheckNow), keyEquivalent: "r"))
+        menu.addItem(NSMenuItem(title: "立即直读额度（CDP）", action: #selector(readQuotaNow), keyEquivalent: "d"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
@@ -131,6 +134,7 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
             button.toolTip = [
                 store.liveAccountEmail.isEmpty ? nil : "当前：\(store.liveAccountEmail)",
                 store.weeklyQuotaSummaryLine,
+                store.lastQuotaSource.map { "额度来源：\($0.displayName)" },
                 store.lastQuotaSyncFresh
                     ? "换号阈值 \(threshold)（仅本周剩余 < 阈值才自动换）"
                     : "本周额度可能陈旧：本轮不自动换号",
@@ -142,14 +146,19 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
             // 若读屏也没取到（未授屏录 / Typeless 窗口不可见 / 解析失败），给出可操作提示，
             // 避免用户误以为「悬浮窗坏了 / 没了」——它还在，只是缺数据源。
             if !store.lastQuotaSyncFresh, store.lastScreenQuotaParsed == nil {
-                button.title = "需屏录"
+                // v2.8.0：首选链路是 CDP 直读；它失败时才轮到读屏。
+                button.title = store.isCDPQuotaEnabled ? "需直读" : "需屏录"
                 button.toolTip = [
-                    "官方额度接口被 Cloudflare 挡死，且屏幕读取尚未取到额度。",
-                    "请：① 系统设置 → 隐私与安全性 → 屏幕录制，勾选 TypelessSwitchboard；",
-                    "② 保持 Typeless 窗口可见（不要最小化到完全不可见）。",
+                    store.isCDPQuotaEnabled
+                        ? "官方额度接口被 JA3 指纹墙挡死；CDP 直读也没连上（Typeless 不是带 --remote-debugging-port=\(store.cdpQuotaPort) 启动的）。"
+                        : "官方额度接口被 JA3 指纹墙挡死，且额度直读已关闭。",
+                    store.isCDPQuotaEnabled
+                        ? "① 打开「额度守护」页点「带端口重启 Typeless」；② 或授权屏幕录制作为兜底。"
+                        : "① 在「额度守护」页打开「额度直读（CDP）」；② 或授权屏幕录制作为兜底。",
+                    store.lastCDPQuotaFailure.isEmpty ? nil : "最近一次直读失败：\(store.lastCDPQuotaFailure)",
                     store.lastScreenQuotaRawText.isEmpty
                         ? nil : "最近一次读屏原始文本：\(store.lastScreenQuotaRawText)",
-                    "授权并可见后，菜单栏将显示实时剩余（低于阈值 \(threshold) 时带 ↓）。"
+                    "取到数据后，菜单栏将显示实时剩余（低于阈值 \(threshold) 时带 ↓）。"
                 ].compactMap { $0 }.joined(separator: "\n")
             } else {
                 button.title = store.lastQuotaSyncFresh ? "监控" : "?"
@@ -175,6 +184,22 @@ final class SwitchboardAppDelegate: NSObject, NSApplicationDelegate, ObservableO
             for window in NSApp.windows {
                 window.makeKeyAndOrderFront(nil)
             }
+        }
+    }
+
+    /// v2.8.0：菜单栏直接读一次额度（不触发换号、不走全量巡检）。
+    ///
+    /// 场景：用户刚点了「带端口重启 Typeless」，想马上确认直读通了 —— 不必等下一轮巡检。
+    @objc private func readQuotaNow() {
+        guard let store else { return }
+        Task { @MainActor in
+            if let snapshot = await store.readQuotaViaCDPBridge() {
+                store.applyQuotaSnapshotToMatchingAccount(snapshot)
+                store.statusMessage = "直读成功：\(snapshot.summary)"
+            } else {
+                store.statusMessage = "直读失败：\(store.lastCDPQuotaFailure)"
+            }
+            refreshStatusItemTitle()
         }
     }
 

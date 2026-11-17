@@ -29,6 +29,11 @@ struct AppSettings: Codable, Equatable, Sendable {
     /// 系统时区与本人所在时区不一致时（例如系统停在 +0700、人在深圳 +0800），
     /// 倒计时与自动复活会整体偏移。填 `Asia/Shanghai` 可锁定为北京时间。
     var quotaCycleTimeZoneIdentifier: String
+    /// v2.8.0：额度直读（CDP）。开启后拉起 Typeless 时会带 `--remote-debugging-port`，
+    /// 守护/同步直接问 Typeless 自己的渲染进程要 `usage_stats`（详见 `TypelessQuotaBridge`）。
+    var isCDPQuotaEnabled: Bool
+    /// v2.8.0：CDP 调试端口（1024–65535，默认 9333）。
+    var cdpQuotaPort: Int
 
     static let defaults = AppSettings(
         typelessLoginURL: typelessDefaultLoginURL,
@@ -49,7 +54,11 @@ struct AppSettings: Codable, Equatable, Sendable {
         autoCreateWhenPoolEmpty: true,
         hotSpareTargetCount: SmartSwitchPolicy.defaultHotSpareTarget,
         keepRunningInBackground: false,
-        quotaCycleTimeZoneIdentifier: ""
+        quotaCycleTimeZoneIdentifier: "",
+        // v2.8.0：默认开启。CDP 直读是唯一还能拿到「真实剩余字数」的链路，
+        // 关掉它等于回到「读屏 OCR + 盲轮换」。
+        isCDPQuotaEnabled: true,
+        cdpQuotaPort: TypelessQuotaBridge.defaultPort
     )
 
     enum CodingKeys: String, CodingKey {
@@ -64,6 +73,8 @@ struct AppSettings: Codable, Equatable, Sendable {
         case hotSpareTargetCount
         case keepRunningInBackground
         case quotaCycleTimeZoneIdentifier
+        case isCDPQuotaEnabled
+        case cdpQuotaPort
     }
 
     init(
@@ -77,7 +88,9 @@ struct AppSettings: Codable, Equatable, Sendable {
         autoCreateWhenPoolEmpty: Bool,
         hotSpareTargetCount: Int,
         keepRunningInBackground: Bool,
-        quotaCycleTimeZoneIdentifier: String
+        quotaCycleTimeZoneIdentifier: String,
+        isCDPQuotaEnabled: Bool = true,
+        cdpQuotaPort: Int = TypelessQuotaBridge.defaultPort
     ) {
         self.typelessLoginURL = typelessLoginURL
         self.moeMailBaseURL = moeMailBaseURL
@@ -90,6 +103,8 @@ struct AppSettings: Codable, Equatable, Sendable {
         self.hotSpareTargetCount = hotSpareTargetCount
         self.keepRunningInBackground = keepRunningInBackground
         self.quotaCycleTimeZoneIdentifier = quotaCycleTimeZoneIdentifier
+        self.isCDPQuotaEnabled = isCDPQuotaEnabled
+        self.cdpQuotaPort = TypelessQuotaBridge.normalizePort(cdpQuotaPort)
     }
 
     /// 周额度周期时区。空串（跟随系统）时返回 nil，由调用方回落到 `TimeZone.current`。
@@ -127,6 +142,12 @@ struct AppSettings: Codable, Equatable, Sendable {
         // 空串 = 跟随系统，与 v2.5.5 之前「一律用系统时区」的行为一致，老 store.json 无需迁移。
         quotaCycleTimeZoneIdentifier = try container.decodeIfPresent(String.self, forKey: .quotaCycleTimeZoneIdentifier)
             ?? fallback.quotaCycleTimeZoneIdentifier
+        // v2.8.0：老 store.json 没有这两个键 → 用默认值（开启 / 9333），不挡解码。
+        isCDPQuotaEnabled = try container.decodeIfPresent(Bool.self, forKey: .isCDPQuotaEnabled)
+            ?? fallback.isCDPQuotaEnabled
+        cdpQuotaPort = TypelessQuotaBridge.normalizePort(
+            try container.decodeIfPresent(Int.self, forKey: .cdpQuotaPort) ?? fallback.cdpQuotaPort
+        )
     }
 }
 
@@ -180,10 +201,15 @@ struct PersistedState: Codable, Equatable, Sendable {
     /// 最近一次**因额度 API 不可用而强制轮换**（降级模式：池内静默换到新鲜号）的时刻。
     ///
     /// v2.7.1 新增。背景：Typeless 在 2026-10-14 起对 `/user/usage_stats` 上线
-    /// Cloudflare 指纹白名单（HTTP 418 / ja3_tls_code），Node / curl_cffi / Playwright
-    /// 等**所有外部客户端**都被拦，只有 Typeless 官方 App 自己的浏览器上下文能过。
-    /// 官方 App 又不把周额度落盘、二进制启动器还拒绝 `--remote-debugging-port`，
-    /// 所以「外部主动读额度」这条路彻底走不通（`quotaFresh` 永远为 false）。
+    /// TLS 指纹（JA3）白名单（HTTP 418 / ja3_tls_code），Node 等外部客户端的握手
+    /// 一律被拒；2026-11-17 实测又叠加了「客户端签名」这道门（code 20006）。
+    ///
+    /// **v2.8.0 更正**：当时认为「二进制启动器拒绝 --remote-debugging-port，所以没有
+    /// 任何外部读额度的办法」是**误判** —— 那次测试的终端里带着
+    /// `ELECTRON_RUN_AS_NODE=1`，Electron 因此退化成 node 解释器，把该参数当成
+    /// 非法选项拒了。去掉这个环境变量后，Typeless 正常接受该参数，CDP 直读可用
+    /// （见 `TypelessQuotaBridge`）。这条降级路径仍然保留：Typeless 没带端口启动时
+    /// 它就是最后一道兜底。
     ///
     /// 老逻辑在「额度陈旧」时仍用**最后一次成功同步的冻结剩余值**做决策，这个值不会
     /// 递减 ⇒ 永远 ≥ 阈值 ⇒ 永不换号，用户额度用完只能手动点「智能换号」。
@@ -210,6 +236,11 @@ struct PersistedState: Codable, Equatable, Sendable {
     /// 最多一小时一次，绝不会把资源烧成火焰山。
     var autoRegistrationConsecutiveFailures: Int?
 
+    /// v2.8.0：换号历史（新的在前，最多 `SwitchHistory.maximumEntries` 条）。
+    /// 只记结果与耗时，不含任何令牌 / 密码 / 会话 payload。
+    /// 可选类型：旧 store.json 缺这个键 → nil，不挡解码。
+    var switchHistory: [SwitchHistoryEntry]?
+
     static let empty = PersistedState(
         accounts: [],
         settings: .defaults,
@@ -222,7 +253,8 @@ struct PersistedState: Codable, Equatable, Sendable {
         lastQuotaSyncAt: nil,
         lastForcedRotationAt: nil,
         lastAutoRegistrationAttemptAt: nil,
-        autoRegistrationConsecutiveFailures: nil
+        autoRegistrationConsecutiveFailures: nil,
+        switchHistory: []
     )
 }
 

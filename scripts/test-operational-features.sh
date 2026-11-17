@@ -5,4 +5,6 @@ cd "$(dirname "$0")/.."
 # 编译 Package.swift manifest，本机（及部分受限 shell / Agent 环境）会直接失败：
 #   sandbox-exec: sandbox_apply: Operation not permitted
 # 不是代码问题，是构建环境不允许再套一层沙箱。
+source "$(dirname "$0")/lib-sdk-fallback.sh"
+# TYPELESS_CDP_LIVE=1 时额外跑一次真实 CDP 直读（需要 Typeless 带调试端口启动）
 swift run --disable-sandbox OperationalFeatureChecks

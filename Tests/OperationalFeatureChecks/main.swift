@@ -1939,10 +1939,17 @@ struct OperationalFeatureChecks {
         check(LegacyQuotaRescale.migrationKey.hasSuffix("_v1"),
               "幂等键必须带版本后缀，将来再改口径才能换新键重跑")
 
-        // 2) 阈值换算：旧默认 200 → 新默认 120；其余原样
+        // 2) 阈值换算。
+        //
+        // 历史：8000 时代默认阈值 200，2000 时代曾下调到 120（v2.6.0），
+        // v2.7.4 按用户明确要求又调回 200。于是这条迁移现在**不该再改任何东西**：
+        // 「旧默认 200」与「新默认 200」相等，换算必须是恒等。
+        // 这里断言恒等，而不是硬编码 120 —— 否则默认值一变，测试就在骗人
+        // （v2.7.4 之后它就是一直失败的状态，只是之前没人跑 checks）。
+        check(SmartSwitchPolicy.defaultRemainingThreshold == 200,
+              "默认阈值必须与 v2.7.4 的用户决定一致（剩余 < 200 即切换）")
         check(LegacyQuotaRescale.rescaledThreshold(200) == SmartSwitchPolicy.defaultRemainingThreshold,
-              "阈值 200（8000 时代旧默认）必须换算成 \(SmartSwitchPolicy.defaultRemainingThreshold)")
-        check(LegacyQuotaRescale.rescaledThreshold(200) == 120, "新默认阈值必须是 120")
+              "阈值 200（8000 时代旧默认）换算后必须等于当前默认值")
         for custom in [0, 1, 50, 100, 150, 199, 201, 300, 500, 50_000] {
             check(LegacyQuotaRescale.rescaledThreshold(custom) == custom,
                   "用户自定义阈值 \(custom) 必须原样保留（不得被迁移覆盖）")
@@ -1962,12 +1969,16 @@ struct OperationalFeatureChecks {
         check(migrated * (SmartSwitchPolicy.urgentRemainingMultiplier - 1)
                 >= SmartSwitchPolicy.assumedDictationWordsPerMinute,
               "换算后的阈值 \(migrated) 必须仍满足安全不变式")
-        check(migrated < LegacyQuotaRescale.legacyThreshold,
-              "换算必须把阈值调**小**（2000 字/周下 200 等于白扔 10% 额度）")
+        // v2.7.4 之后默认阈值回到 200，这条迁移变成**恒等**映射。
+        // 仍要断言它「不会把用户手改过的值改坏」，但不能再要求「必须调小」——
+        // 那是 120 时代的口径，继续留着就是在测试里写死一个已经不成立的事实。
+        check(migrated == SmartSwitchPolicy.defaultRemainingThreshold,
+              "换算结果必须等于当前默认阈值（v2.7.4 起为恒等映射）")
 
         // 5) 两次调用结果一致（纯函数、无副作用、可安全重跑）
         for _ in 0..<50 {
-            check(LegacyQuotaRescale.rescaledThreshold(200) == 120, "阈值换算必须稳定")
+            check(LegacyQuotaRescale.rescaledThreshold(200) == SmartSwitchPolicy.defaultRemainingThreshold,
+                  "阈值换算必须稳定")
             check(LegacyQuotaRescale.rescaledWeeklyLimit(8000) == 2000, "额度换算必须稳定")
         }
     }
@@ -2219,8 +2230,8 @@ struct OperationalFeatureChecks {
     ///     阈值 × (紧急倍率 − 1) ≥ 两次常规巡检之间最大可能消耗的字数
     /// 不满足就会在巡检间隙直接撞到 0（听写中途断掉）。
     private static func runThresholdBoundaryChecks() {
-        let threshold = SmartSwitchPolicy.defaultRemainingThreshold  // 120
-        check(threshold == 120, "默认阈值必须=120（v2.6.0 契约）")
+        let threshold = SmartSwitchPolicy.defaultRemainingThreshold
+        check(threshold == 200, "默认阈值必须与 v2.7.4 的用户决定一致（剩余 < 200 即切换）")
 
         // 0) 安全不变式：这条比具体数值更重要 —— 以后谁再调阈值/倍率，先过这一关
         let worstCaseBurn = SmartSwitchPolicy.assumedDictationWordsPerMinute
@@ -2229,45 +2240,43 @@ struct OperationalFeatureChecks {
               + "必须 ≥ 每分钟最大消耗 \(worstCaseBurn) 字，否则会在巡检间隙撞到 0")
         check(SmartSwitchPolicy.urgentRemainingMultiplier > 1,
               "紧急倍率必须 > 1，否则不存在「常规带」，不变式无意义")
-        // 阈值不得大到把整个周额度都吃掉（2000 字里的 120 = 6%）
+        // 阈值不得大到把整个周额度都吃掉（2000 字里的 200 = 10%，用户主动接受的取舍）
         check(threshold * 4 <= QuotaCycleEngine.defaultWeeklyLimit,
               "阈值 \(threshold) 必须远小于周额度 \(QuotaCycleEngine.defaultWeeklyLimit)（否则换号等于白换）")
 
-        // 1) 严格 < 语义
-        check(SmartSwitchPolicy.isQuotaLow(remaining: 120, threshold: threshold) == false,
-              "isQuotaLow(120, 120) 必须 false（边界 = 阈值不算低）")
-        check(SmartSwitchPolicy.isQuotaLow(remaining: 121, threshold: threshold) == false,
-              "isQuotaLow(121, 120) 必须 false（>阈值不算低）")
-        check(SmartSwitchPolicy.isQuotaLow(remaining: 119, threshold: threshold) == true,
-              "isQuotaLow(119, 120) 必须 true（<阈值才算低，触发换号）")
+        // 1) 严格 < 语义（边界值一律用 threshold 推，别再写死 120）
+        check(SmartSwitchPolicy.isQuotaLow(remaining: threshold, threshold: threshold) == false,
+              "isQuotaLow(阈值, 阈值) 必须 false（边界 = 阈值不算低）")
+        check(SmartSwitchPolicy.isQuotaLow(remaining: threshold + 1, threshold: threshold) == false,
+              "isQuotaLow(阈值+1, 阈值) 必须 false（>阈值不算低）")
+        check(SmartSwitchPolicy.isQuotaLow(remaining: threshold - 1, threshold: threshold) == true,
+              "isQuotaLow(阈值-1, 阈值) 必须 true（<阈值才算低，触发换号）")
         check(SmartSwitchPolicy.isQuotaLow(remaining: 1, threshold: threshold) == true,
-              "isQuotaLow(1, 120) 必须 true（接近 0）")
+              "isQuotaLow(1, 阈值) 必须 true（接近 0）")
         check(SmartSwitchPolicy.isQuotaLow(remaining: 0, threshold: threshold) == true,
-              "isQuotaLow(0, 120) 必须 true（用完）")
+              "isQuotaLow(0, 阈值) 必须 true（用完）")
 
-        // 2) 负数不视为"低"（避免 Typeless 返回异常时误触发换号）
-        //    注：实际是 normalized 用的 max(threshold, 0)，负 threshold 被钳为 0
-        //    但负 remaining < 0 仍然 < 0 钳后阈值 0，恒为 true。
+        // 2) 负数剩余按「已透支」处理；threshold 传负数会被钳为 0
         check(SmartSwitchPolicy.isQuotaLow(remaining: -1, threshold: threshold) == true,
-              "isQuotaLow(-1, 120) 必须 true（负数剩余按\"已透支\"处理）")
+              "isQuotaLow(-1, 阈值) 必须 true（负数剩余按\"已透支\"处理）")
         check(SmartSwitchPolicy.isQuotaLow(remaining: 100, threshold: 0) == false,
               "isQuotaLow(100, 0)：threshold 被钳为 0，100>0 不算低")
 
-        // 3) isApproachingQuotaLimit：< threshold * urgentMultiplier（= 4）= 480 时进入加速
-        let urgentEdge = threshold * SmartSwitchPolicy.urgentRemainingMultiplier  // 480
+        // 3) isApproachingQuotaLimit：< threshold * urgentMultiplier 时进入加速
+        let urgentEdge = threshold * SmartSwitchPolicy.urgentRemainingMultiplier
         check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: urgentEdge, threshold: threshold) == false,
-              "isApproachingQuotaLimit(\(urgentEdge), 120) 必须 false（边界 = 阈值*倍率 不算接近）")
+              "isApproachingQuotaLimit(\(urgentEdge), \(threshold)) 必须 false（边界 = 阈值*倍率 不算接近）")
         check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: urgentEdge - 1, threshold: threshold) == true,
-              "isApproachingQuotaLimit(\(urgentEdge - 1), 120) 必须 true（<阈值*倍率 触发加速巡检）")
-        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: 120, threshold: threshold) == true,
-              "isApproachingQuotaLimit(120, 120) 必须 true（<480 触发加速）")
+              "isApproachingQuotaLimit(\(urgentEdge - 1), \(threshold)) 必须 true（<阈值*倍率 触发加速巡检）")
+        check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: threshold, threshold: threshold) == true,
+              "isApproachingQuotaLimit(\(threshold), \(threshold)) 必须 true（阈值本身已进入加速带）")
         check(SmartSwitchPolicy.isApproachingQuotaLimit(remaining: 2000, threshold: threshold) == false,
-              "isApproachingQuotaLimit(2000, 120) 必须 false（额度充足）")
+              "isApproachingQuotaLimit(2000, \(threshold)) 必须 false（额度充足）")
 
         // 4) nextCheckDelaySeconds：接近阈值时 20s，否则按分钟配置
-        let fast = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 100, threshold: 120, intervalMinutes: 10)
-        let slow = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 5000, threshold: 120, intervalMinutes: 10)
-        let nilCase = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: nil, threshold: 120, intervalMinutes: 10)
+        let fast = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 100, threshold: threshold, intervalMinutes: 10)
+        let slow = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: 5000, threshold: threshold, intervalMinutes: 10)
+        let nilCase = SmartSwitchPolicy.nextCheckDelaySeconds(remaining: nil, threshold: threshold, intervalMinutes: 10)
         check(fast <= 60, "接近阈值时本轮 sleep 必须 <= 60s（实际: \(fast)）")
         check(slow == 10 * 60, "额度充足时按分钟配置 sleep（10 分钟 = 600s）")
         check(nilCase == 10 * 60, "remaining=nil 时按默认间隔 sleep（避免无数据时高频）")
@@ -2275,32 +2284,24 @@ struct OperationalFeatureChecks {
         // 5) normalizeThreshold：负数/超大值都钳到合法范围
         check(SmartSwitchPolicy.normalizeThreshold(-50) == 0, "负阈值被钳为 0")
         check(SmartSwitchPolicy.normalizeThreshold(0) == 0, "0 阈值合法")
-        check(SmartSwitchPolicy.normalizeThreshold(120) == 120, "120 原样保留")
+        check(SmartSwitchPolicy.normalizeThreshold(threshold) == threshold, "默认阈值原样保留")
         check(SmartSwitchPolicy.normalizeThreshold(100_000) == 50_000,
               "超大阈值被钳为上限 50_000")
 
-        // 6) 不抖动：阈值附近的 118/119/120/121/122 各跑一次，状态必须单调
-        var lowFlags: [Bool] = []
-        for r in [118, 119, 120, 121, 122] {
-            lowFlags.append(SmartSwitchPolicy.isQuotaLow(remaining: r, threshold: 120))
-        }
-        // 期望：[true, true, false, false, false] — 120 是「回到不低」的拐点
+        // 6) 不抖动：阈值附近逐个跑一次，状态必须单调
+        let probes = [threshold - 2, threshold - 1, threshold, threshold + 1, threshold + 2]
+        let lowFlags = probes.map { SmartSwitchPolicy.isQuotaLow(remaining: $0, threshold: threshold) }
         check(lowFlags == [true, true, false, false, false],
               "isQuotaLow 在阈值附近必须单调：\(lowFlags)")
 
-        // 7) 状态机在边界处稳定：低于阈值时连续多轮 isQuotaLow 都返回 true
+        // 7) 状态机在边界处稳定：低于阈值时连续多轮都返回 true
         let consecutive = (0..<5).map { _ in
-            SmartSwitchPolicy.isQuotaLow(remaining: 50, threshold: 200)
+            SmartSwitchPolicy.isQuotaLow(remaining: max(threshold - 150, 0), threshold: threshold)
         }
         check(consecutive.allSatisfy { $0 },
               "连续多次低于阈值，结果必须稳定为 true（不抖动）")
 
-        // 8) v2.6.0：静默换号的等待预算必须覆盖 Electron 冷启动
-        //
-        // 这是一条**回归锁**。旧值 2 秒不是「保守取值」，是实测错误：
-        // Typeless 冷启动到读盘完成约 120 秒，而旧实现是「死等 2 秒 + 8 轮 × 2 秒校验」，
-        // 合计最多 18 秒 —— 冷启动场景必然报「注入后未能确认目标账号已生效」。
-        // 更糟的是上层把已经写好的会话当失败，继续换下一个号，白白烧掉一个账号的额度。
+        // 8) 静默换号的等待预算必须覆盖 Electron 冷启动（回归锁）
         let coldStartSeconds: UInt64 = 120
         check(SmartSwitchPolicy.silentInjectSettleSeconds >= coldStartSeconds,
               "静默注入等待上限 \(SmartSwitchPolicy.silentInjectSettleSeconds)s "
@@ -3028,5 +3029,154 @@ struct OperationalFeatureChecks {
               "重载安全：必须有基于 launchctl 的 isLoaded（只看 plist 文件会重演静默失效）")
         check(agentSrc.contains("reloadVerified"),
               "重载安全：重载必须走校验式路径")
+
+        // MARK: - v2.8.0 额度直读（CDP）与读屏解析
+
+        // 1. 端口规范化：非法值必须回到默认，绝不把 0/8080 这种值透传出去
+        check(TypelessQuotaBridge.normalizePort(9333) == 9333, "CDP：合法端口原样保留")
+        check(TypelessQuotaBridge.normalizePort(80) == TypelessQuotaBridge.defaultPort,
+              "CDP：<1024 的端口必须回落默认（普通用户绑不上）")
+        check(TypelessQuotaBridge.normalizePort(0) == TypelessQuotaBridge.defaultPort, "CDP：0 端口回落默认")
+        check(TypelessQuotaBridge.normalizePort(70_000) == TypelessQuotaBridge.defaultPort, "CDP：越界端口回落默认")
+
+        // 2. /json/list 解析与页面选择：floating-bar 优先（常驻、不遮挡、不打断听写）
+        let listJSON = """
+        [
+          {"type":"page","id":"A","url":"file:///Applications/Typeless.app/Contents/Resources/app.asar/dist/renderer/hub.html","webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/page/A"},
+          {"type":"page","id":"B","url":"file:///Applications/Typeless.app/Contents/Resources/app.asar/dist/renderer/floating-bar.html","webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/page/B"},
+          {"type":"page","id":"C","url":"https://example.com/","webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/page/C"},
+          {"type":"service_worker","id":"D","url":"file:///x.asar/sw.js","webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/page/D"}
+        ]
+        """
+        let targets = TypelessQuotaBridge.decodeTargets(Data(listJSON.utf8))
+        check(targets.count == 3, "CDP：只接受 page 类型目标（service_worker 不算）")
+        check(TypelessQuotaBridge.preferredTarget(in: targets)?.id == "B",
+              "CDP：优先挑 floating-bar 页面")
+        let hubOnly = targets.filter { $0.id != "B" }
+        check(TypelessQuotaBridge.preferredTarget(in: hubOnly)?.id == "A",
+              "CDP：没有 floating-bar 时退到 hub")
+        check(TypelessQuotaBridge.preferredTarget(in: []) == nil, "CDP：没有 Typeless 页面时返回 nil")
+
+        // 3. 探针表达式：按形状找客户端、只读 auth 的邮箱/ID，绝不回传令牌
+        let expression = TypelessQuotaBridge.probeExpression()
+        check(expression.contains("modulepreload"), "CDP：探针必须优先用 modulepreload 发现 chunk")
+        check(expression.contains("buildUrl"), "CDP：按形状（post + buildUrl）识别客户端，不硬编码导出名")
+        check(expression.contains("auth:get-current"), "CDP：顺带读当前登录邮箱")
+        check(!expression.contains("print("), "CDP：探针表达式里不该有调试打印")
+        check(!expression.lowercased().contains("accesstoken"), "CDP：探针不得返回访问令牌")
+
+        // 4. 探针结果解析：正常 / 脏数据 / 声称成功但缺字段
+        let okProbe = #"{"ok":true,"used":252,"limit":23333,"wpm":229.71,"minsSaved":7.83,"email":"a@b.com","userId":"u-1","chunk":"fw3XiDt9.js","tried":6}"#
+        let okSnapshot = TypelessQuotaBridge.decodeProbe(okProbe)
+        check(okSnapshot?.remainingCharacters == 23081, "CDP：剩余 = 上限 - 已用")
+        check(okSnapshot?.email == "a@b.com", "CDP：解析邮箱")
+        check(okSnapshot?.clientChunk == "fw3XiDt9.js", "CDP：保留命中的 chunk 名（排错用）")
+        check(TypelessQuotaBridge.decodeProbe(#"{"ok":false,"error":"no-client"}"#) == nil,
+              "CDP：失败探针不得产出快照")
+        check(TypelessQuotaBridge.decodeProbe(#"{"ok":true,"used":10}"#) == nil,
+              "CDP：缺上限的探针必须拒绝")
+        check(TypelessQuotaBridge.decodeProbe(#"{"ok":true,"used":1,"limit":0}"#) == nil,
+              "CDP：上限为 0 必须拒绝（防止除零 / 满额度假象）")
+
+        // 5. 官方 usage_stats 报文（2.12.0 实测形状）也能解，保证降级兼容
+        let usageBody = #"{"status":"OK","msg":"success","data":{"voice_transcription":{"total_words":179,"total_audio_seconds":72.43,"avg_wpm":222.82,"mins_saved":5.52,"week_word_usage_limit":23333,"week_word_usage_value":179}}}"#
+        let apiSnapshot = TypelessQuotaBridge.decodeUsageStatsBody(usageBody)
+        check(apiSnapshot?.usedCharacters == 179, "API 报文：解析已用")
+        check(apiSnapshot?.weeklyLimit == 23333, "API 报文：解析上限（Pro 试用 23333）")
+        check(apiSnapshot?.source == .officialAPI, "API 报文：来源标注正确")
+
+        // 6. 脱敏：JWT 与 40 位十六进制密钥都不得出现在日志里
+        let jwt = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWJqZWN0Ijp7InVzZXJfaWQiOiIwOTdmIn0.signaturepart123"
+        let redacted = TypelessQuotaBridge.redactSecrets(in: "token=\(jwt) key=c0d8ed41321be9c43686ea47291b85116fe355e3a129d574d97c39a8")
+        check(!redacted.contains("eyJ0eXAi"), "脱敏：JWT 必须被抹掉")
+        check(!redacted.contains("c0d8ed41321be9c4"), "脱敏：40 位密钥必须被抹掉")
+
+        // 7. 读屏解析：日期/上限/比例方向这三个坑必须逐个堵上
+        check(QuotaScreenTextParser.parse(from: ["2026年10月25日", "18:32", "v2.12.0"]) == nil,
+              "读屏：日期/时间/版本号不得被当成额度")
+        check(QuotaScreenTextParser.parse(from: ["本周剩余 1,834 字", "本周已用 166 字"])?.remaining == 1834,
+              "读屏：关键字近邻数字")
+        check(QuotaScreenTextParser.parse(from: ["本周额度 23333 字", "已用 179 字"])?.remaining == 23154,
+              "读屏：只有上限 + 已用时要相减，不能把上限当剩余")
+        check(QuotaScreenTextParser.parse(from: ["已用 179 / 2000"])?.remaining == 1821,
+              "读屏：「已用 X / Y」的方向是剩余 = Y - X")
+        check(QuotaScreenTextParser.parse(from: ["剩余 179 / 2000"])?.remaining == 179,
+              "读屏：「剩余 X / Y」的方向是 X")
+        check(QuotaScreenTextParser.parse(from: ["Remaining: 1,234 of 2,000"])?.remaining == 1234,
+              "读屏：英文 of 比例式")
+        check(QuotaScreenTextParser.parse(from: ["本周剩余", "1,234 字"])?.remaining == 1234,
+              "读屏：关键字与数字被 OCR 拆成两行时也要能接上")
+        check(QuotaScreenTextParser.parse(from: ["0 字", "0 min", "0%"]) == nil,
+              "读屏：多个无意义数字时返回 nil，不硬猜")
+
+        // 8. 换号历史：追加裁剪 / 统计 / CSV 转义
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var history: [SwitchHistoryEntry] = []
+        for index in 0..<(SwitchHistory.maximumEntries + 20) {
+            history = SwitchHistory.appending(
+                SwitchHistoryEntry(
+                    at: now.addingTimeInterval(Double(-index) * 60),
+                    fromEmail: "a@x.com",
+                    toEmail: "b@x.com",
+                    trigger: .automatic,
+                    succeeded: index % 2 == 0,
+                    durationSeconds: Double(index),
+                    note: ""
+                ),
+                to: history
+            )
+        }
+        check(history.count == SwitchHistory.maximumEntries, "历史：必须裁剪到上限")
+        check(history.first?.at == now, "历史：新记录在前")
+
+        let entries = [
+            SwitchHistoryEntry(at: now, trigger: .automatic, succeeded: true, durationSeconds: 4),
+            SwitchHistoryEntry(at: now.addingTimeInterval(-60), trigger: .manual, succeeded: true, durationSeconds: 8),
+            SwitchHistoryEntry(at: now.addingTimeInterval(-120), trigger: .registration, succeeded: false, durationSeconds: 20),
+            SwitchHistoryEntry(at: now.addingTimeInterval(-8 * 86_400), trigger: .automatic, succeeded: true, durationSeconds: 100)
+        ]
+        let summary = SwitchHistory.summarize(entries, now: now, windowDays: 7)
+        check(summary.total == 3, "统计：窗口外的记录不计入")
+        check(summary.succeeded == 2 && summary.failed == 1, "统计：成功/失败计数")
+        check(abs(summary.averageSeconds - (4 + 8 + 20) / 3.0) < 0.001, "统计：平均耗时")
+        check(abs(summary.medianSeconds - 8) < 0.001, "统计：中位耗时")
+        check(summary.byTrigger[.automatic] == 1, "统计：按触发方式分组")
+        check(SwitchHistory.summaryLine(SwitchHistory.summarize([], now: now)).contains("还没有"),
+              "统计：空历史文案")
+
+        let csv = SwitchHistory.csv([
+            SwitchHistoryEntry(
+                at: now,
+                fromEmail: "a@x.com",
+                toEmail: "b@x.com",
+                trigger: .manual,
+                succeeded: true,
+                durationSeconds: 3.5,
+                note: "含,逗号与\"引号"
+            )
+        ])
+        check(csv.hasPrefix("时间,触发方式,结果"), "CSV：表头")
+        check(csv.contains("\"含,逗号与\"\"引号\""), "CSV：逗号与引号必须转义：\(csv)")
+        check(csv.components(separatedBy: "\n").count == 2, "CSV：一行一条记录")
+
+        // 9. 真实链路（可选）：TYPELESS_CDP_LIVE=1 时直连本机 Typeless 验证
+        if ProcessInfo.processInfo.environment["TYPELESS_CDP_LIVE"] == "1" {
+            final class SnapshotBox: @unchecked Sendable {
+                var value: TypelessQuotaSnapshot?
+                var failure: String?
+            }
+            let box = SnapshotBox()
+            let port = Int(ProcessInfo.processInfo.environment["TYPELESS_CDP_PORT"] ?? "") ?? TypelessQuotaBridge.defaultPort
+            let semaphore = DispatchSemaphore(value: 0)
+            Task {
+                let reader = TypelessCDPQuotaReader(port: port)
+                box.value = await reader.readQuota()
+                if box.value == nil { box.failure = await reader.lastFailureDescription }
+                semaphore.signal()
+            }
+            semaphore.wait()
+            check(box.value != nil, "CDP 真实链路：读不到额度（\(box.failure ?? "unknown")）")
+            print("CDP 直读：\(box.value?.summary ?? "-")；客户端 \(box.value?.clientChunk ?? "-")")
+        }
     }
 }

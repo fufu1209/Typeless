@@ -46,11 +46,32 @@ final class SwitchboardStore: ObservableObject {
     @Published var liveRemainingCharacters: Int?
     @Published var liveAccountEmail = ""
 
+    // MARK: - v2.8.0 额度直读（CDP）
+    //
+    // 直读是现在唯一还能拿到「真实剩余字数」的链路：官方接口同时被客户端签名和
+    // JA3/TLS 指纹墙挡着，读屏 OCR 依赖权限与窗口可见性。见 `TypelessQuotaBridge`。
+    /// 最近一次成功读数的来源（CDP / 官方接口 / 读屏 / 缓存）。UI 必须显示它，
+    /// 否则用户会把「估算值」当成实测值。
+    @Published var lastQuotaSource: TypelessQuotaSource?
+    /// 最近一次直读失败的原因（中文，可直接进日志/UI）。成功时清空。
+    @Published var lastCDPQuotaFailure = ""
+    /// v2.8.0：实时监听（CDP Network 事件）收到的额度更新次数 / 时间。
+    /// Typeless 自己刷新额度时，我们会旁听到同一份响应，不需要额外请求。
+    @Published var liveQuotaEventCount = 0
+    @Published var lastLiveQuotaEventAt: Date?
+    /// 实时监听器与它的消费任务（GUI 常驻期间存在）。
+    var liveQuotaWatcher: TypelessQuotaLiveWatcher?
+    var liveQuotaWatcherTask: Task<Void, Never>?
+
     // MARK: - 额度 API 降级（v2.6.7）
     //
     // 背景：Typeless 服务端 2026-10-14 起对 `/user/usage_stats` 上线 JA3/TLS 指纹白名单
-    // （HTTP 418 / code 101010100 / ja3_tls_code），Node 与 Chromium 的握手指纹都不在
-    // 名单内，整条额度读取链路失效。
+    // （HTTP 418 / code 101010100 / ja3_tls_code）。**Node 的握手不在名单内**，
+    // 所以「脚本自己发请求」这条路失效；Chromium 的握手指纹是通的，真正拦住浏览器
+    // 上下文的是另一道门 —— 客户端签名（code 20006）。
+    //
+    // v2.8.0 起额度链路改为 CDP 直读（在 Typeless 渲染进程里用 App 自己的客户端发请求，
+    // 两道门一起过）。下面这套降级逻辑仍然保留：直读没连上时它还能顶着。
     //
     // 而 `performAutoRotateCheck` 的旧逻辑是「API 不新鲜就跳过换号决策」——
     // 这在 API **偶尔**抖动时是对的（避免陈旧数字误触发），但 API **持续**失效时

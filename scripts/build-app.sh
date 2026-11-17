@@ -36,15 +36,9 @@ fi
 #   error: external macro implementation type 'SwiftUIMacros.StateMacro' could not be found
 # 这不是代码问题，是工具链缺件。所以没有 Xcode 时回退到仍能编译的 26.x SDK。
 # 装了 Xcode 的话什么都不用做，走系统默认。
-if [[ -z "${SDKROOT:-}" && ! -d "/Applications/Xcode.app" ]]; then
-  for candidate in /Library/Developer/CommandLineTools/SDKs/MacOSX26.*.sdk; do
-    if [[ -d "$candidate" ]]; then
-      export SDKROOT="$candidate"
-      echo "NOTE: 未检测到 Xcode，使用 SDK $(basename "$SDKROOT") 构建"
-      break
-    fi
-  done
-fi
+# v2.8.0：这段逻辑抽到 scripts/lib-sdk-fallback.sh，与两个测试脚本共用 ——
+# 以前只有这里处理「没有 Xcode」，测试脚本直接 `swift run` 就挂，容易误判成代码坏了。
+source "$(dirname "$0")/lib-sdk-fallback.sh"
 
 # `--disable-sandbox`：SwiftPM 默认用 sandbox-exec 编译 Package.swift 的 manifest，
 # 而在本机（以及部分受限 shell / Agent 环境）里 sandbox-exec 会直接失败：

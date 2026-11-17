@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.7.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.8.0-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -86,6 +86,7 @@ open /Applications/TypelessSwitchboard.app
 - [推荐使用方式](#推荐使用方式)
 - [macOS 权限](#macos-权限)
 - [全自动一键换号流程](#全自动一键换号流程)
+- [额度直读（CDP）](#额度直读cdp)
 - [开机轻量额度守护](#开机轻量额度守护推荐不必一直开着-app)
 - [数据保存位置](#数据保存位置)
 - [域名邮箱搭建](docs/DEPLOYMENT.md)
@@ -98,9 +99,15 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.7.0**（2026-10-25）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.8.0**（2026-11-17）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-最近的主要变化：**账号池扩容管线**（v2.7.0 —— CLI 批量注册上限 5→100，
+最近的主要变化：**额度直读（CDP）**（v2.8.0 —— 官方 `/user/usage_stats` 同时被
+客户端签名和 JA3/TLS 指纹墙挡着，Node 直连必然 418。现在改为连 Typeless 自己的
+DevTools 端口，在渲染进程里用**它自己的 API 客户端**发请求：两道门一起过，
+读到的是服务端原值，不需要屏幕录制权限。实测一次读取 0.2–0.8 秒；
+`--probe-quota` / `scripts/probe-quota-cdp.js` 可独立验证。
+顺带修掉读屏解析的三个坑：把日期当额度、把「上限」当「剩余」、把`已用 X/Y` 的方向弄反）、
+**账号池扩容管线**（v2.7.0 —— CLI 批量注册上限 5→100，
 新增 `--auto-switch-preserve-current` 热备模式：只加号、不碰桌面登录态，
 轮次间隔默认 30 秒防速率压力；支撑「池子 50 个左右、承载高压测试」的运维需求）、
 **选号算法稳定化**（v2.6.9 —— 审查 7069 行守护日志证实算法本身不抖，
@@ -137,6 +144,15 @@ launchd 却显示一切正常；现在守护只读 0600 边车密源，另加 20
 - 通过 MoeMail API 生成邮箱并导入账号池。
 - 一键用 MoeMail 生成注册候选账号：创建真实邮箱、生成用户名、复制强密码，并放入兜底确认队列。
 - 读取当前已关联 MoeMail 邮箱的邮件摘要，方便兜底查看验证码邮件。
+- **额度实时同步（v2.8.0）**：GUI 常驻时旁听 Typeless 自己的额度刷新（CDP Network 事件），
+  App 一刷新我们立刻同步，**不额外发请求、不解析界面文字**。
+- **换号历史 / 运营看板（v2.8.0）**：每次换号记一条「结果 + 耗时 + 原账号 → 新账号 + 触发方式」，
+  给出近 7 天成功率与中位耗时，可一键复制 CSV。
+- **注册失败现场证据（v2.8.0）**：注册卡住时自动落盘整页截图 + DOM 快照，
+  「自检排障」页可直接打开，不用再靠口述截图。
+- **额度直读（CDP，v2.8.0）**：直接问 Typeless 自己的渲染进程要 `usage_stats` ——
+  签名、Cookie、TLS 指纹都是官方的，所以既不会被 JA3 指纹墙挡（HTTP 418），
+  也不需要屏幕录制权限。读到的是**服务端原值**（`week_word_usage_value / _limit`）。
 - **开机轻量额度守护（推荐，不必常驻 GUI）**：用 macOS LaunchAgent 定时执行 `--daemon-check`。**只有剩余字数 &lt; 阈值（默认 120）才自动换号**；额度够只检查就退出。登录后自动跑，不要求一直开着本窗口。
 - **App 内循环监控（可选）**：打开 App 时可勾选「打开本 App 时循环监控」；默认关闭，避免占后台。
 - **热备池**：额度还够时，后台预注册 1 个带静默会话缓存的备用号；真正低额度时秒切，尽量让你感觉不到。
@@ -304,6 +320,63 @@ Windows 可用：
 node scripts/typeless-portable-preflight.js --config config.local.json
 ```
 
+## 额度直读（CDP）
+
+**为什么需要它**：Typeless 的 `POST /user/usage_stats` 现在有两道门 ——
+客户端签名（`code 20006`）和 JA3/TLS 指纹白名单（`HTTP 418 / ja3_tls_code`）。
+`node` / `curl` 这类客户端**在签名被看到之前**就被 TLS 握手拒了，所以
+「脚本自己发请求读额度」这条路已经结构性死亡，换密钥也救不回来。
+
+**怎么绕开**：Typeless 是 Electron 应用，带上调试端口启动后，它的渲染进程可以被
+本机 CDP 客户端连上；而渲染进程里的 API 客户端是**可被页面 `import()` 的 ES 模块**。
+我们只是「请 App 自己的客户端帮忙发一次请求」——签名、Cookie、TLS 指纹全是官方的：
+
+```text
+读取路径：本 App ──CDP──▶ Typeless 渲染进程 ──App 自己的客户端──▶ api.typeless.com
+```
+
+**怎么用**：
+
+1. App 右侧「额度守护」→ 打开「启用额度直读（推荐）」（默认已开），端口 9333；
+2. 点一次 **「带端口重启 Typeless」**（只做一次；之后每次换号、每次从本 App
+   打开 Typeless 都会自动带端口）；
+3. 点「自检直读」应看到 `直读正常：已用 …/…，剩余 …`。
+
+命令行验证（不需要编译、不需要开 GUI）：
+
+```bash
+# 端口上已经有 Typeless 的 DevTools
+node scripts/probe-quota-cdp.js
+
+# 还没有：自动带端口拉起 Typeless（会先清掉 ELECTRON_RUN_AS_NODE）
+node scripts/probe-quota-cdp.js --launch
+
+# 给脚本消费的一行 JSON
+node scripts/probe-quota-cdp.js --json
+
+# 编译好的 App 也能直接读一次（无界面、不写数据）
+/Applications/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard --probe-quota
+```
+
+设计细节、失败模式对照表、以及「Typeless 下个大版本改了渲染层怎么修」的排查顺序，
+都在 **[docs/CDP-QUOTA.md](docs/CDP-QUOTA.md)**。
+
+**实时模式**：App 开着的时候还会旁听 Typeless 自己的 `usage_stats` 请求
+（`--watch-quota` 可单独验证）：你打开主窗口、切回首页，额度立刻跟着变，
+不需要等下一轮轮询，也不会额外发一次请求。
+
+失败时它会**直接说原因**（端口没监听 / 端口上是别的应用 / 找不到渲染页面 /
+`no-client`），不会静默降级成「看起来还在监控」。读不到时额度守护会自动退回
+读屏 OCR 与本地缓存估算，行为与 v2.7.6 一致。
+
+> ⚠️ 两个容易踩的点：
+> ① 从自带 `ELECTRON_RUN_AS_NODE=1` 的终端（很多 IDE / Agent 环境会设）里启动
+> Typeless，会退化成 node 解释器并拒绝 `--remote-debugging-port` —— 这不是启动器
+> 的限制，去掉该环境变量即可；
+> ② 直读只覆盖**当前登录账号**；池里其它账号要切换后才知道额度。
+
+---
+
 ## 开机轻量额度守护（推荐：不必一直开着 App）
 
 适合「不想让工具常驻后台，但额度低了要自动换号」：
@@ -325,7 +398,7 @@ node scripts/typeless-portable-preflight.js --config config.local.json
 行为说明：
 
 1. 插件定时唤醒：`TypelessSwitchboard.app … --daemon-check`
-2. 读取本机 Typeless 登录态与官方额度
+2. 读取本机 Typeless 登录态，并**优先用 CDP 直读**真实额度（读不到才退回接口/读屏）
 3. **剩余 ≥ 阈值**：只记日志，进程退出（不换号）
 4. **剩余 &lt; 阈值**：静默换号（含设备身份轮换）；失败则全自动注册换号
 5. 日志：`~/Library/Application Support/TypelessSwitchboard/Logs/`

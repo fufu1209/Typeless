@@ -65,7 +65,9 @@ function hoursUntil(exp, nowSec) {
 }
 
 // 已知结论：官方对 /oauth/refresh_access_token 做了 JA3/TLS 指纹白名单校验，
-// Node 与 Chromium 均无法通过（418 / code 1010101xx），只有官方 Electron 客户端在名单内。
+// Node 的 TLS 握手不在名单内（418 / code 1010101xx）—— 签名算对也没用，
+// 因为它在签名被看到之前就被拒。v2.8.0 起「当前账号」的额度改由 CDP 直读
+// （scripts/probe-quota-cdp.js），但**池内其它账号**仍然只能靠切换后才知道。
 // 这里保留一次尝试，用于「服务端将来放开」或「换到别的出口」时的探测。
 function refreshAccessToken(refreshToken) {
   return new Promise((resolve) => {
@@ -296,6 +298,15 @@ async function run() {
   const revivable = rows.filter((r) => r.verdict === 'token-expired');
   if (revivable.length) {
     console.log(`  ↳ 另有 ${revivable.length} 个账号静默会话过期但 refresh_token 仍有效，可经桌面端重新登录复活`);
+  }
+  const ja3Blocked = rows.filter((r) => String(r.refreshBlockedBy || '').includes('JA3'));
+  if (ja3Blocked.length) {
+    console.log('');
+    console.log(`  ⚠️ ${ja3Blocked.length} 个账号的额度被 JA3/TLS 指纹白名单挡住（HTTP 418），本脚本读不到真实数字。`);
+    console.log('     这不是脚本坏了：Node 的握手指纹永远进不了白名单，换密钥也救不回来。');
+    console.log('     「当前登录账号」可用 CDP 直读真值：');
+    console.log('       node scripts/probe-quota-cdp.js          # 或 --launch 自动带端口拉起 Typeless');
+    console.log('     池内其它账号要读额度，只能先切过去（或换号后由守护自动直读）。');
   }
 }
 

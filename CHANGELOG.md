@@ -1,6 +1,109 @@
 # 更新记录
 
-当前版本 **v2.7.5**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.8.0**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.8.0（2026-11-17）
+
+**额度直读（CDP）** —— 绕开 JA3 指纹墙与客户端签名，直接从 Typeless 自己的渲染进程
+拿到服务端原值；顺带修掉「把上限当剩余」「把日期当额度」两类静默失效，以及三条
+停在 120 时代的过期断言。
+
+### 背景（本机实测，Typeless 2.12.0 / Electron 43.8.4 / Chrome 150）
+
+1. `POST https://api.typeless.com/user/usage_stats` 现在有**两道**门：
+   - **客户端签名**：外部请求返回 `403 / code 20006 / This client is not supported`；
+   - **JA3/TLS 指纹白名单**：`extract-active-session.js` 即使把签名算对，Node 的握手
+     仍在签名被看到之前就被拒 —— `HTTP 418 / code 101010100 / ja3_tls_code`。
+   结论：**「脚本自己发请求读额度」这条路是结构性死亡**，换密钥救不回来。
+2. v2.7.5 认定的「Typeless 启动器拒绝 `--remote-debugging-port`」是**误判**：
+   那次测试的终端里带着 `ELECTRON_RUN_AS_NODE=1`（很多 Agent / IDE 环境会设），
+   Electron 因此退化成 node 解释器，把这个参数当非法选项拒了。去掉该变量后，
+   `/Applications/Typeless.app/Contents/MacOS/Typeless --remote-debugging-port=9333`
+   与 `open -a Typeless --args --remote-debugging-port=9333` 都正常起 DevTools。
+3. Typeless 渲染进程里的 API 客户端是**可被页面 `import()` 的 ES 模块**：
+   ```
+   const m = await import('…/static/js/fw3XiDt9.js');
+   await m.y.post('/user/usage_stats', { params: {} });
+   ```
+   它带的是 App 自己的签名、Cookie 与 Chromium TLS 指纹 —— 两道门一起过，
+   返回的就是界面上那份真实数据（`week_word_usage_value / _limit`）。
+
+### 改动
+
+- **新增额度直读链路**（`Sources/TypelessSwitchboardCore/TypelessQuotaBridge.swift`、
+  `TypelessCDPQuotaReader.swift`）：
+  - `URLSessionWebSocketTask` 实现最小 CDP 客户端，**零第三方依赖**；
+  - 页面选择：floating-bar（常驻、不遮挡、不打断听写）> hub > 任意 Typeless 页面；
+  - 客户端发现**按形状**（带 `post` + `buildUrl` 的导出对象），不硬编码导出名 ——
+    版本升级后导出名会变，形状不变；首选 `link[rel=modulepreload]` 列表，
+    没有时再开 `Debugger` 列出实际加载过的脚本重试；
+  - 只用 App 自己的客户端发请求，并用 `auth:get-current` 补邮箱 / user_id
+    （**只取这两个字段，令牌一律不落地**）。
+- **额度链路顺序重排**：CDP 直读 → 官方接口（历史路径）→ 读屏 OCR → 本地缓存估算。
+  `syncActiveAppSessionAndQuota` 先直读，成功时让 node 脚本走 `--local-only`
+  （只取会话 payload，不再去撞那面必然 418 的墙，日志里少一条误导性报错）。
+- **启动即带端口**：`launchTypelessInBackground` 用 `NSWorkspace.OpenConfiguration.arguments`
+  传 `--remote-debugging-port=<端口>`；App 内「打开 Typeless」也走同一入口，
+  避免「手动开一次就把直读链路弄丢」。
+- **读屏兜底顺序修正**：v2.7.5 先判「客户端被拒」再试读屏 —— 一旦服务端返回 20006，
+  读屏永远不会被执行（而读屏本来不依赖网络）。现在先读屏，再喊被拒。
+- **读屏解析器下沉到 Core**（`QuotaScreenTextParser`）并修掉三个实测坑：
+  - `2026年10月25日` 被 `firstInt` 拼成 `20261025` → 现在先剔日期/时间/版本号形状；
+  - **把「本周额度 23333」当「剩余 23333」** → 现在区分 remaining / used / limit 三类语义，
+    「上限 + 已用」会自动相减（这是最坏的一种错：静默失效，永远不换号）；
+  - `已用 179/2000` 被当成「剩余 179」→ 现在看行内是否带「已用 / used」再决定方向。
+  - 截图窗口选择改为「普通窗口层 + 面积最大」，不再抓到浮条（浮条上没有额度数字）。
+    （顺带修掉 `\d{1,3}(?:,\d{3})*|\d+` 会把 `23333` 截成 `233` 的正则缺陷。）
+- **额度实时监听（v2.8.0）**：`TypelessQuotaLiveWatcher` 连上 Typeless 的 DevTools 后
+  订阅 `Network.responseReceived`，当 App 自己刷新 `usage_stats` 时**旁听**同一份响应——
+  不额外发请求、不解析界面文字；hub 出现/消失时每 8 秒对一次目标并自动换页重连。
+  GUI 常驻时启用；daemon 仍走轮询。
+- **换号历史 / 运营看板（v2.8.0）**：每次换号（自动巡检 / 手动 / 降级轮换 / 自动注册）
+  记录一条「结果 + 耗时 + 原账号 → 新账号 + 触发方式」，最多 200 条，随 store.json 备份；
+  「额度守护」页给出近 7 天成功率、中位耗时与最近 8 条，可一键复制 CSV、清空。
+  热备注册不切换账号，因此**不记**，避免把「换号次数」灌水。
+- **注册失败现场证据（v2.8.0）**：注册脚本非成功结束时自动落盘
+  整页截图 `failure-*.png` + DOM 快照 `failure-*.html` + 可见输入框清单 + 可见文本，
+  结果 JSON 里给出路径；「自检排障」页可直接打开截图/DOM。
+  以前页面一改版只有一行 status/detail，只能靠用户口述。
+- **UI / 可观测性**：
+  - 「额度守护」页新增**额度直读卡片**：开关、端口、`自检直读`、
+    `带端口重启 Typeless`、`立即直读一次额度`，失败原因直接显示；
+  - 侧栏/菜单栏/摘要现在都标注**额度来源**（CDP 直读 / 官方接口 / 读屏 OCR / 本地缓存）；
+  - 菜单栏在直读失败时显示「需直读」，tooltip 给出可操作的两步；
+  - 「一键自检」新增「额度直读（CDP）」项，紧挨 Typeless App 检查。
+- **CLI 与脚本**：
+  - `TypelessSwitchboard --probe-quota [--port N]`：无界面读一次，输出 JSON，成功 exit 0；
+  - `scripts/probe-quota-cdp.js`：不依赖 App / 不编译的独立探针（Node 26 自带 WebSocket），
+    支持 `--launch`（自动带端口拉起，且会先清掉 `ELECTRON_RUN_AS_NODE`）、`--json`。
+- **安全**：`TypelessQuotaBridge.redactSecrets` 会把 JWT（三段 base64url）与
+  40–64 位十六进制密钥抹成 `<redacted>`，任何进入日志/UI 的原始报文都先过它。
+- **测试**：`OperationalFeatureChecks` 新增约 45 条断言（端口规范化、页面选择、
+  探针形状、报文解析、脏数据拒绝、脱敏、读屏三类坑、换号历史统计与 CSV 转义），
+  并新增 `TYPELESS_CDP_LIVE=1` 的真实链路自检；同时修好三条**停在 120 时代**的过期断言
+  （v2.7.4 已把默认阈值调回 200，旧断言一直在失败，只是之前没人跑 checks）。
+
+### 影响 / 迁移
+
+- 旧 `store.json` 缺 `isCDPQuotaEnabled` / `cdpQuotaPort` → 默认**开启**、端口 9333，
+  不挡解码；不需要手工迁移。
+- 直读需要 Typeless **以调试端口启动**（点一次「带端口重启 Typeless」即可；
+  之后每次换号、每次从本 App 打开 Typeless 都会自动带端口）。
+- 没带端口时行为**与 2.7.6 完全一致**：官方接口 → 读屏 → 缓存估算，不会因为
+  新增链路而少一条兜底。
+
+### 已知边界（本次未做，见 docs/ROADMAP.md）
+
+- 直读只能读**当前登录账号**。池里其它账号的额度仍需切换后才知道
+  （`scripts/audit-account-pool.js` 走的仍是 Node 直连，会被 JA3 墙拦）。
+  逐号体检需要「每号一个浏览器 profile 跑 web 客户端」或「App 内多账号会话」，
+  两者都要先解决设备指纹与登录冲突，作为下一里程碑。
+- DevTools 端口只监听 `127.0.0.1`，但同机任意进程都能连上 —— 这是 CDP 的固有属性，
+  与「打开开发者工具」等价；不需要直读时可在设置里关掉。
+- 客户端 chunk 名与导出名随版本变化；探针按形状发现，已对 2.12.0 验证，
+  未来版本若把客户端改成非模块形式，`--probe-quota` 会直接报 `no-client` 而不是猜。
 
 ---
 

@@ -92,6 +92,16 @@ extension SwitchboardStore {
             return nil
         }
 
+        // v2.8.2：GUI 与守护是两个进程，各自内存里的 lastForcedRotationAt 不同步。
+        // 实测出现过 1 分钟内连续两次降级轮换（14:44/14:45、10:08/10:09），
+        // 后一次把前一次刚注入的会话又换掉 —— 用户看到的就是反复登录 / 新手引导。
+        // 用文件锁把「巡检 + 换号」串行化。
+        guard let checkLock = QuotaCheckLock.acquire() else {
+            autoRotateMonitorStatus = "另一进程正在巡检/换号，本轮跳过"
+            return nil
+        }
+        defer { checkLock.release() }
+
         isAutoRotateCheckInFlight = true
         defer { isAutoRotateCheckInFlight = false }
 
@@ -103,14 +113,37 @@ extension SwitchboardStore {
         // 钥匙串（首跑装 Key 之前条目不存在，秒返回空串，不会卡）。
         let key = (apiKey ?? resolveAPIKeyForCurrentMode()).trimmingCharacters(in: .whitespacesAndNewlines)
         let domain = state.settings.domains.first ?? ""
-        let allowCreate = state.settings.autoCreateWhenPoolEmpty && !key.isEmpty
+        // v2.8.2：守护（launchd 单次进程）不再做自动注册。
+        //
+        // 实测教训（2026-11-19）：一次巡检在注册链路上挂了 20 分钟，看门狗才把它杀掉；
+        // 而且注册失败会把桌面会话清空（user-data.json 消失），用户直接看到登录页。
+        // 注册是「有人在电脑前才能兜底」的交互型操作，放回 GUI 或手动触发。
+        let allowCreate = state.settings.autoCreateWhenPoolEmpty && !key.isEmpty && runMode != .daemonOnce
 
+        // v2.8.2：额度已经陈旧、直读端口又没开时，先**修桥**（带端口重启 Typeless）再同步。
+        // 这一步取代了旧的「盲轮换」：换号并不能让额度重新可读，只会反复登录。
+        if isCDPQuotaEnabled, isQuotaDataStaleBeyondDegradeThreshold, await shouldRepairQuotaBridge() {
+            autoRotateMonitorStatus = "额度直连端口未开启，正在带端口重启 Typeless 以恢复直读…"
+            lastAutoRotateDecisionReason = "自动修复：带端口重启 Typeless（10 分钟内最多一次）"
+            appendDaemonLog(
+                remaining: nil,
+                email: liveAccountEmail,
+                reason: "自动修复额度直连：带端口重启 Typeless",
+                resultID: nil
+            )
+            _ = await restartTypelessWithQuotaDebugPort()
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
         let syncedID = await syncActiveAppSessionAndQuota()
         if lastSyncHitDeviceUserLimit {
             lastAutoRotateDecisionReason = "检测到设备登录用户数超限，跳过静默切换并全自动重置设备身份"
             guard allowCreate else {
-                autoRotateMonitorStatus = "巡检完成：设备用户数超限，但未允许自动创建新号"
-                statusMessage = "设备登录用户数已超限；请配置 MoeMail API Key 并开启「池空时自动注册新号」"
+                autoRotateMonitorStatus = runMode == .daemonOnce
+                    ? "巡检完成：设备用户数超限（守护模式不做自动注册，请打开 App 处理）"
+                    : "巡检完成：设备用户数超限，但未允许自动创建新号"
+                statusMessage = runMode == .daemonOnce
+                    ? "设备登录用户数已超限；守护不自动注册，请打开 App 手动换号/注册"
+                    : "设备登录用户数已超限；请配置 MoeMail API Key 并开启「池空时自动注册新号」"
                 return nil
             }
             if isRunningAutomaticReplacement || isRunningSmartSwitch {
@@ -191,6 +224,25 @@ extension SwitchboardStore {
                 // 不能靠降级掩盖 —— 降级只会让用户以为还在自动保护中。
                 lastAutoRotateDecisionReason = "Typeless 已拒绝本客户端（客户端指纹过期），自动换号停摆：请升级 Typeless Switchboard"
                 autoRotateMonitorStatus = "⚠️ 自动换号已停摆：Typeless 拒绝本客户端指纹，需要新版本 App 适配"
+                return currentID
+            } else if isCDPQuotaEnabled {
+                // v2.8.2：直读开着却读不到，且修桥也没成功 —— **不盲换号**。
+                //
+                // 旧行为是「降级用缓存估算 + 90 分钟强制轮换」。2026-11-18/19 实测后果：
+                // 换号 → 注入的会话无效 → Typeless 变成未登录 → 触发自动注册 →
+                // 注册失败 → 桌面会话被清空 → 用户只看到「一直让我登录」。
+                // 额度未知时保留当前账号，才是安全动作。
+                isQuotaAPIDegraded = false
+                quotaDegradedReason = ""
+                let portReason = lastCDPQuotaFailure.isEmpty ? "直读不可用" : lastCDPQuotaFailure
+                lastAutoRotateDecisionReason = "额度未知（\(portReason)）；已暂停自动换号，保留当前账号"
+                autoRotateMonitorStatus = "巡检完成：额度未知，已暂停自动换号（点「额度守护 → 自检直读」查看原因）"
+                appendDaemonLog(
+                    remaining: nil,
+                    email: liveAccountEmail,
+                    reason: "额度未知，暂停自动换号：\(portReason)",
+                    resultID: currentID
+                )
                 return currentID
             } else if isQuotaDataStaleBeyondDegradeThreshold {
                 degradedEstimate = true
@@ -524,4 +576,39 @@ extension SwitchboardStore {
         }
     }
 
+}
+
+
+/// 跨进程巡检锁（`flock`）。
+///
+/// GUI 常驻与 LaunchAgent 守护会同时跑 `performAutoRotateCheck`，而
+/// `lastForcedRotationAt` 只存在于各自的 `state` 副本里 —— 两个进程可以在同一分钟
+/// 各做一次「强制轮换」。文件锁让「巡检 + 换号 + 注册」同一时刻只允许一个进程执行，
+/// 简单、跨进程、进程退出自动释放（不会留 stale lock）。
+final class QuotaCheckLock {
+    private let fd: Int32
+
+    private init(fd: Int32) {
+        self.fd = fd
+    }
+
+    static func acquire() -> QuotaCheckLock? {
+        let path = NSTemporaryDirectory() + "typeless-switchboard.quota-check.lock"
+        let fd = open(path, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else {
+            // 连文件都开不了：放行，不要让锁本身把守护卡死。
+            return QuotaCheckLock(fd: -1)
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            return nil
+        }
+        return QuotaCheckLock(fd: fd)
+    }
+
+    func release() {
+        guard fd >= 0 else { return }
+        flock(fd, LOCK_UN)
+        close(fd)
+    }
 }

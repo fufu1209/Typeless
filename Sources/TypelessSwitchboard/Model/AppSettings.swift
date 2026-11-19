@@ -236,6 +236,12 @@ struct PersistedState: Codable, Equatable, Sendable {
     /// 最多一小时一次，绝不会把资源烧成火焰山。
     var autoRegistrationConsecutiveFailures: Int?
 
+    /// v2.8.0：最近一次「带端口重启 Typeless 以修复额度直读」的时间。
+    ///
+    /// 存在的理由：额度读不到时自动修复会**重启 Typeless**（打断听写），
+    /// 必须限频（10 分钟一次），否则会变成新的抖动源。
+    var lastCDPBridgeRepairAt: Date?
+
     /// v2.8.0：换号历史（新的在前，最多 `SwitchHistory.maximumEntries` 条）。
     /// 只记结果与耗时，不含任何令牌 / 密码 / 会话 payload。
     /// 可选类型：旧 store.json 缺这个键 → nil，不挡解码。
@@ -254,6 +260,7 @@ struct PersistedState: Codable, Equatable, Sendable {
         lastForcedRotationAt: nil,
         lastAutoRegistrationAttemptAt: nil,
         autoRegistrationConsecutiveFailures: nil,
+        lastCDPBridgeRepairAt: nil,
         switchHistory: []
     )
 }

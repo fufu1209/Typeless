@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.8.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.8.2-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -99,9 +99,12 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.8.1**（2026-11-17）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.8.2**（2026-11-19）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-最近的主要变化：**启动即直读**（v2.8.1 —— 修掉「链路正常但菜单栏显示『需直读』」：
+最近的主要变化：**修「一直让我登录」**（v2.8.2 —— 额度读不到时不再盲轮换；
+所有拉起 Typeless 的路径统一带调试端口；注册失败自动恢复原账号会话；
+GUI 与守护用跨进程锁串行化，消除 1 分钟内双轮换）、
+**启动即直读**（v2.8.1 —— 修掉「链路正常但菜单栏显示『需直读』」：
 App 启动后先异步读一次额度，0.2–0.8 秒，不写会话、不换号）、
 **额度直读（CDP）**（v2.8.0 —— 官方 `/user/usage_stats` 同时被
 客户端签名和 JA3/TLS 指纹墙挡着，Node 直连必然 418。现在改为连 Typeless 自己的

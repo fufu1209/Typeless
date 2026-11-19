@@ -37,6 +37,35 @@ extension SwitchboardStore {
                 succeeded: switched,
                 startedAt: started
             )
+
+            // v2.8.2：注册失败不能把用户留在「未登录」。
+            //
+            // 2026-11-19 实测：注册链路在 resetDevice 之后失败，`user-data.json`
+            // 被清掉、注册又没成功 —— 桌面端直接变登录页，用户以为工具把账号弄丢了。
+            // 这里做兜底：只要原账号还有可注入的会话，就把它写回去并重启（不重置设备）。
+            if !switched,
+               let currentID,
+               let index = accountIndex(id: currentID),
+               let payload = state.accounts[index].rawUserDataPayload,
+               !payload.isEmpty,
+               !isDesktopSessionPresent() {
+                let email = state.accounts[index].email
+                autoRotateMonitorStatus = "自动注册未完成，正在恢复原账号「\(email)」的登录态…"
+                let restored = await reinjectSessionPayload(
+                    payload,
+                    activateTypeless: true,
+                    resetDeviceIdentity: false
+                )
+                statusMessage = restored
+                    ? "自动注册未完成，已恢复原账号登录态（\(email)）"
+                    : "自动注册未完成，恢复原账号登录态也失败；请手动登录 \(email)"
+                appendDaemonLog(
+                    remaining: liveRemainingCharacters,
+                    email: email,
+                    reason: restored ? "注册失败后已恢复原账号会话" : "注册失败且恢复会话失败：\(lastSilentSwitchFailureReason)",
+                    resultID: currentID
+                )
+            }
         }
         return result
     }
@@ -394,7 +423,10 @@ extension SwitchboardStore {
     /// 守护看门狗时长（秒）。正常巡检 1-2 秒；最慢的一次全自动注册实测 735 秒
     /// （Playwright 全流程）。20 分钟 = 最慢合法巡检的 1.6 倍，留足余量又不至于
     /// 让卡死的 job 占用太久。到点强制 exit，launchd 下一轮自然重启。
-    static let daemonWatchdogSeconds: TimeInterval = 1200
+    /// v2.8.2：从 1200 秒收到 300 秒。
+    /// 守护已不再做自动注册（注册是这次 20 分钟挂起的元凶），一次「读额度 + 必要时静默换号」
+    /// 正常在 3 分钟内完成；超过 5 分钟基本可以判定卡死，尽早重启比拖 20 分钟好。
+    static let daemonWatchdogSeconds: TimeInterval = 300
 
     /// LaunchAgent / 定时任务入口：同步额度 → 低额度自动换号 → 可选补热备 → 退出。
     /// 不启动 GUI、不常驻循环。

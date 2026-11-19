@@ -117,7 +117,41 @@ extension SwitchboardStore {
         return text
     }
 
-    /// 让 Typeless 以调试端口重启（用户主动点击时才调用）。
+    /// Typeless 桌面端是否在运行（用 bundle id / 名称双判）。
+    func typelessIsRunning() -> Bool {
+        NSWorkspace.shared.runningApplications.contains {
+            $0.bundleIdentifier == "now.typeless.desktop" || $0.localizedName == "Typeless"
+        }
+    }
+
+    /// 桌面端当前是否**真的有登录态**。
+    ///
+    /// 判据两条：`user-data.json` 存在（加密会话本体），且 `app-storage.json` 的
+    /// `userData` 非空（Typeless 启动后自己回填的投影）。只看文件存在不够 ——
+    /// 注册失败会把内容清空但文件可能还在。
+    func isDesktopSessionPresent() -> Bool {
+        let userData = typelessUserDataDir().appendingPathComponent("user-data.json")
+        guard FileManager.default.fileExists(atPath: userData.path) else { return false }
+        guard let data = try? Data(contentsOf: typelessStorageURL()),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let projected = object["userData"] as? String
+        else { return false }
+        return !projected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 是否需要「自动修桥」：直读开着、Typeless 在跑、端口不在、且 10 分钟内没修过。
+    ///
+    /// 只在额度数据已经陈旧（>=10 分钟）时才会被调用 —— 正常抖动不重启 App。
+    func shouldRepairQuotaBridge() async -> Bool {
+        guard isCDPQuotaEnabled, typelessIsRunning() else { return false }
+        if await isQuotaDebugPortReachable() { return false }
+        if let last = state.lastCDPBridgeRepairAt, Date().timeIntervalSince(last) < 600 {
+            return false
+        }
+        return true
+    }
+
+    /// 让 Typeless 以调试端口重启（用户主动点击 / 额度未知时的自动修复）。
     ///
     /// 为什么必须重启：`--remote-debugging-port` 只在进程启动时生效，
     /// 已经跑着的 Typeless 不会凭空长出 DevTools 端口。
@@ -125,6 +159,10 @@ extension SwitchboardStore {
         guard let appPath = typelessAppPath() else {
             return "未找到 /Applications/Typeless.app"
         }
+        // 先记时间再动手：即使重启失败，也要让下一次修复至少等 10 分钟，
+        // 否则「修不好 → 每分钟重启一次」会变成新的灾难。
+        state.lastCDPBridgeRepairAt = Date()
+        save()
         let quitLog = await terminateInstalledTypelessApp()
         // 给 Electron 一点收尾时间（它要 flush 会话文件，否则下一次启动可能读到半份缓存）。
         try? await Task.sleep(nanoseconds: 2_500_000_000)

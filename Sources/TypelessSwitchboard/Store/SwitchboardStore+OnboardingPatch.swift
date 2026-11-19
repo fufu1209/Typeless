@@ -142,8 +142,12 @@ extension SwitchboardStore {
         // 5) 交互模式重启并复核若干轮 —— Typeless 冷启动会按 is_new_user
         //    重新初始化 onboarding 片段，只写一次可能被它改回去。
         if mode == .interactive {
-            if let path = typelessAppPath() {
-                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            if typelessAppPath() != nil {
+                // v2.8.2：同上 —— 带端口重启，别把额度直读弄丢。
+                launchTypelessInBackground(
+                    activate: true,
+                    quotaDebugPort: isCDPQuotaEnabled ? cdpQuotaPort : nil
+                )
                 await enforceTypelessDesktopOnboardingPatchAfterRelaunch(
                     storageURL: storageURL,
                     onboardingURL: onboardingURL,

@@ -222,8 +222,14 @@ extension SwitchboardStore {
 
 
     func forceLaunchTypelessBeforeAuthProtocol() async {
-        if let path = typelessAppPath() {
-            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        if typelessAppPath() != nil {
+            // v2.8.2：所有拉起 Typeless 的路径都必须带调试端口。
+            // 这里以前用 NSWorkspace.open（不带参数），一次注册流程就能把 CDP 链路弄丢，
+            // 之后守护读不到额度 → 降级 → 反复换号/登录。
+            launchTypelessInBackground(
+                activate: true,
+                quotaDebugPort: isCDPQuotaEnabled ? cdpQuotaPort : nil
+            )
             // 给 Electron 冷启动留时间，但用可取消 sleep，不再硬冻结主线程。
             try? await Task.sleep(nanoseconds: 6_000_000_000)
         }

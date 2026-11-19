@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/macOS-13%2B-blue.svg)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.8.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.9.0-blue.svg)](CHANGELOG.md)
 
 > 🌍 [English README](README.en.md)
 
@@ -99,9 +99,12 @@ open /Applications/TypelessSwitchboard.app
 
 ## 更新记录
 
-**当前版本 v2.8.2**（2026-11-19）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 v2.9.0**（2026-11-19）。完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-最近的主要变化：**修「一直让我登录」**（v2.8.2 —— 额度读不到时不再盲轮换；
+最近的主要变化：**稳定性大版本**（v2.9.0 —— 热备注册移出巡检关键路径、超时杀整棵进程树、
+会话 payload 改走 stdin、注册前抓当前会话、日志去重、`--health` / `--repair-login`、
+诊断页「修复登录」；完整审计见 [docs/AUDIT-v2.9.md](docs/AUDIT-v2.9.md)）、
+**修「一直让我登录」**（v2.8.2 —— 额度读不到时不再盲轮换；
 所有拉起 Typeless 的路径统一带调试端口；注册失败自动恢复原账号会话；
 GUI 与守护用跨进程锁串行化，消除 1 分钟内双轮换）、
 **启动即直读**（v2.8.1 —— 修掉「链路正常但菜单栏显示『需直读』」：
@@ -361,6 +364,12 @@ node scripts/probe-quota-cdp.js --json
 
 # 编译好的 App 也能直接读一次（无界面、不写数据）
 /Applications/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard --probe-quota
+
+# 一行一条的健康报告（排障时贴这个就够）
+/Applications/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard --health
+
+# 桌面端变未登录时，一键恢复到可用账号（优先当前账号）
+/Applications/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard --repair-login
 ```
 
 设计细节、失败模式对照表、以及「Typeless 下个大版本改了渲染层怎么修」的排查顺序，
@@ -522,6 +531,25 @@ $HOME/Library/Caches/TypelessSwitchboard/TypelessSwitchboard.app
 ---
 
 ## 常见问题
+
+### Typeless 反复让我登录？
+
+先点「自检排障 → 修复登录」，或在终端跑：
+
+```bash
+/Applications/TypelessSwitchboard.app/Contents/MacOS/TypelessSwitchboard --repair-login
+```
+
+它会挑一个「刷新令牌仍有效、优先你刚才在用的号」把会话写回去并验证额度。
+根因（2026-11-19 事故）与修复见 [docs/AUDIT-v2.9.md](docs/AUDIT-v2.9.md)：
+额度读不到时不再盲换号、注册失败自动恢复会话、拉起 Typeless 时强制清掉
+`ELECTRON_RUN_AS_NODE`（否则 Electron 会退化成 node 直接退出）。
+
+### 双击 App 没反应？
+
+v2.9.0 已修：以前如果正好有一次 `--daemon-check` 在跑，LaunchServices 会「激活」
+那个后台进程而不是开窗口；现在守护收到 reopen 会另起 GUI 实例。
+
 
 **Q：一定要自建邮箱服务吗？**
 只有「自动注册新号」需要。已经有一批账号的话，直接加进池子就能自动轮换，

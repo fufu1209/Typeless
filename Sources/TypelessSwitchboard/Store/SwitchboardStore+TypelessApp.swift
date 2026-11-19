@@ -32,8 +32,10 @@ extension SwitchboardStore {
                 activate: true,
                 quotaDebugPort: isCDPQuotaEnabled ? cdpQuotaPort : nil
             )
+            // 已经在跑的实例不会因为这次调用补上调试端口 —— 提示要诚实，
+            // 否则用户会以为直读已经就绪，实际端口还是没开。
             statusMessage = isCDPQuotaEnabled
-                ? "已打开本机 Typeless App（额度直读端口 \(cdpQuotaPort)）"
+                ? "已请求打开本机 Typeless App（若它已在运行，需点「带端口重启」才会补上调试端口）"
                 : "已打开本机 Typeless App"
             return
         }

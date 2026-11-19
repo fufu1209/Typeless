@@ -1,6 +1,55 @@
 # 更新记录
 
-当前版本 **v2.8.2**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+当前版本 **v2.9.0**。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+---
+
+## v2.9.0（2026-11-19）
+
+**深度审计后的大版本**：把「读不到额度 → 盲换号 → 注册 → 清会话」这条级联的每一环都装上闸，
+并补上可运维性（健康报告 / 一键修复登录 / 日志去重）。
+
+完整审计见 **[docs/AUDIT-v2.9.md](docs/AUDIT-v2.9.md)**（7,751 行日志 + 73 个账号逐条对照）。
+
+### 修复
+
+- **热备注册移出巡检关键路径**：注册是分钟级慢操作，以前在巡检里 `await`，
+  一旦卡住就不返回、跨进程锁不释放、守护每分钟被挡在门外。现在丢到后台任务。
+- **超时杀整棵进程树**：`node → npm → Playwright → Chromium` 以前只 terminate 外层 node，
+  Chromium 继续跑，把守护拖到看门狗超时（实测 7 次）。现在从叶子往上 SIGKILL。
+- **会话 payload 改走 stdin**：`refresh_token` 有效期约 1 年，以前出现在 `ps` 参数里，
+  同机任意进程可见。`write-active-session.js --stdin`，argv 旧用法仍兼容。
+- **注册前先抓当前真实会话**：全自动注册会清桌面会话；以前失败后只能拿旧 payload 恢复，
+  现在先同步一次当前会话，恢复的就是用户刚才在用的那份。
+- **拉起 Typeless 时强制清掉 `ELECTRON_RUN_AS_NODE`**（根因级修复）：
+  `open` 会把调用方环境交给新 App；父进程带着这个变量时（终端 / IDE / Agent 环境很常见），
+  Electron 会退化成 node 解释器，`--remote-debugging-port` 被当非法参数、进程直接退出 ——
+  表现为「点了没反应 / 换号后没登录 / 端口永远起不来」。改用 `/usr/bin/open` 并在 launcher
+  里删掉该变量；`--repair-login` 实测从「15 秒等不到端口」变为「恢复并读到额度」。
+- **自动修桥加守卫**：换号/同步进行中绝不重启 Typeless。
+- **守护日志去重**：同 email + 同原因 5 分钟内只记一次（362 条复读 → 一条）。
+- **双击 App 不再被守护进程吞掉**：守护收到 reopen 时用 `open -n` 另起 GUI 实例。
+- **文案诚实化**：「打开 Typeless」不再谎报已带调试端口（已运行的实例不会补参数）。
+
+### 新增
+
+- `--health`：一行一条的健康报告（版本 / Typeless / CDP / 额度 / 上次同步 /
+  自动修桥 / LaunchAgent / 巡检锁 / 账号池 / 7 天换号统计），只读，不写数据。
+- `--repair-login [--email x]`：把桌面端恢复到「刷新令牌仍有效、优先当前账号」的会话，
+  并回读额度验证。
+- 诊断页「修复登录」按钮：未登录时一键恢复，不用手动换号。
+- 额度守护页健康信息：当前账号 / 额度年龄 / 最近自动修桥时间。
+
+### 验证
+
+- 连续两轮守护：`CDP 直读 · 剩余 23252 · 新鲜 · 暂不换号`，换号历史无新增；
+- `--health`、`--repair-login`、`--probe-quota`、`--watch-quota` 均在安装版实跑；
+- `OperationalFeatureChecks` 通过；全量 Playwright smoke 通过。
+
+### 未做（原因见审计文档）
+
+- 池内逐号额度（需要独立浏览器 profile 或 App 内切会话，风险未验证）；
+- 邮箱服务商抽象（需要协议层重构，半成品更危险）。
 
 ---
 

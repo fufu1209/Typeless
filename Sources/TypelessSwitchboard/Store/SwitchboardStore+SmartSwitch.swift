@@ -301,10 +301,11 @@ extension SwitchboardStore {
 
         let result = await Task.detached(priority: .userInitiated) {
             return SwitchboardStore.runProcess(
-                arguments: ["node", scriptURL.path, payload],
+                arguments: ["node", scriptURL.path, "--stdin"],
                 environment: SwitchboardStore.automationEnvironment(),
                 currentDirectory: folder,
-                timeoutSeconds: 10
+                timeoutSeconds: 10,
+                standardInput: Data(payload.utf8)
             )
         }.value
 
@@ -350,12 +351,35 @@ extension SwitchboardStore {
             if activate { openInstalledTypelessApp() }
             return
         }
-        let url = URL(fileURLWithPath: path)
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = activate
-        if let quotaDebugPort {
-            configuration.arguments = ["--remote-debugging-port=\(TypelessQuotaBridge.normalizePort(quotaDebugPort))"]
+        // v2.9.0：改用 `/usr/bin/open` 拉起，而不是 `NSWorkspace.openApplication`。
+        //
+        // 实测（2026-11-19）：在无界面 CLI（`--repair-login`）里 NSWorkspace 的异步
+        // open 请求会被静默丢掉 —— 会话写好了、返回 true，但 Typeless 根本没起来，
+        // 端口自然也等不到。`/usr/bin/open` 是同一个 LaunchServices 入口，
+        // 但它是同步提交的独立进程，不依赖调用方的 AppKit run loop。
+        var arguments = ["-a", path]
+        if !activate {
+            // `-g`：不要在后台把 Typeless 抢到前台（静默换号时用）。
+            arguments.insert("-g", at: 0)
         }
-        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, _ in }
+        if let quotaDebugPort {
+            arguments += ["--args", "--remote-debugging-port=\(TypelessQuotaBridge.normalizePort(quotaDebugPort))"]
+        }
+        let launcher = Process()
+        launcher.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        launcher.arguments = arguments
+        // v2.9.0：必须清掉 ELECTRON_RUN_AS_NODE。
+        //
+        // `open` 会把调用方的环境一起交给新 App；一旦父进程（终端 / IDE / Agent）
+        // 带着 `ELECTRON_RUN_AS_NODE=1`，Typeless 会退化成 node 解释器，
+        // `--remote-debugging-port` 被当成非法选项，进程直接退出 —— 表现为「点了没反应」。
+        var launcherEnvironment = ProcessInfo.processInfo.environment
+        launcherEnvironment.removeValue(forKey: "ELECTRON_RUN_AS_NODE")
+        launcher.environment = launcherEnvironment
+        do {
+            try launcher.run()
+        } catch {
+            statusMessage = "拉起 Typeless 失败：\(error.localizedDescription)"
+        }
     }
 }

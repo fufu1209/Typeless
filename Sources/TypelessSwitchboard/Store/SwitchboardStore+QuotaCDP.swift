@@ -139,11 +139,80 @@ extension SwitchboardStore {
         return !projected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// 恢复桌面登录态（v2.9.0）。
+    ///
+    /// 场景：注册失败 / 手动误删 / 切换后桌面端变未登录。挑一个**令牌未死**、
+    /// 剩余额度最多的账号，把 payload 写回去并重启（不重置设备）。
+    /// `force = false` 时只在「确实没有登录态」时才动手。
+    func repairDesktopLogin(preferredEmail: String? = nil, force: Bool = false) async -> String {
+        if !force, isDesktopSessionPresent() {
+            return "Typeless 当前已有登录态，无需修复"
+        }
+        // 先读一次当前会话（只在本地解密，不发请求）：能读出来就优先恢复「同一个号」，
+        // 而不是因为别的号剩余额度更多就把用户换走。
+        _ = await syncActiveAppSessionAndQuotaNode(localOnly: true)
+
+        let candidates = state.accounts.filter { $0.isSilentlySwitchable }
+        let target: Account? = {
+            if let preferredEmail,
+               let match = candidates.first(where: { $0.email.caseInsensitiveCompare(preferredEmail) == .orderedSame }) {
+                return match
+            }
+            // 优先恢复「用户刚才在用的号」，而不是简单挑额度最多的 —— 换号是有成本的。
+            if let live = liveAccountEmail.nilIfBlank,
+               let match = candidates.first(where: { $0.email.caseInsensitiveCompare(live) == .orderedSame }) {
+                return match
+            }
+            if let previousID = state.lastAutomationResult?.previousAccountID,
+               let match = candidates.first(where: { $0.id == previousID }) {
+                return match
+            }
+            return candidates.sorted {
+                if $0.remainingCharacters == $1.remainingCharacters {
+                    return $0.createdAt > $1.createdAt
+                }
+                return $0.remainingCharacters > $1.remainingCharacters
+            }.first
+        }()
+        guard let target, let payload = target.rawUserDataPayload, !payload.isEmpty else {
+            return "没有可恢复的会话：账号池里没有「刷新令牌仍有效」的账号，请手动登录一次或注册新号"
+        }
+
+        let restored = await reinjectSessionPayload(
+            payload,
+            activateTypeless: true,
+            resetDeviceIdentity: false
+        )
+        guard restored else {
+            return "恢复「\(target.email)」会话失败：\(lastSilentSwitchFailureReason.ifEmpty("未知原因"))"
+        }
+        // 等待调试端口真正起来再读额度。
+        //
+        // v2.9.0 实测：CLI 里 `reinjectSessionPayload` 只是**提交**了 openApplication，
+        // 紧接着 exit(0) 会把启动请求一起带走 —— 打印「已恢复」但 Typeless 根本没起来。
+        // 现在必须等到端口可连（同时证明渲染进程已就绪）才算完成。
+        guard await waitForQuotaDebugPort(timeout: 15) else {
+            return "已写入「\(target.email)」的会话，但 15 秒内没等到 Typeless 起来（调试端口未就绪）"
+        }
+        // 端口可连不代表渲染页面已经建好（floating-bar 通常晚 1–3 秒）。
+        // 再给最多 10 秒逐次重试，避免「明明能读，却报没读到」。
+        for _ in 0..<10 {
+            if let snapshot = await readQuotaViaCDPBridge() {
+                _ = applyQuotaSnapshotToMatchingAccount(snapshot)
+                return "已恢复「\(target.email)」并读到额度：\(snapshot.summary)"
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return "已恢复「\(target.email)」的会话；额度暂未读到（刚启动，稍后会自动重试）"
+    }
+
     /// 是否需要「自动修桥」：直读开着、Typeless 在跑、端口不在、且 10 分钟内没修过。
     ///
     /// 只在额度数据已经陈旧（>=10 分钟）时才会被调用 —— 正常抖动不重启 App。
     func shouldRepairQuotaBridge() async -> Bool {
         guard isCDPQuotaEnabled, typelessIsRunning() else { return false }
+        // 换号/注册进行中时绝不重启 Typeless —— 那会把正在注入的会话打断。
+        guard !isSwitchBusy else { return false }
         if await isQuotaDebugPortReachable() { return false }
         if let last = state.lastCDPBridgeRepairAt, Date().timeIntervalSince(last) < 600 {
             return false
@@ -156,6 +225,9 @@ extension SwitchboardStore {
     /// 为什么必须重启：`--remote-debugging-port` 只在进程启动时生效，
     /// 已经跑着的 Typeless 不会凭空长出 DevTools 端口。
     func restartTypelessWithQuotaDebugPort() async -> String {
+        guard !isSwitchBusy else {
+            return "换号/同步进行中，跳过带端口重启"
+        }
         guard let appPath = typelessAppPath() else {
             return "未找到 /Applications/Typeless.app"
         }
@@ -169,16 +241,23 @@ extension SwitchboardStore {
         launchTypelessInBackground(activate: false, quotaDebugPort: cdpQuotaPort)
         var lines = [quitLog]
         lines.append("已用 --remote-debugging-port=\(cdpQuotaPort) 重新拉起 \(appPath)")
-        // 等端口起来（最多 12 秒），让用户点完就能看到结果。
-        for _ in 0..<12 {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            if await isQuotaDebugPortReachable() {
-                lines.append("调试端口已就绪：http://127.0.0.1:\(cdpQuotaPort)/json/version")
-                return lines.joined(separator: "\n")
-            }
+        // 等端口起来（最多 15 秒），让用户点完就能看到结果。
+        if await waitForQuotaDebugPort(timeout: 15) {
+            lines.append("调试端口已就绪：http://127.0.0.1:\(cdpQuotaPort)/json/version")
+            return lines.joined(separator: "\n")
         }
-        lines.append("等了 12 秒仍未连上端口 —— 可能是新版本改了启动参数，或端口 \(cdpQuotaPort) 被占用")
+        lines.append("等了 15 秒仍未连上端口 —— 可能是新版本改了启动参数，或端口 \(cdpQuotaPort) 被占用")
         return lines.joined(separator: "\n")
+    }
+
+    /// 等调试端口就绪（最多 `timeout` 秒）。返回 true 表示端口可连且是 Typeless。
+    func waitForQuotaDebugPort(timeout: TimeInterval = 15) async -> Bool {
+        let deadline = Date().addingTimeInterval(max(timeout, 1))
+        while Date() < deadline {
+            if await isQuotaDebugPortReachable() { return true }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return false
     }
 
     /// 端口上是不是 Typeless 的 DevTools。

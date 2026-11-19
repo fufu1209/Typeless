@@ -216,6 +216,27 @@ struct DiagnosticsTabView: View {
             }
             .buttonStyle(.bordered)
 
+            // v2.9.0：桌面端未登录时给一键修复（挑一个刷新令牌仍有效的账号写回会话）。
+            if !store.isDesktopSessionPresent() {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label("Typeless 当前未登录", systemImage: "person.crop.circle.badge.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Spacer()
+                    Button {
+                        Task {
+                            let message = await store.repairDesktopLogin()
+                            store.statusMessage = message
+                        }
+                    } label: {
+                        Label("修复登录", systemImage: "wrench.and.screwdriver")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(store.isSwitchBusy)
+                }
+            }
+
             if let result = store.state.lastAutomationResult {
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {

@@ -66,6 +66,16 @@ enum TypelessSwitchboardMain {
         if CommandLine.arguments.contains("--watch-quota") {
             runStandaloneQuotaWatchAndExit()
         }
+        // v2.9.0：一行一条的健康报告（排障/巡检用；不写任何数据）。
+        //   TypelessSwitchboard --health
+        if CommandLine.arguments.contains("--health") {
+            runStandaloneHealthAndExit()
+        }
+        // v2.9.0：把桌面端恢复到某个可用账号（默认挑剩余额度最多的可用会话）。
+        //   TypelessSwitchboard --repair-login [--email x@y]
+        if CommandLine.arguments.contains("--repair-login") {
+            runStandaloneRepairLoginAndExit()
+        }
         // v2.5.6：无界面导出配置包，供脚本化备份 / 换机迁移使用。
         //   --export-full-bundle    真实邮箱 + 完整设置（自用，别外传）
         //   --export-public-bundle  脱敏版（可分享 / 发 GitHub）
@@ -131,6 +141,81 @@ enum TypelessSwitchboardMain {
             let reason = await reader.lastFailureDescription ?? "未知原因"
             print("直读失败：\(reason)")
             exit(1)
+        }
+        RunLoop.main.run()
+        exit(0)
+    }
+
+    /// v2.9.0：`--health` 的实现。
+    ///
+    /// 只读：不写 store、不改会话、不触发换号。输出刻意做成一行一条，
+    /// 用户复制进聊天窗口就能让支持方一眼看出「哪一环断了」。
+    @MainActor
+    private static func runStandaloneHealthAndExit() -> Never {
+        let store = SwitchboardStore(runMode: .daemonOnce)
+        Task { @MainActor in
+            var lines: [String] = []
+            lines.append("version: \(AppVersion.full)")
+
+            let typelessVersion: String = {
+                guard let path = store.typelessAppPath() else { return "not-installed" }
+                let plistPath = path + "/Contents/Info.plist"
+                guard let plist = NSDictionary(contentsOfFile: plistPath),
+                      let version = plist["CFBundleShortVersionString"] as? String
+                else { return "unknown" }
+                return version
+            }()
+            let running = store.typelessIsRunning()
+            let reachable = await store.isQuotaDebugPortReachable()
+            lines.append("typeless: running=\(running) version=\(typelessVersion) cdpPort=\(store.cdpQuotaPort) reachable=\(reachable)")
+
+            let reader = TypelessCDPQuotaReader(port: store.cdpQuotaPort)
+            let liveSnapshot = await reader.readQuota()
+            if let snapshot = liveSnapshot {
+                lines.append("quota(live): \(snapshot.usedCharacters)/\(snapshot.weeklyLimit) remaining=\(snapshot.remainingCharacters) email=\(snapshot.email ?? "-") chunk=\(snapshot.clientChunk ?? "-")")
+            } else {
+                let reason = await reader.lastFailureDescription ?? "unknown"
+                lines.append("quota: unavailable reason=\(reason)")
+            }
+
+            let syncAge = store.lastQuotaSyncAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
+            let sourceText = liveSnapshot != nil ? "CDP 直读（live）" : (store.lastQuotaSource?.displayName ?? "unknown")
+            lines.append("lastSync: age=\(syncAge)s source=\(sourceText) fresh=\(liveSnapshot != nil || store.lastQuotaSyncFresh)")
+            lines.append("repair: last=\(store.state.lastCDPBridgeRepairAt.map { ISO8601DateFormatter().string(from: $0) } ?? "never")")
+            lines.append("launchagent: installed=\(QuotaGuardLaunchAgent.isInstalled) loaded=\(QuotaGuardLaunchAgent.isLoaded)")
+            if let lock = QuotaCheckLock.acquire() {
+                lock.release()
+                lines.append("checkLock: free")
+            } else {
+                lines.append("checkLock: held (另一进程正在巡检/换号)")
+            }
+            lines.append("automation: autoRotate=\(store.state.settings.isAutoRotateEnabled) cdp=\(store.state.settings.isCDPQuotaEnabled) port=\(store.cdpQuotaPort)")
+
+            let accounts = store.state.accounts
+            let available = accounts.filter { $0.status == .available }.count
+            let pending = accounts.filter { $0.effectiveReviewState == .pending }.count
+            let exhausted = accounts.filter { $0.status == .exhausted }.count
+            let paused = accounts.filter { $0.status == .paused }.count
+            lines.append("accounts: total=\(accounts.count) available=\(available) pending=\(pending) exhausted=\(exhausted) paused=\(paused)")
+
+            let summary = store.switchHistorySummary(days: 7)
+            lines.append("switches(7d): total=\(summary.total) ok=\(summary.succeeded) failed=\(summary.failed) median=\(String(format: "%.1f", summary.medianSeconds))s")
+            print(lines.joined(separator: "\n"))
+            exit(0)
+        }
+        RunLoop.main.run()
+        exit(0)
+    }
+
+    /// v2.9.0：`--repair-login` 的实现。
+    @MainActor
+    private static func runStandaloneRepairLoginAndExit() -> Never {
+        let email = value(of: "--email")
+        let store = SwitchboardStore(runMode: .daemonOnce)
+        Task { @MainActor in
+            let message = await store.repairDesktopLogin(preferredEmail: email, force: true)
+            print(message)
+            exit(message.contains("已恢复") ? 0 : 1)
         }
         RunLoop.main.run()
         exit(0)
@@ -270,6 +355,19 @@ final class HeadlessCLIRunner: NSObject, NSApplicationDelegate {
     init(mode: SwitchboardRunMode) {
         self.mode = mode
         super.init()
+    }
+
+    /// v2.9.0：守护进程收到「用户点了 App」时，另起一个 GUI 实例。
+    ///
+    /// 以前的坑：LaunchServices 认为 bundle 已经在跑（其实是 `--daemon-check`），
+    /// 于是只「激活」那个后台进程 —— 用户双击 App 什么都不发生。
+    /// `open -n` 强制新实例；单实例锁保证 GUI 只有一个。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-n", Bundle.main.bundlePath]
+        try? process.run()
+        return false
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

@@ -295,7 +295,10 @@ extension SwitchboardStore {
                 + " · \(weeklyQuotaSummaryLine)"
                 + (degradedEstimate ? " · ⚠️ 估算模式（官方额度 API 不可用，阈值为正常 \(SwitchboardStore.quotaDegradedThresholdMultiplier) 倍）" : "")
             if allowCreate {
-                await ensureHotSpareIfNeeded(apiKey: key, domain: domain, respectCooldown: true)
+                // v2.9.0：热备注册挪到后台任务。
+                // 以前在巡检里 await：注册一旦卡住（实测 20 分钟），
+                // 巡检不返回、跨进程锁不释放、守护每分钟都在门外等 —— 额度也跟着陈旧。
+                scheduleHotSpareRegistration(apiKey: key, domain: domain)
             }
 
         case .silentPoolSwitch:
@@ -319,7 +322,7 @@ extension SwitchboardStore {
                 autoRotateMonitorStatus = "守护中：已静默切换并轮换设备身份，继续监测"
                 resultID = targetID
                 if allowCreate {
-                    await ensureHotSpareIfNeeded(apiKey: key, domain: domain, respectCooldown: true)
+                    scheduleHotSpareRegistration(apiKey: key, domain: domain)
                 }
             } else if allowCreate {
                 // v2.6.9：注册退避。失败后不立刻重试，否则守护每分钟烧一个
@@ -371,11 +374,22 @@ extension SwitchboardStore {
                 : "巡检完成：自动注册未完成"
             resultID = newID ?? currentID
             if allowCreate, newID != nil {
-                await ensureHotSpareIfNeeded(apiKey: key, domain: domain, respectCooldown: true)
+                scheduleHotSpareRegistration(apiKey: key, domain: domain)
             }
         }
 
         return resultID
+    }
+
+    /// 把补热备丢到后台（v2.9.0）。
+    ///
+    /// 巡检只需要「读额度 + 决定是否换号」，注册是分钟级的慢操作。
+    /// 放在巡检里会把整个检查拖长、占着跨进程锁，还会让守护一直跳过。
+    func scheduleHotSpareRegistration(apiKey: String, domain: String) {
+        guard runMode == .gui, state.settings.autoCreateWhenPoolEmpty else { return }
+        Task { [weak self] in
+            await self?.ensureHotSpareIfNeeded(apiKey: apiKey, domain: domain, respectCooldown: true)
+        }
     }
 
     /// 后台补齐热备：额度充足时静默注册 1 个可注入会话的备用号，不切换当前使用号。

@@ -139,6 +139,12 @@ extension SwitchboardStore {
             // 热备：只在独立 Playwright profile 里注册，绝不碰当前桌面/Chrome 登录态。
             log.append("热备模式：跳过桌面/Chrome 清理与 handoff，避免打断当前使用")
         } else {
+            // v2.9.0：清理桌面环境前，先把**当前真实会话**抓一份存进账号。
+            //
+            // 这一步以前缺失：注册会删掉 user-data.json，失败时只能拿账号里
+            // 上次同步的旧 payload 去恢复。先抓一次，恢复的就是用户刚才在用的那份会话。
+            _ = await syncActiveAppSessionAndQuotaNode(localOnly: true)
+
             let staleChromePromptLog = await resolvePendingChromeTypelessAppPromptBeforeAutomaticReplacement()
             log.append(contentsOf: staleChromePromptLog)
             let staleChromeTabsLog = await closePersonalChromeTypelessTabsBeforeReplacement()
@@ -578,6 +584,29 @@ extension SwitchboardStore {
     func appendDaemonLog(remaining: Int?, email: String, reason: String, resultID: UUID?) {
         let dir = fileURL.deletingLastPathComponent().appendingPathComponent("Logs", isDirectory: true)
         let logURL = dir.appendingPathComponent("quota-guard-daemon.log")
+
+        // v2.9.0：同一条状态 5 分钟内只记一次。
+        //
+        // 实测日志里 462 条「无法读取登录态」、几十条完全相同的「暂停换号」——
+        // 一条/分钟的复读会把真正的转折点淹掉。这里用一个小签名文件做跨进程去重：
+        // email + reason 相同且 5 分钟内出现过，就跳过写盘（UI 状态照常更新）。
+        let signatureURL = dir.appendingPathComponent(".last-daemon-log-signature.json")
+        struct Signature: Codable {
+            var at: Date
+            var email: String
+            var reason: String
+        }
+        if let data = try? Data(contentsOf: signatureURL),
+           let previous = try? JSONDecoder().decode(Signature.self, from: data),
+           previous.email == email,
+           previous.reason == reason,
+           Date().timeIntervalSince(previous.at) < 300 {
+            return
+        }
+        if let data = try? JSONEncoder().encode(Signature(at: Date(), email: email, reason: reason)) {
+            try? data.write(to: signatureURL, options: .atomic)
+        }
+
         let stamp = ISO8601DateFormatter().string(from: Date())
         LogFileRotator.append(
             line: "[\(stamp)] remaining=\(remaining.map(String.init) ?? "-") email=\(email.ifEmpty("-")) result=\(resultID?.uuidString ?? "-") \(reason)",

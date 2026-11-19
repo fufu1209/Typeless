@@ -139,6 +139,47 @@ extension SwitchboardStore {
     }
 
 
+    /// 递归列出某个进程的所有后代 PID（用于超时清理）。
+    ///
+    /// 用一次 `ps -axo pid=,ppid=` 建全量父子表再遍历：比反复 `pgrep -P` 稳定，
+    /// 也不会在进程已经退出时把中间层漏掉。
+    nonisolated static func descendantProcessIDs(of root: Int32) -> [Int32] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-axo", "pid=,ppid="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return []
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+
+        var childrenByParent: [Int32: [Int32]] = [:]
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 2,
+                  let pid = Int32(parts[0]),
+                  let parent = Int32(parts[1])
+            else { continue }
+            childrenByParent[parent, default: []].append(pid)
+        }
+
+        var result: [Int32] = []
+        var stack: [Int32] = [root]
+        while let current = stack.popLast() {
+            for child in childrenByParent[current] ?? [] {
+                result.append(child)
+                stack.append(child)
+            }
+        }
+        return result
+    }
+
     nonisolated static func automationEnvironment() -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         let home = NSHomeDirectory()
@@ -241,7 +282,8 @@ extension SwitchboardStore {
         arguments: [String],
         environment: [String: String],
         currentDirectory: URL? = nil,
-        timeoutSeconds: TimeInterval = 60
+        timeoutSeconds: TimeInterval = 60,
+        standardInput: Data? = nil
     ) -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -251,6 +293,9 @@ extension SwitchboardStore {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        // v2.9.0：会话 payload 走 stdin，避免出现在 `ps` 的参数里。
+        let inputPipe = Pipe()
+        process.standardInput = inputPipe
 
         // 边跑边读：子进程输出超过管道缓冲（约 64KB）时会写阻塞，若等进程退出后才读会永远等不到退出。
         // 最多保留 512KB，超时终止时也能拿到已产生的部分输出。
@@ -287,8 +332,23 @@ extension SwitchboardStore {
             return (-1, error.localizedDescription)
         }
 
+        // 写入 stdin 后立即关闭：子进程读到 EOF 才能继续。payload 很小（<8KB），
+        // 不会把管道写满；写失败说明子进程已经退出，交给下面的超时/退出码处理。
+        if let standardInput {
+            try? inputPipe.fileHandleForWriting.write(contentsOf: standardInput)
+        }
+        try? inputPipe.fileHandleForWriting.close()
+
         let timedOut = exited.wait(timeout: .now() + timeoutSeconds) == .timedOut
         if timedOut {
+            // v2.9.0：终止整棵进程树，而不只是直接子进程。
+            //
+            // 实测教训：`node → npm → Playwright → Chromium` 层层嵌套，只 terminate
+            // 外层 node 时，Chromium 会继续跑并把 daemon 拖到看门狗超时（1200 秒）。
+            // 这里先把后代 SIGKILL（从叶子往上），再 terminate 父进程。
+            for pid in Self.descendantProcessIDs(of: process.processIdentifier).reversed() {
+                kill(pid, SIGKILL)
+            }
             process.terminate()
             // 给子进程死亡一点收尾时间。
             _ = exited.wait(timeout: .now() + 2)

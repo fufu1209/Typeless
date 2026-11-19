@@ -282,6 +282,21 @@ struct QuotaGuardTabView: View {
                 }
             }
 
+            if !store.liveAccountEmail.isEmpty {
+                InfoLine(label: "当前账号", value: store.liveAccountEmail, color: .secondary)
+            }
+            if let synced = store.lastQuotaSyncAt {
+                let age = Date().timeIntervalSince(synced)
+                InfoLine(
+                    label: "额度年龄",
+                    value: Self.relativeAge(synced),
+                    color: age > 600 ? .orange : .secondary
+                )
+            }
+            if let repaired = store.state.lastCDPBridgeRepairAt {
+                InfoLine(label: "最近自动修桥", value: Self.relativeAge(repaired), color: .secondary)
+            }
+
             HStack(spacing: 8) {
                 Button {
                     Task {
@@ -424,6 +439,15 @@ struct QuotaGuardTabView: View {
 
     private var historyFootnote: String {
         "每次换号（自动巡检 / 手动 / 降级轮换 / 自动注册）都会记一条结果与耗时；热备注册不切换账号，不记。只保留最近 \(SwitchHistory.maximumEntries) 条，不含令牌或会话内容。"
+    }
+
+    /// 「多久以前」的人话表述，给额度年龄/修桥时间用。
+    private static func relativeAge(_ date: Date) -> String {
+        let seconds = max(Int(Date().timeIntervalSince(date)), 0)
+        if seconds < 60 { return "\(seconds) 秒前" }
+        if seconds < 3600 { return "\(seconds / 60) 分钟前" }
+        if seconds < 86_400 { return "\(seconds / 3600) 小时前" }
+        return "\(seconds / 86_400) 天前"
     }
 
     private static func historyClock(_ date: Date) -> String {
